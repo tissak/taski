@@ -48,16 +48,19 @@ impl Status {
 /// A single extracted task. See PRD §9 for the full field-by-field rationale.
 #[derive(Debug, Clone)]
 pub struct Task {
-    /// Stable identity. Slice 0 uses a stub hash of (note_path + line + text); the
-    /// final identity scheme is pending the ADR-0005 spike.
-    pub id: String,
+    /// DB-assigned surrogate identity (ADR-0005). The parser sets this to `0`; SQLite
+    /// assigns the real `INTEGER PRIMARY KEY AUTOINCREMENT` rowid on INSERT. Once
+    /// assigned, a task's id never changes and is never reused after deletion.
+    pub id: i64,
     /// Source note (relative to vault root).
     pub note_path: String,
     /// 1-based line number within the note. Location, not identity.
     pub line_number: usize,
     /// Task body text (trimmed).
     pub text: String,
-    /// Hash of the task text, for identity re-verification at write time.
+    /// Hash of the task text — the per-note reconciliation key (ADR-0005 §2). Two
+    /// tasks with the same `text_hash` in the same note are considered the "same"
+    /// task across re-scans (matched greedily in line order).
     pub text_hash: String,
     /// Checkbox-derived status.
     pub status: Status,
@@ -113,10 +116,9 @@ fn parse_task_line(raw_line: &str, note_path: &str, line_number: usize, now: i64
     let body = body.trim();
     let status = Status::from_checkbox_char(checkbox_char);
     let text_hash = hash_str(body);
-    let id = hash_str(&format!("{note_path}|{line_number}|{body}"));
 
     Some(Task {
-        id,
+        id: 0, // placeholder — the DB assigns the surrogate rowid on INSERT (ADR-0005).
         note_path: note_path.to_string(),
         line_number,
         text: body.to_string(),
@@ -296,13 +298,15 @@ plain text
     }
 
     #[test]
-    fn stub_id_is_stable_for_same_input() {
+    fn parsed_task_has_zero_id_placeholder() {
         let tasks_a = parse_tasks("- [ ] hello", "a.md");
         let tasks_b = parse_tasks("- [ ] hello", "a.md");
         assert_eq!(tasks_a.len(), 1);
-        assert_eq!(tasks_a[0].id, tasks_b[0].id);
-        assert_eq!(tasks_a[0].id, tasks_b[0].id);
-        assert!(!tasks_a[0].id.is_empty());
+        // The parser no longer generates identity — id is always 0; the DB assigns
+        // the real surrogate rowid on INSERT (ADR-0005).
+        assert_eq!(tasks_a[0].id, 0);
+        assert_eq!(tasks_b[0].id, 0);
+        // text_hash IS load-bearing — it's the reconciliation key.
         assert!(!tasks_a[0].text_hash.is_empty());
     }
 

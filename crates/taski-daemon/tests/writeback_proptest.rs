@@ -215,7 +215,7 @@ proptest! {
 
         // Enqueue + process the flip.
         db::enqueue_action(
-            &conn, &anchor.id, note_rel, anchor_line, anchor_ch, target_ch,
+            &conn, anchor.id, note_rel, anchor_line, anchor_ch, target_ch,
         )
         .unwrap();
         let action = db::pending_actions(&conn).unwrap()[0].clone();

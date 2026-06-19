@@ -56,7 +56,7 @@ Validated against external prior art (research notes, 2026-06-20):
 - ⚠️ **Text edits break continuity.** Editing a task's text in Obsidian causes the old row to be deleted and a new one inserted. Any pending flip on the old rowid is refused (`TaskNotFound`). This is safe but means the user must re-toggle after editing text. Acceptable under ADR-0003 (Taski never edits text; text edits are user-initiated).
 - ⚠️ **Cross-note moves lose history.** Renaming a note or cut-pasting tasks between notes produces delete-old + insert-new. A future slice can add note-level Jaccard-similarity rename detection.
 - ⚠️ **Schema migration required.** `tasks.id` changes from `TEXT` to `INTEGER`; `pending_actions.task_id` likewise. Pre-MVP, this is a drop-and-recreate (gated by `PRAGMA user_version = 2`).
-- ⚠️ Duplicate tasks (identical text, same note) are disambiguated by greedy in-order matching. Correct unless duplicates are reordered between scans (rare); history-only impact, no safety risk.
+- ⚠️ **Duplicate tasks (identical text, same note)** are disambiguated by greedy in-order matching. For distinct tasks this is always correct. Under rare restructuring — deleting one duplicate and adding another with identical text during the short window between a TUI toggle enqueue and daemon drain — a flip can land on the wrong duplicate. This is a wrong *mutation* (a different checkbox gets toggled), not corruption — the note remains valid Markdown and no data is lost. It is inherent to content-based identity; the only complete fix is injected markers, rejected for MVP (see Alternatives).
 
 ## Alternatives considered
 

@@ -150,7 +150,7 @@ fn enqueue_toggle(conn: &Connection, task: &Task) -> Result<()> {
     let new_char = toggle_target_char(&task.raw_checkbox_char);
     db::enqueue_action(
         conn,
-        &task.id,
+        task.id,
         &task.note_path,
         task.line_number,
         &task.raw_checkbox_char,
@@ -223,13 +223,13 @@ mod tests {
     use super::*;
     use taski_db::Status;
 
-    fn task(id: &str, raw: &str, line: usize, note: &str) -> Task {
+    fn task(id: i64, raw: &str, line: usize, note: &str) -> Task {
         Task {
-            id: id.to_string(),
+            id,
             note_path: note.to_string(),
             line_number: line,
             text: format!("task {id}"),
-            text_hash: "h".to_string(),
+            text_hash: format!("h{id}"),
             status: Status::from_checkbox_char(raw),
             raw_checkbox_char: raw.to_string(),
             note_hash: None,
@@ -246,15 +246,15 @@ mod tests {
         let conn = db::open(":memory:").unwrap();
         assert!(db::all_tasks(&conn).unwrap().is_empty());
 
-        db::upsert_task(&conn, &task("a", " ", 1, "n.md")).unwrap();
-        db::upsert_task(&conn, &task("b", "x", 2, "n.md")).unwrap();
+        db::upsert_task(&conn, &task(1, " ", 1, "n.md")).unwrap();
+        db::upsert_task(&conn, &task(2, "x", 2, "n.md")).unwrap();
         assert_eq!(db::all_tasks(&conn).unwrap().len(), 2);
 
         // Mutate a's status via upsert-on-same-id, then re-query.
-        db::upsert_task(&conn, &task("a", "/", 1, "n.md")).unwrap();
+        db::upsert_task(&conn, &task(1, "/", 1, "n.md")).unwrap();
         let got = db::all_tasks(&conn).unwrap();
         assert_eq!(got.len(), 2, "upsert on same id must not grow the table");
-        let a = got.iter().find(|t| t.id == "a").unwrap();
+        let a = got.iter().find(|t| t.id == 1).unwrap();
         assert_eq!(a.status, Status::InProgress);
     }
 
@@ -273,9 +273,9 @@ mod tests {
 
         // Add 3 tasks (distinct notes so they can be removed selectively): refresh ->
         // 3 tasks, selection jumps to 0 (was empty/None).
-        db::upsert_task(&conn, &task("a", " ", 1, "alpha.md")).unwrap();
-        db::upsert_task(&conn, &task("b", " ", 2, "beta.md")).unwrap();
-        db::upsert_task(&conn, &task("c", " ", 3, "gamma.md")).unwrap();
+        db::upsert_task(&conn, &task(1, " ", 1, "alpha.md")).unwrap();
+        db::upsert_task(&conn, &task(2, " ", 2, "beta.md")).unwrap();
+        db::upsert_task(&conn, &task(3, " ", 3, "gamma.md")).unwrap();
         refresh_tasks(&conn, &mut tasks, &mut state).unwrap();
         assert_eq!(tasks.len(), 3);
         assert_eq!(state.selected(), Some(0));
@@ -327,13 +327,13 @@ mod tests {
         let conn = db::open(":memory:").unwrap();
         assert!(db::pending_actions(&conn).unwrap().is_empty());
 
-        let t = task("a", " ", 3, "n.md");
+        let t = task(1, " ", 3, "n.md");
         enqueue_toggle(&conn, &t).unwrap();
 
         let pending = db::pending_actions(&conn).unwrap();
         assert_eq!(pending.len(), 1);
         let p = &pending[0];
-        assert_eq!(p.task_id, "a");
+        assert_eq!(p.task_id, 1);
         assert_eq!(p.note_path, "n.md");
         assert_eq!(p.line_number, 3);
         assert_eq!(p.expected_char, " ");
@@ -343,7 +343,7 @@ mod tests {
 
         // A done task enqueues a flip back to open.
         db::resolve_action(&conn, p.id, "done", None).unwrap(); // clear the queue
-        let done_task = task("b", "x", 7, "n.md");
+        let done_task = task(2, "x", 7, "n.md");
         enqueue_toggle(&conn, &done_task).unwrap();
         let p2 = &db::pending_actions(&conn).unwrap()[0];
         assert_eq!(p2.expected_char, "x");

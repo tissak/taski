@@ -80,9 +80,11 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-/// Read one note, recompute its tasks, and upsert them into the index. Any previous
-/// tasks for the note are deleted first so stale rows from an old line layout don't
-/// linger. Returns the number of tasks indexed (0 if the note was skipped).
+/// Read one note, recompute its tasks, and reconcile them into the index via
+/// content-hash matching (ADR-0005 §3). Tasks whose `text_hash` matches an existing
+/// row for this note keep their surrogate rowid (UPDATEd in place); unmatched old
+/// rows are deleted; new tasks are inserted. Returns the number of tasks indexed
+/// (0 if the note was skipped).
 ///
 /// Tolerates non-UTF8 and just-vanished files: both are skipped with a log line
 /// rather than aborting the caller.
@@ -106,22 +108,23 @@ pub fn index_note(conn: &Connection, abs_path: &Path, vault_root: &Path) -> Resu
         }
     };
 
-    db::delete_tasks_for_note(conn, &rel)
-        .with_context(|| format!("deleting old tasks for {rel:?}"))?;
-
     // Capture the note's content hash + mtime at scan time. These anchor the
     // write-back conflict check (ADR-0004): before flipping a checkbox the daemon
     // verifies the note is still byte-identical to this snapshot.
     let hash = content_hash(&bytes);
     let mtime = note_mtime(abs_path);
 
-    let mut tasks = parse_tasks(markdown, &rel);
-    for task in &mut tasks {
-        task.note_hash = Some(hash.clone());
-        task.note_mtime = mtime;
-        db::upsert_task(conn, task).with_context(|| format!("upserting task from {rel:?}"))?;
-    }
-    tracing::debug!(?rel, count = tasks.len(), "indexed note");
+    let tasks = parse_tasks(markdown, &rel);
+    let summary = db::reconcile_note(conn, &rel, &tasks, Some(&hash), mtime)
+        .with_context(|| format!("reconciling tasks for {rel:?}"))?;
+    tracing::debug!(
+        ?rel,
+        total = tasks.len(),
+        kept = summary.kept,
+        inserted = summary.inserted,
+        deleted = summary.deleted,
+        "reconciled note"
+    );
     Ok(tasks.len())
 }
 
@@ -359,19 +362,25 @@ pub fn process_pending_actions(conn: &Connection, vault_root: &Path) -> Result<(
     Ok(())
 }
 
-/// Execute one pending checkbox flip per ADR-0002/0004. The vault is mutated **only**
-/// on a successful [`ApplyOutcome::Applied`]; every other path leaves it untouched.
+/// Execute one pending checkbox flip per ADR-0002/0004/0005. The vault is mutated
+/// **only** on a successful [`ApplyOutcome::Applied`]; every other path leaves it
+/// untouched.
 ///
 /// Sequence:
 /// 1. Validate `new_char` is exactly one character (H1) and decode it to a `char`.
-/// 2. Look up the current task row by `action.task_id`.
+/// 2. Look up the current task row by `action.task_id` (surrogate rowid, ADR-0005).
 /// 3. Read the note fresh.
 /// 4. Authoritative conflict check: current content hash == stored `note_hash`.
-/// 5. Locate the target line by `action.line_number` (what the user saw).
+/// 5. **Target the row's CURRENT `line_number`** (ADR-0005 §4), not the stale
+///    `action.line_number` (which is now audit-only).
 /// 6. Three-way byte verification on the on-disk checkbox char (M2 idempotency):
-///    - equals `expected_char` → flip it;
 ///    - equals `new_char` → already done (e.g. retry after a crash) → `Applied`;
+///    - equals `expected_char` → flip it;
 ///    - anything else → `TaskLineMismatch`.
+///
+///    Plus a guard (ADR-0005 §4): if `action.expected_char != row.raw_checkbox_char`
+///    (the checkbox was changed in Obsidian between enqueue and execute, and the
+///    re-scan updated the row), refuse with `TaskLineMismatch`.
 /// 7. Flip exactly that one char (byte-level surgery — preserves every other byte,
 ///    including line endings).
 /// 8. Atomic write (temp file in same dir → fsync → re-verify hash → rename) with a
@@ -389,7 +398,7 @@ pub fn process_action(
     };
 
     // 2. Current task row (the DB row is a *claim*, not truth — bytes are re-verified).
-    let Some(row) = lookup_task_for_action(conn, &action.task_id)? else {
+    let Some(row) = lookup_task_for_action(conn, action.task_id)? else {
         return Ok(ApplyOutcome::TaskNotFound);
     };
 
@@ -407,15 +416,13 @@ pub fn process_action(
         return Ok(ApplyOutcome::ConflictNoteChanged);
     }
 
-    // 5. The target line, by the line number the user saw.
-    let Some(line_range) = line_byte_range(&bytes, action.line_number) else {
+    // 5. Target the task's CURRENT line (ADR-0005 §4) — the row's `line_number`,
+    //    updated by reconciliation if the task moved, NOT the stale `action.line_number`.
+    let Some(line_range) = line_byte_range(&bytes, row.line_number) else {
         return Ok(ApplyOutcome::TaskLineMismatch);
     };
 
-    // 6. Three-way byte verification (M2). We don't compare the stored `raw_checkbox_char`
-    //    to `expected_char` (both are stale claims that could legitimately disagree after
-    //    a crash+restart re-scan). Instead, trust only the bytes: whatever is on disk now
-    //    is authoritative.
+    // 6. Three-way byte verification (M2) + row-level guard.
     let Some((on_disk_c, char_range)) = find_checkbox_char_any(&bytes, line_range.clone()) else {
         return Ok(ApplyOutcome::TaskLineMismatch);
     };
@@ -425,9 +432,15 @@ pub fn process_action(
         // do not touch the file (idempotent).
         return Ok(ApplyOutcome::Applied);
     }
-    // Decode expected_char for the comparison. If the action's expected_char is itself
-    // malformed, the on-disk char can't equal the intended "before" state, so the only
-    // safe outcome is a mismatch refusal.
+    // Guard (ADR-0005 §4): the row's checkbox char was updated by a re-scan since
+    // enqueue, meaning the user changed the checkbox in Obsidian. Refuse rather than
+    // act on a stale expected_char. (This fires AFTER the M2 idempotency check so
+    // crash-recovery idempotent applies still succeed.)
+    if action.expected_char != row.raw_checkbox_char {
+        return Ok(ApplyOutcome::TaskLineMismatch);
+    }
+    // Decode expected_char for the on-disk comparison. If malformed, the on-disk char
+    // can't equal the intended "before" state, so refuse.
     let Some(expected_c) = single_char(&action.expected_char) else {
         return Ok(ApplyOutcome::TaskLineMismatch);
     };
@@ -461,18 +474,28 @@ fn single_char(s: &str) -> Option<char> {
 /// The slice of a task row needed to execute an action.
 struct TaskRow {
     note_path: String,
+    /// The task's CURRENT line number (updated by reconciliation if the task moved).
+    /// process_action targets this line, not the stale `action.line_number`.
+    line_number: usize,
+    /// The task's current checkbox char — compared to `action.expected_char` as a
+    /// guard against the checkbox having been flipped between enqueue and execute.
+    raw_checkbox_char: String,
     note_hash: Option<String>,
 }
 
-/// Fetch [`TaskRow`] for a task id, or `None` if the task is no longer indexed.
-fn lookup_task_for_action(conn: &Connection, task_id: &str) -> Result<Option<TaskRow>> {
+/// Fetch [`TaskRow`] for a task id (surrogate rowid), or `None` if the task is no
+/// longer indexed.
+fn lookup_task_for_action(conn: &Connection, task_id: i64) -> Result<Option<TaskRow>> {
     let row = conn.query_row(
-        "SELECT note_path, note_hash FROM tasks WHERE id = ?1",
+        "SELECT note_path, line_number, raw_checkbox_char, note_hash
+         FROM tasks WHERE id = ?1",
         rusqlite::params![task_id],
         |row| {
             Ok(TaskRow {
                 note_path: row.get(0)?,
-                note_hash: row.get(1)?,
+                line_number: row.get::<_, i64>(1)? as usize,
+                raw_checkbox_char: row.get(2)?,
+                note_hash: row.get(3)?,
             })
         },
     );
