@@ -1,0 +1,11 @@
+[package]
+name = "taski-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+taski-db.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+anyhow.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "taski-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+taski-core.workspace = true
+taski-db.workspace = true
+anyhow.workspace = true

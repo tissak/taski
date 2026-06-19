@@ -18,6 +18,8 @@ Authoritative record of technology choices for Taski. Each entry has a one-line 
 | **SQLite via `rusqlite` + `libsqlite3-sys`** | Battle-tested WAL multi-process access (daemon writes, any-language TUI reads). Limbo/Turso rejected — see ADR-0001. | 2026-06-20 |
 | **WAL journal mode**, `synchronous=NORMAL` | Standard SQLite pattern for one-writer + many-readers across processes. | 2026-06-20 |
 
+> **Pin note (rusqlite):** currently pinned to `0.39` (libsqlite3-sys `0.37`). `rusqlite 0.40` pulls libsqlite3-sys `0.38`, whose `build.rs` uses the unstable `cfg_select!` macro and does **not** compile on stable rustc 1.93. Bump back to `0.40` once the toolchain stabilizes `cfg_select!`. (Validated 2026-06-20.)
+
 ## Scanner / Daemon
 | Choice | Rationale | Decided |
 |---|---|---|

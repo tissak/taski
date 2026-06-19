@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/taski-core",
+    "crates/taski-db",
+    "crates/taski-daemon",
+    "crates/taski-tui",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+rust-version = "1.93"
+
+[workspace.dependencies]
+# Internal crates
+taski-core = { path = "crates/taski-core" }
+taski-db = { path = "crates/taski-db" }
+
+# External crates
+anyhow = "1.0"
+crossterm = "0.29"
+ratatui = "0.30"
+rusqlite = { version = "0.39", features = ["bundled"] }
+thiserror = "2.0"
