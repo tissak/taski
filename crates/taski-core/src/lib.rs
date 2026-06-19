@@ -133,13 +133,16 @@ fn parse_task_line(raw_line: &str, note_path: &str, line_number: usize, now: i64
 /// Match `^\s*[-*+]\s+\[(.)\]\s+(.+)$` for a single line, returning the two captured
 /// slices (`checkbox_char`, `body`). Hand-rolled so we avoid a regex dependency in
 /// Slice 0; safe because all indices land on UTF-8 char boundaries.
+///
+/// As a Slice 1 hardening, a leading run of blockquote markers (`>` optionally
+/// followed by whitespace) is tolerated *before* the bullet — so `> - [ ] task` and
+/// `> > - [x] nested` are recognised. Behaviour for ordinary lines is unchanged.
 fn task_captures(line: &str) -> Option<(&str, &str)> {
-    // Leading whitespace (we re-slice from the original line at the end).
-    let mut i = 0;
+    // Leading whitespace, then any run of `>` blockquote markers (each optionally
+    // followed by whitespace). Leaves `i` at the first byte that is neither.
     let bytes = line.as_bytes();
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
+    let mut i = 0;
+    advance_past_leading_markers(bytes, &mut i);
     if i >= bytes.len() {
         return None;
     }
@@ -187,6 +190,22 @@ fn task_captures(line: &str) -> Option<(&str, &str)> {
     let checkbox_str = &line[char_start..close_idx];
     let body = &line[j..];
     Some((checkbox_str, body))
+}
+
+/// Advance `i` past leading ASCII whitespace and any run of `>` blockquote markers
+/// (each optionally followed by more whitespace). Stops at the first byte that is
+/// neither whitespace nor part of a leading `>` run.
+fn advance_past_leading_markers(bytes: &[u8], i: &mut usize) {
+    loop {
+        while *i < bytes.len() && bytes[*i].is_ascii_whitespace() {
+            *i += 1;
+        }
+        if *i < bytes.len() && bytes[*i] == b'>' {
+            *i += 1;
+            continue;
+        }
+        break;
+    }
 }
 
 fn hash_str(value: &str) -> String {
@@ -282,7 +301,34 @@ plain text
         let tasks_b = parse_tasks("- [ ] hello", "a.md");
         assert_eq!(tasks_a.len(), 1);
         assert_eq!(tasks_a[0].id, tasks_b[0].id);
+        assert_eq!(tasks_a[0].id, tasks_b[0].id);
         assert!(!tasks_a[0].id.is_empty());
         assert!(!tasks_a[0].text_hash.is_empty());
+    }
+
+    #[test]
+    fn tolerates_leading_blockquote_markers() {
+        let md = "\
+> - [ ] quoted open
+> > - [x] double-quoted done
+- [ ] normal
+>>> - [/] triple-quoted in progress
+";
+
+        let tasks = parse_tasks(md, "q.md");
+        assert_eq!(
+            tasks.len(),
+            4,
+            "blockquote-prefixed tasks should be recognised"
+        );
+
+        assert_eq!(tasks[0].status, Status::Open);
+        assert_eq!(tasks[0].text, "quoted open");
+        assert_eq!(tasks[1].status, Status::Done);
+        assert_eq!(tasks[1].text, "double-quoted done");
+        assert_eq!(tasks[2].status, Status::Open);
+        assert_eq!(tasks[2].text, "normal");
+        assert_eq!(tasks[3].status, Status::InProgress);
+        assert_eq!(tasks[3].text, "triple-quoted in progress");
     }
 }

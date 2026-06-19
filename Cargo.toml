@@ -19,7 +19,16 @@ taski-db = { path = "crates/taski-db" }
 
 # External crates
 anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
+ctrlc = "3"
+notify = "8"
+notify-debouncer-mini = "0.6"
+proptest = "1"
 ratatui = "0.30"
 rusqlite = { version = "0.39", features = ["bundled"] }
+tempfile = "3"
 thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+walkdir = "2"

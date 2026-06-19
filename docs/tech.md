@@ -23,8 +23,13 @@ Authoritative record of technology choices for Taski. Each entry has a one-line 
 ## Scanner / Daemon
 | Choice | Rationale | Decided |
 |---|---|---|
-| **`notify`** (crate) | Cross-platform FS events; primary target is macOS (FSEvents). Debounce + periodic reconcile needed on darwin. | 2026-06-20 |
-| **`pulldown-cmark`** | Robust, spec-compliant Markdown parser; tolerant of real-world vault markup. | 2026-06-20 |
+| **`notify` + `notify-debouncer-mini`** | Cross-platform FS events; debounced (300ms) to coalesce rapid saves. Primary target macOS (FSEvents). Note: `mini` does not report event kind (create/modify/remove) — action is decided by a file-existence check. | 2026-06-20 |
+| **`clap`** (derive) | Daemon CLI args (`--vault`, `--db`, `--once`). | 2026-06-20 |
+| **`walkdir`** | Recursive vault scan with hidden-dir pruning (`.obsidian` / `.trash` / `.git`). | 2026-06-20 |
+| **`ctrlc`** | Graceful SIGINT shutdown of the watch loop. | 2026-06-20 |
+| **Line-based parser** (in `taski-core`) | Current Markdown checkbox parser — fence-aware, tolerates leading blockquote markers. Chosen over `pulldown-cmark` for now (YAGNI; checkboxes are line-oriented). | 2026-06-20 |
+
+> **Deferred (revisit when needed):** `pulldown-cmark` (adopt when real edge cases — tasks in nested lists / inline code / callouts — exceed the line parser), and Tasks-plugin due-date (`📅`) *extraction* (the line is already parsed as a task; only the metadata parse is deferred).
 
 ## UI / TUI
 | Choice | Rationale | Decided |
@@ -40,9 +45,9 @@ Authoritative record of technology choices for Taski. Each entry has a one-line 
 ## Testing
 | Choice | Rationale | Decided |
 |---|---|---|
-| **`tempfile` + `assert_fs`** | Integration tests against throwaway fake vaults — never the real vault. | 2026-06-20 |
-| **`proptest`** | Property tests for write-back safety ("never corrupts") and stable identity. | 2026-06-20 |
-| **`cargo-fuzz`** | Fuzz the parser against arbitrary Markdown-ish bytes (never panic). | 2026-06-20 |
+| **`tempfile`** | Integration tests against throwaway fake vaults — never the real vault. (Real vault is exercised at runtime via `taski.db`, which is gitignored.) | 2026-06-20 |
+| **`proptest`** | Property tests: parser never panics on arbitrary input; (Slice 3+) write-back "never corrupts" + stable identity. | 2026-06-20 |
+| **`cargo-fuzz`** | *Deferred* — needs nightly; `proptest` covers the "never panic" property on stable for now. Revisit when nightly is acceptable. | 2026-06-20 |
 | **`cargo-deny`** | CI advisory/license/supply-chain checks. | 2026-06-20 |
 
 ## Explicitly Rejected (for MVP)

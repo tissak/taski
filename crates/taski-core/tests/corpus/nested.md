@@ -1,0 +1,4 @@
+- [ ] top level
+  - [ ] nested one
+  - [x] nested two
+    - [/] deeply nested

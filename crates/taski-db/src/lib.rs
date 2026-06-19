@@ -63,6 +63,17 @@ pub fn upsert_task(conn: &Connection, task: &Task) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Delete every task belonging to a single note, keyed on its `note_path` (relative
+/// to the vault root). Used by the daemon before re-indexing a note and on note
+/// removal so the index never carries stale rows for a note's old line layout.
+pub fn delete_tasks_for_note(conn: &Connection, note_path: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM tasks WHERE note_path = ?1",
+        rusqlite::params![note_path],
+    )?;
+    Ok(())
+}
+
 /// Read every task from the index, ordered by note path then line number for a stable
 /// display. Status is reconstructed from `raw_checkbox_char` via
 /// [`Status::from_checkbox_char`].
@@ -143,5 +154,38 @@ mod tests {
         assert_eq!(a.text, "changed");
         assert_eq!(a.line_number, 9);
         assert_eq!(a.status, Status::InProgress);
+    }
+
+    #[test]
+    fn delete_tasks_for_note_removes_only_that_note() {
+        let conn = open(":memory:").unwrap();
+        // Two notes, distinct note_path values.
+        let mut a1 = sample_task("a1", " ", 1);
+        a1.note_path = "alpha.md".to_string();
+        let mut a2 = sample_task("a2", "x", 2);
+        a2.note_path = "alpha.md".to_string();
+        let mut b1 = sample_task("b1", "/", 1);
+        b1.note_path = "beta.md".to_string();
+
+        upsert_task(&conn, &a1).unwrap();
+        upsert_task(&conn, &a2).unwrap();
+        upsert_task(&conn, &b1).unwrap();
+        assert_eq!(all_tasks(&conn).unwrap().len(), 3);
+
+        // Delete alpha.md only.
+        delete_tasks_for_note(&conn, "alpha.md").unwrap();
+
+        let got = all_tasks(&conn).unwrap();
+        assert_eq!(
+            got.len(),
+            1,
+            "alpha's rows should be gone, beta should remain"
+        );
+        assert_eq!(got[0].id, "b1");
+        assert_eq!(got[0].note_path, "beta.md");
+
+        // Deleting a note with no rows is a no-op (and not an error).
+        delete_tasks_for_note(&conn, "nonexistent.md").unwrap();
+        assert_eq!(all_tasks(&conn).unwrap().len(), 1);
     }
 }

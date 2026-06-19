@@ -8,3 +8,14 @@ rust-version.workspace = true
 taski-core.workspace = true
 taski-db.workspace = true
 anyhow.workspace = true
+clap.workspace = true
+ctrlc.workspace = true
+notify.workspace = true
+notify-debouncer-mini.workspace = true
+rusqlite.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
