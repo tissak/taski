@@ -2,5 +2,6 @@
 *.db
 *.db-wal
 *.db-shm
+*.taski.tmp
 .DS_Store
 **/*.rs.bk

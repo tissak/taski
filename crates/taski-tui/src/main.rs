@@ -113,9 +113,51 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, conn: &Connection) -> 
             KeyCode::Char('c') if ctrl => return Ok(()),
             KeyCode::Down | KeyCode::Char('j') => move_selection(&mut state, tasks.len(), 1),
             KeyCode::Up | KeyCode::Char('k') => move_selection(&mut state, tasks.len(), -1),
+            // Space toggles the selected task open<->done via the daemon's write-back
+            // queue (ADR-0002). The TUI never touches vault files directly.
+            KeyCode::Char(' ') => submit_toggle(conn, &tasks, &state),
             _ => {}
         }
     }
+}
+
+/// Enqueue a checkbox-flip request for the currently-selected task. Nothing happens
+/// if nothing is selected. Enqueue errors are logged to stderr and never propagate —
+/// a failed enqueue must not block or crash the UI.
+fn submit_toggle(conn: &Connection, tasks: &[Task], state: &ListState) {
+    let Some(task) = state.selected().and_then(|sel| tasks.get(sel)) else {
+        return;
+    };
+    if let Err(e) = enqueue_toggle(conn, task) {
+        eprintln!("taski: could not enqueue toggle: {e:#}");
+    }
+}
+
+/// Decide the desired checkbox char for a toggle of `raw` (PRD §10.2 / ADR-0003):
+/// open (`" "`) -> done (`"x"`); done (`"x"`/`"X"`) -> open (`" "`); anything else
+/// (in-progress, forwarded, …) resets to open.
+fn toggle_target_char(raw: &str) -> &'static str {
+    match raw {
+        " " => "x",
+        "x" | "X" => " ",
+        _ => " ",
+    }
+}
+
+/// Enqueue a checkbox-flip request for `task` into the shared `pending_actions`
+/// table. Non-blocking: just inserts a row; the daemon applies it.
+fn enqueue_toggle(conn: &Connection, task: &Task) -> Result<()> {
+    let new_char = toggle_target_char(&task.raw_checkbox_char);
+    db::enqueue_action(
+        conn,
+        &task.id,
+        &task.note_path,
+        task.line_number,
+        &task.raw_checkbox_char,
+        new_char,
+    )
+    .context("enqueuing toggle action")?;
+    Ok(())
 }
 
 /// Re-read the index into `tasks` and adjust `state` so the selection survives the
@@ -269,5 +311,42 @@ mod tests {
         state.select(Some(2));
         reconcile_selection(&mut state, 0);
         assert_eq!(state.selected(), None);
+    }
+
+    #[test]
+    fn toggle_target_char_maps_open_done_and_resets_others() {
+        assert_eq!(toggle_target_char(" "), "x");
+        assert_eq!(toggle_target_char("x"), " ");
+        assert_eq!(toggle_target_char("X"), " ");
+        assert_eq!(toggle_target_char("/"), " "); // in-progress -> reset to open
+        assert_eq!(toggle_target_char(">"), " "); // forwarded -> reset to open
+    }
+
+    #[test]
+    fn enqueue_toggle_inserts_pending_action_with_expected_bytes() {
+        let conn = db::open(":memory:").unwrap();
+        assert!(db::pending_actions(&conn).unwrap().is_empty());
+
+        let t = task("a", " ", 3, "n.md");
+        enqueue_toggle(&conn, &t).unwrap();
+
+        let pending = db::pending_actions(&conn).unwrap();
+        assert_eq!(pending.len(), 1);
+        let p = &pending[0];
+        assert_eq!(p.task_id, "a");
+        assert_eq!(p.note_path, "n.md");
+        assert_eq!(p.line_number, 3);
+        assert_eq!(p.expected_char, " ");
+        assert_eq!(p.new_char, "x", "open -> done");
+        assert_eq!(p.state, "pending");
+        assert!(p.error.is_none());
+
+        // A done task enqueues a flip back to open.
+        db::resolve_action(&conn, p.id, "done", None).unwrap(); // clear the queue
+        let done_task = task("b", "x", 7, "n.md");
+        enqueue_toggle(&conn, &done_task).unwrap();
+        let p2 = &db::pending_actions(&conn).unwrap()[0];
+        assert_eq!(p2.expected_char, "x");
+        assert_eq!(p2.new_char, " ");
     }
 }

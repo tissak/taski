@@ -1773,6 +1773,7 @@ dependencies = [
  "ctrlc",
  "notify",
  "notify-debouncer-mini",
+ "proptest",
  "rusqlite",
  "taski-core",
  "taski-db",

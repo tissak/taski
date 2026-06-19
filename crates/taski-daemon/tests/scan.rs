@@ -126,3 +126,42 @@ fn index_note_skips_non_utf8_without_bailing() {
     assert_eq!(n, 0, "non-UTF8 note is skipped, not indexed");
     assert!(db::all_tasks(&conn).expect("all_tasks").is_empty());
 }
+
+/// Slice 3: indexing must populate `note_hash` + `note_mtime` (the anchor for the
+/// write-back conflict check), and the hash must be stable for unchanged bytes but
+/// change when the bytes change.
+#[test]
+fn index_note_populates_note_hash_and_mtime() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let conn = db::open(&tmp.path().join("h.db").to_string_lossy()).expect("open db");
+    let note = root.join("a.md");
+    fs::write(&note, "- [ ] do a thing\n").unwrap();
+
+    index_note(&conn, &note, root).expect("index");
+    let tasks = db::all_tasks(&conn).expect("all_tasks");
+    assert_eq!(tasks.len(), 1);
+    assert!(tasks[0].note_hash.is_some(), "note_hash must be populated");
+    assert!(
+        tasks[0].note_mtime.is_some(),
+        "note_mtime must be populated"
+    );
+
+    // Stable for unchanged bytes.
+    let h1 = tasks[0].note_hash.clone().unwrap();
+    index_note(&conn, &note, root).expect("re-index");
+    let h2 = db::all_tasks(&conn).expect("all_tasks")[0]
+        .note_hash
+        .clone()
+        .unwrap();
+    assert_eq!(h1, h2, "content hash must be stable for unchanged bytes");
+
+    // Different when bytes change.
+    fs::write(&note, "- [ ] do a DIFFERENT thing\n").unwrap();
+    index_note(&conn, &note, root).expect("re-index changed");
+    let h3 = db::all_tasks(&conn).expect("all_tasks")[0]
+        .note_hash
+        .clone()
+        .unwrap();
+    assert_ne!(h3, h1, "content hash must change when bytes change");
+}

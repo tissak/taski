@@ -34,5 +34,12 @@ The write must also re-verify the exact bytes at the target line match the recor
 - **Last-write-wins** — rejected; risks clobbering user edits.
 - **Merge** — rejected for MVP; too complex for the value, and text-merge of Markdown checkboxes is error-prone.
 
+## Implementation notes (added on implementing Slice 3, 2026-06-20)
+- **The conflict check runs twice.** Once in `process_action` (decide whether to proceed), and again as a **final TOCTOU guard inside `atomic_write`**: immediately before the `rename` (after the temp's `fsync`), the target is re-read and re-hashed and compared to the snapshot hash. There is deliberately **no I/O between that re-read and the `rename`**. Without this second check, the window between the first check and the (post-`fsync`) `rename` — tens of milliseconds — could silently clobber an Obsidian save that landed in it. The guard narrows the race to microseconds. (Surfaced by an independent safety review.)
+- **Hash is authoritative; mtime is informational only.** The decision never consults mtime, avoiding false refusals from mtime-resolution edge cases.
+- **Deferred from this ADR's step 4:** the "re-scan and retry once on conflict" is **not** implemented in the MVP — the executor refuses on conflict instead. Refusing is always safe; the retry is a UX nicety.
+- **Crash recovery is idempotent:** if the daemon dies after a successful write but before resolving the action, re-processing that action on restart detects the on-disk char already equals the desired new char and returns `Applied` (not a misleading `failed`).
+- **Deferred (durability, not correctness):** the parent directory is not `fsync`ed after `rename`, so a power loss immediately after a flip could revert it. `rename` is atomic, so this is never a corruption vector — only a potential loss of the last flip on power failure.
+
 ## References
 - [`docs/tech.md`](../tech.md), [ADR-0002](./0002-write-back-through-daemon.md), [ADR-0003](./0003-checkbox-only-mvp.md)

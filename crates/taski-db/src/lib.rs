@@ -12,7 +12,7 @@ use rusqlite::Connection;
 // and `Task` into scope within this module.
 pub use taski_core::{Status, Task};
 
-/// The canonical `tasks` schema, owned in this one place (PRD §9). Created with
+/// The canonical schema, owned in this one place (PRD §9). Created with
 /// `IF NOT EXISTS` so `open()` is idempotent.
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS tasks (
@@ -27,6 +27,21 @@ CREATE TABLE IF NOT EXISTS tasks (
   note_mtime        INTEGER,
   due_date          TEXT,
   updated_at        INTEGER NOT NULL
+);
+
+-- PRD §8 / ADR-0002: the queue the TUI writes action requests into and the daemon
+-- (sole vault writer) drains. A row's lifecycle is pending -> done | failed.
+CREATE TABLE IF NOT EXISTS pending_actions (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id           TEXT NOT NULL,
+  note_path         TEXT NOT NULL,
+  line_number       INTEGER NOT NULL,
+  expected_char     TEXT NOT NULL,   -- raw_checkbox_char the user saw (byte verify)
+  new_char          TEXT NOT NULL,   -- desired checkbox char after flip
+  state             TEXT NOT NULL DEFAULT 'pending',  -- pending | done | failed
+  created_at        INTEGER NOT NULL,
+  resolved_at       INTEGER,
+  error             TEXT
 );
 ";
 
@@ -72,6 +87,112 @@ pub fn delete_tasks_for_note(conn: &Connection, note_path: &str) -> rusqlite::Re
         rusqlite::params![note_path],
     )?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// pending_actions: the TUI -> daemon write-back queue (ADR-0002 / ADR-0003).
+// ---------------------------------------------------------------------------
+
+/// One requested checkbox flip, queued by the TUI for the daemon to execute. The
+/// lifecycle is `pending` -> `done` (applied) or `failed` (refused/errored).
+#[derive(Debug, Clone)]
+pub struct PendingAction {
+    /// Row id (AUTOINCREMENT).
+    pub id: i64,
+    /// `tasks.id` of the target task.
+    pub task_id: String,
+    /// Note the task lives in (relative to vault root).
+    pub note_path: String,
+    /// 1-based line of the checkbox within the note.
+    pub line_number: usize,
+    /// The `raw_checkbox_char` the user saw when requesting the flip; the daemon
+    /// re-verifies this exact byte is still present before writing (ADR-0004).
+    pub expected_char: String,
+    /// Desired checkbox char after the flip (e.g. `"x"`, `" "`, `"/"`).
+    pub new_char: String,
+    /// `pending` | `done` | `failed`.
+    pub state: String,
+    /// Unix seconds the action was enqueued.
+    pub created_at: i64,
+    /// Unix seconds the daemon resolved the action (`None` while pending).
+    pub resolved_at: Option<i64>,
+    /// Error/explanation message set when `state = "failed"`.
+    pub error: Option<String>,
+}
+
+/// Enqueue a checkbox-flip request from the TUI. Inserts with `state='pending'` and
+/// returns the new row id.
+pub fn enqueue_action(
+    conn: &Connection,
+    task_id: &str,
+    note_path: &str,
+    line_number: usize,
+    expected_char: &str,
+    new_char: &str,
+) -> rusqlite::Result<i64> {
+    conn.execute(
+        "INSERT INTO pending_actions
+            (task_id, note_path, line_number, expected_char, new_char, state, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
+        rusqlite::params![
+            task_id,
+            note_path,
+            line_number as i64,
+            expected_char,
+            new_char,
+            unix_now(),
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// All actions still awaiting processing, oldest first.
+pub fn pending_actions(conn: &Connection) -> rusqlite::Result<Vec<PendingAction>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, task_id, note_path, line_number, expected_char, new_char,
+                state, created_at, resolved_at, error
+         FROM pending_actions
+         WHERE state = 'pending'
+         ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(PendingAction {
+            id: row.get(0)?,
+            task_id: row.get(1)?,
+            note_path: row.get(2)?,
+            line_number: row.get::<_, i64>(3)? as usize,
+            expected_char: row.get(4)?,
+            new_char: row.get(5)?,
+            state: row.get(6)?,
+            created_at: row.get(7)?,
+            resolved_at: row.get(8)?,
+            error: row.get(9)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Mark an action resolved: `state` becomes `done` or `failed`, `resolved_at` is
+/// stamped, and an optional explanation `error` is recorded.
+pub fn resolve_action(
+    conn: &Connection,
+    id: i64,
+    state: &str,
+    error: Option<&str>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE pending_actions SET state = ?1, resolved_at = ?2, error = ?3 WHERE id = ?4",
+        rusqlite::params![state, unix_now(), error, id],
+    )?;
+    Ok(())
+}
+
+/// Current unix time in seconds, or 0 if the clock is before the epoch.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Read every task from the index, ordered by note path then line number for a stable
@@ -187,5 +308,36 @@ mod tests {
         // Deleting a note with no rows is a no-op (and not an error).
         delete_tasks_for_note(&conn, "nonexistent.md").unwrap();
         assert_eq!(all_tasks(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pending_actions_enqueue_resolve_round_trip() {
+        let conn = open(":memory:").unwrap();
+        assert!(pending_actions(&conn).unwrap().is_empty());
+
+        let id = enqueue_action(&conn, "tid", "note.md", 4, " ", "x").unwrap();
+        let pending = pending_actions(&conn).unwrap();
+        assert_eq!(pending.len(), 1);
+        let p = &pending[0];
+        assert_eq!(p.id, id);
+        assert_eq!(p.task_id, "tid");
+        assert_eq!(p.note_path, "note.md");
+        assert_eq!(p.line_number, 4);
+        assert_eq!(p.expected_char, " ");
+        assert_eq!(p.new_char, "x");
+        assert_eq!(p.state, "pending");
+        assert!(p.error.is_none());
+        assert!(p.resolved_at.is_none());
+
+        // Resolved actions drop out of the pending view; their final state is
+        // recorded. Resolve as done (no error)...
+        resolve_action(&conn, id, "done", None).unwrap();
+        assert!(pending_actions(&conn).unwrap().is_empty());
+
+        // ...and a failed resolution carries an explanation. Re-enqueue first since
+        // the prior one is no longer pending.
+        let id2 = enqueue_action(&conn, "tid2", "note2.md", 1, "x", " ").unwrap();
+        resolve_action(&conn, id2, "failed", Some("note changed externally")).unwrap();
+        assert!(pending_actions(&conn).unwrap().is_empty());
     }
 }
