@@ -12,6 +12,7 @@
 use std::collections::HashSet;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -62,17 +63,47 @@ const TRACK_CAP: usize = 64;
 /// narrow. The pane can also be toggled off explicitly with `p`.
 const MIN_SPLIT_WIDTH: u16 = 60;
 
-/// Library entry point: parse CLI args, load config, open the DB, install the panic
-/// hook, enter the terminal, run the event loop, and restore the terminal. Invoked by
-/// the `taski-tui` binary's thin `main`, and (later) by the unified launcher's
-/// `taski tui` subcommand. Returns `anyhow::Result` so the caller propagates errors.
+/// A caller-provided quit callback. The unified launcher passes one (in combined mode)
+/// that signals the daemon's `ShutdownSignal` so the daemon drains and exits when the
+/// user quits the TUI. Standalone runs pass `None`.
+type QuitHook = Arc<dyn Fn() + Send + Sync>;
+
+/// Run the TUI standalone, parsing its own CLI (`--db`). Used by the `taski-tui`
+/// binary's thin `main`. Returns `anyhow::Result` so the caller propagates errors.
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
+    run_inner(cli.db, None)
+}
 
+/// Run the TUI with a resolved `db` override and NO quit hook. Used by the unified
+/// launcher's `taski tui` subcommand (and, in Phase C, its attach path: TUI-only
+/// against an already-running daemon). `db_override` is the launcher's `--db` flag
+/// (`None` ⇒ resolve from config / default). This entry does **not** re-parse argv, so
+/// it composes cleanly under the launcher's subcommand dispatch.
+pub fn run_with_db(db_override: Option<PathBuf>) -> Result<()> {
+    run_inner(db_override, None)
+}
+
+/// Run the TUI in combined mode: with a `db` override AND a quit hook the launcher uses
+/// to trigger cooperative daemon shutdown (ADR-0007) when the user quits (`q` / `Esc` /
+/// `Ctrl-C`). The TUI stays decoupled from `taski-daemon` — the hook is an opaque
+/// callback, so this crate takes no new dependency.
+pub fn run_combined(
+    db_override: Option<PathBuf>,
+    quit_hook: impl Fn() + Send + Sync + 'static,
+) -> Result<()> {
+    run_inner(db_override, Some(Arc::new(quit_hook)))
+}
+
+/// Shared TUI lifecycle: load config, resolve the db (honoring `db_override`), open the
+/// reader connection, install the panic hook (restore the terminal on any panic), enter
+/// the terminal, run the loop (invoking `quit_hook` on quit if present), and restore the
+/// terminal. `db_override` flows from the caller so the launcher never re-parses argv.
+fn run_inner(db_override: Option<PathBuf>, quit_hook: Option<QuitHook>) -> Result<()> {
     // Config is optional (a missing file yields defaults); a malformed file is a
-    // hard error. Resolve db: CLI flag → config → ./taski.db.
+    // hard error. Resolve db: override → config → ./taski.db.
     let cfg = taski_config::load().context("loading taski config")?;
-    let db_path = taski_config::resolve_db(cli.db.as_deref().and_then(Path::to_str), &cfg);
+    let db_path = taski_config::resolve_db(db_override.as_deref().and_then(Path::to_str), &cfg);
 
     // Restore the terminal even if a panic occurs mid-render.
     let original_hook = std::panic::take_hook();
@@ -82,11 +113,11 @@ pub fn run() -> Result<()> {
     }));
 
     // One long-lived reader connection: WAL lets it coexist with the daemon's writer
-    // (separate process) for the whole session.
+    // (separate process, or a separate thread in combined mode) for the whole session.
     let conn = db::open(&db_path.to_string_lossy()).context("opening taski database")?;
 
     let mut terminal = enter_terminal()?;
-    let result = run_loop(&mut terminal, &conn);
+    let result = run_loop(&mut terminal, &conn, quit_hook.as_ref());
     restore_terminal()?;
     result
 }
@@ -575,7 +606,11 @@ impl App {
 /// Main render+event loop. Holds one DB connection for the whole session and re-reads
 /// the index on a ~750ms cadence so daemon writes appear live without blocking input.
 /// Returns when the user requests to quit.
-fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, conn: &Connection) -> Result<()> {
+fn run_loop(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    conn: &Connection,
+    quit_hook: Option<&QuitHook>,
+) -> Result<()> {
     let mut app = App::new();
     // `None` => never refreshed yet, so the first iteration reads immediately.
     let mut last_refresh: Option<Instant> = None;
@@ -603,8 +638,18 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, conn: &Connection
 
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-            KeyCode::Char('c') if ctrl => return Ok(()),
+            KeyCode::Char('q') | KeyCode::Esc => {
+                if let Some(hook) = quit_hook {
+                    hook();
+                }
+                return Ok(());
+            }
+            KeyCode::Char('c') if ctrl => {
+                if let Some(hook) = quit_hook {
+                    hook();
+                }
+                return Ok(());
+            }
             KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
             // Space toggles the selected task open<->done via the daemon's write-back

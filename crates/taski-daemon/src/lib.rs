@@ -9,8 +9,10 @@
 //! The testable scan + write-back logic lives here as free functions so the
 //! integration tests in `tests/` can exercise it without driving the live watcher.
 
+mod lock;
 mod shutdown;
 
+pub use lock::{DaemonLockGuard, LockOutcome, acquire_daemon_lock, daemon_lock_path};
 pub use shutdown::{ShutdownHandle, ShutdownSignal};
 
 use std::collections::hash_map::DefaultHasher;
@@ -119,7 +121,26 @@ pub fn run() -> Result<()> {
     let (signal, handle) = ShutdownSignal::new();
     ctrlc::set_handler(move || signal.set()).context("installing Ctrl-C handler")?;
 
-    run_daemon(DaemonOpts::from(&cli), handle)
+    // Single-writer enforcement (ADR-0008): acquire the daemon lock beside the resolved
+    // db before running. The guard is passed into `run_daemon` as a capability token and
+    // held for the engine's whole lifetime (released on exit). Refuse if another daemon
+    // already holds it.
+    let cfg = taski_config::load().context("loading taski config")?;
+    let db_path = taski_config::resolve_db(cli.db.as_deref().and_then(Path::to_str), &cfg);
+    let lock_path = daemon_lock_path(&db_path);
+    let guard = match acquire_daemon_lock(&lock_path).context("acquiring daemon lock")? {
+        LockOutcome::Acquired(g) => g,
+        LockOutcome::HeldByOther(pid) => {
+            eprintln!(
+                "taski-daemon: another daemon is already running{}. Refusing to start a \
+                 second writer (ADR-0008). Stop it first, or run a TUI against it.",
+                pid.map(|p| format!(" (PID {p})")).unwrap_or_default()
+            );
+            anyhow::bail!("daemon already running");
+        }
+    };
+
+    run_daemon(DaemonOpts::from(&cli), handle, guard)
 }
 
 /// Run the daemon engine against resolved options: load config, resolve vault/db,
@@ -131,7 +152,17 @@ pub fn run() -> Result<()> {
 /// thread. It does NOT parse CLI args, call `init_tracing`, handle `--init-config`,
 /// or install a Ctrl-C handler — those are the caller's responsibilities (see
 /// [`run`]). `init_tracing` and `write_initial_config` stay in the standalone entry.
-pub fn run_daemon(opts: DaemonOpts, shutdown: ShutdownHandle) -> Result<()> {
+///
+/// The `_lock` guard is the **single-writer capability** (ADR-0008): the caller MUST
+/// have acquired the daemon lock and pass it here. It is held for the engine's whole
+/// lifetime and dropped on return, releasing the lock exactly when the daemon stops —
+/// so every daemon entry point (standalone `run`, `taski daemon`, combined mode) is
+/// uniformly single-writer-protected at the type level.
+pub fn run_daemon(
+    opts: DaemonOpts,
+    shutdown: ShutdownHandle,
+    _lock: DaemonLockGuard,
+) -> Result<()> {
     // Config is optional (a missing file yields defaults); a malformed file is a
     // hard error.
     let cfg = taski_config::load().context("loading taski config")?;
@@ -346,7 +377,15 @@ fn run_watch_loop(conn: &Connection, vault_root: &Path, shutdown: &ShutdownHandl
             }
         }
         if shutdown.is_set() {
-            tracing::info!("shutdown signal received; exiting watch loop");
+            // Final drain: apply any toggles the TUI queued this session before exiting
+            // (ADR-0007), so "quit" means "everything I did has landed". The flag can only
+            // be set after the TUI's main loop returns, so no further enqueues are possible.
+            // Pending rows are durable in SQLite regardless; this is about session UX
+            // completeness. Errors are logged, not fatal.
+            tracing::info!("shutdown signal received; draining pending actions then exiting");
+            if let Err(e) = process_pending_actions(conn, vault_root) {
+                tracing::error!(err = %e, "final pending-actions drain failed");
+            }
             break;
         }
 
@@ -853,7 +892,10 @@ pub fn sweep_tmp_files(vault_root: &Path) -> Result<usize> {
 
 /// Initialise `tracing` stderr output. Honors `RUST_LOG`; defaults to `info`. Safe to
 /// call when a subscriber is already installed (e.g. when running under a test).
-fn init_tracing() {
+/// Initialize `tracing` to stderr at `info` (overridable via `RUST_LOG`). Used by the
+/// standalone daemon entry points; the unified launcher reuses this for `taski daemon`
+/// and installs its own file-sink subscriber for combined mode.
+pub fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()

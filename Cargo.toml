@@ -6,6 +6,7 @@ members = [
     "crates/taski-db",
     "crates/taski-daemon",
     "crates/taski-tui",
+    "crates/taski",
 ]
 
 [workspace.package]
@@ -24,6 +25,7 @@ anyhow = "1.0"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 ctrlc = "3"
+fs2 = "0.4"
 notify = "8"
 notify-debouncer-mini = "0.6"
 proptest = "1"

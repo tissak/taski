@@ -45,8 +45,12 @@ daemon` and `taski tui` run either component alone.
    `taski-tui` binaries are **kept** for back-compat with installed launchd plists; they are
    not replaced.
 4. **Shutdown ordering.** TUI loop returns → `shutdown.set()` → **terminal restored first**
-   (user sees their shell at once) → daemon thread joined (bounded by its ≤500 ms tick plus
-   the final drain) → connections dropped → exit.
+   (user sees their shell at once) → daemon thread joined → connections dropped → exit. Once
+   the watch loop is running, `join()` is bounded by the ≤500 ms tick plus the final drain; if
+   the user quits during the pre-watch-loop setup (config load → vault resolve → `scan_vault`),
+   `join` is bounded by that scan instead (typically sub-second for a personal vault; the daemon
+   does not poll `shutdown` during setup, but the terminal is already restored so only a brief
+   delay before process exit is visible).
 5. **One Ctrl-C handler, dormant in combined mode.** The TUI runs in crossterm raw mode,
    which swallows `SIGINT`, so Ctrl-C arrives as a key event the TUI handles (driving the
    same shutdown path as `q`). The daemon's global `ctrlc::set_handler` is therefore live

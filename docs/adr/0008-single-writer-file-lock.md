@@ -44,9 +44,15 @@ released by the OS when the process exits (including crash / `kill -9`).
    OS releases the lock). A non-acquiring `probe_daemon_lock()` powers the launcher's
    attach decision. The dependency is `fs2` (a tiny, ubiquitous `flock` wrapper), recorded
    in `tech.md`.
-2. **Uniform acquisition across all daemon entry points.** The lock is taken inside
-   `run_daemon`, so the standalone `taski-daemon` binary, `taski daemon`, and the combined
-   launcher's spawned daemon thread are all protected identically.
+2. **Capability-token acquisition: callers acquire, `run_daemon` consumes the guard.**
+   The lock is taken by whichever entry point starts the daemon — the standalone
+   `taski-daemon` binary (`taski_daemon::run`), `taski daemon`, and the combined launcher
+   (`run_combined`) each call `acquire_daemon_lock` and move the resulting `DaemonLockGuard`
+   into `run_daemon(opts, shutdown, lock: DaemonLockGuard)`. Because `DaemonLockGuard`'s
+   constructor is private, the guard cannot be forged — the type system enforces "you must
+   hold the lock to call `run_daemon`." This keeps every entry point protected identically
+   while making acquisition atomic with respect to thread spawn (the launcher acquires on
+   the main thread before spawning the daemon thread, eliminating any probe/acquire race).
 3. **Attach-or-spawn for combined mode; refuse for `taski daemon`.** When the lock is held,
    `taski` (combined) runs the **TUI only** against the existing daemon and prints
    `Attached to running daemon (PID X).` `taski daemon` (and `taski-daemon`), by contrast,
