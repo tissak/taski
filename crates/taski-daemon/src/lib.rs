@@ -29,7 +29,7 @@ use clap::Parser;
 use notify::RecursiveMode;
 use notify_debouncer_mini::{DebounceEventResult, new_debouncer};
 use rusqlite::Connection;
-use taski_core::parse_tasks;
+use taski_core::{RewriteResult, parse_tasks, rewrite_scheduled};
 use taski_db as db;
 use taski_db::PendingAction;
 use walkdir::WalkDir;
@@ -480,11 +480,11 @@ fn traverses_hidden_dir(abs_path: &Path, vault_root: &Path) -> bool {
 // Write-back: the daemon is the sole vault writer (ADR-0002/0003/0004).
 // ---------------------------------------------------------------------------
 
-/// Outcome of attempting one pending checkbox flip. Anything other than [`Applied`]
-/// means the action was **refused** — the vault is left untouched.
+/// Outcome of attempting one pending write-back action. Anything other than
+/// [`Applied`] means the action was **refused** — the vault is left untouched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyOutcome {
-    /// The flip was written atomically.
+    /// The write was applied atomically (or was already a no-op idempotent match).
     Applied,
     /// The note changed externally since scan (content hash mismatch) — refused.
     ConflictNoteChanged,
@@ -494,6 +494,10 @@ pub enum ApplyOutcome {
     TaskLineMismatch,
     /// `new_char` is not exactly one character — refused (malformed action).
     InvalidAction,
+    /// ADR-0009 Phase 2: an existing `⏳` on the line is malformed (bad date,
+    /// NBSP, stray variation selectors, more than one `⏳`), so
+    /// `rewrite_scheduled` refused to guess — the action is not applied.
+    MetadataUnparseable,
 }
 
 /// Process every currently-pending action to completion, resolving each (`done` on
@@ -507,13 +511,47 @@ pub fn process_pending_actions(conn: &Connection, vault_root: &Path) -> Result<(
             break;
         }
         for action in &pending {
-            let (state, message) = match process_action(conn, vault_root, action) {
+            // ADR-0009 Phase 2: dispatch on `action_type` at the top of the drain
+            // loop. The proven checkbox path (`process_action`) and its 256-case
+            // proptest are byte-for-byte unchanged; only this dispatch branch is
+            // added. Unknown types are refused inline with a distinct message
+            // (NOT routed through `InvalidAction`, whose `new_char` wording would be
+            // wrong for an unrecognized write gesture).
+            let outcome: Result<ApplyOutcome> = match action.action_type.as_str() {
+                "checkbox" => process_action(conn, vault_root, action),
+                "set_scheduled" => process_metadata_action(conn, vault_root, action),
+                // Unknown action_type: refuse with a distinct, accurate message.
+                // (NOT the checkbox `new_char` phrasing — there is no `new_char`
+                // here; this is an unrecognized write gesture.)
+                other => {
+                    tracing::warn!(
+                        id = action.id,
+                        action_type = other,
+                        "unknown action_type; action not applied"
+                    );
+                    db::resolve_action(
+                        conn,
+                        action.id,
+                        "failed",
+                        Some("unknown action_type; action not applied"),
+                    )
+                    .with_context(|| format!("resolving action {}", action.id))?;
+                    continue;
+                }
+            };
+            let (state, message) = match outcome {
                 Ok(ApplyOutcome::Applied) => {
-                    tracing::info!(id = action.id, task = %action.task_id, "applied checkbox flip");
+                    tracing::info!(
+                        id = action.id,
+                        task = %action.task_id,
+                        kind = %action.action_type,
+                        "applied action"
+                    );
                     // Re-index the note so its stored `note_hash` reflects the bytes
                     // we just wrote. Without this, a *second* pending action on the
                     // same note would see a stale hash and be refused even though the
-                    // only change was our own (legitimate) flip.
+                    // only change was our own (legitimate) write. Applies to both
+                    // checkbox flips and `set_scheduled` writes.
                     if let Err(e) =
                         index_note(conn, &vault_root.join(&action.note_path), vault_root)
                     {
@@ -536,6 +574,9 @@ pub fn process_pending_actions(conn: &Connection, vault_root: &Path) -> Result<(
                             "checkbox line no longer matches expected bytes; action not applied"
                         }
                         ApplyOutcome::InvalidAction => "invalid new_char; action not applied",
+                        ApplyOutcome::MetadataUnparseable => {
+                            "scheduled date is malformed or unparseable; action not applied"
+                        }
                         ApplyOutcome::Applied => unreachable!(),
                     };
                     tracing::warn!(id = action.id, outcome = ?outcome, "{msg}");
@@ -543,7 +584,7 @@ pub fn process_pending_actions(conn: &Connection, vault_root: &Path) -> Result<(
                 }
                 Err(e) => {
                     let msg = format!("{e:#}");
-                    tracing::error!(id = action.id, err = %e, "process_action errored");
+                    tracing::error!(id = action.id, err = %e, "action processing errored");
                     ("failed", Some(msg))
                 }
             };
@@ -650,6 +691,116 @@ pub fn process_action(
     // 8. Atomic write with a final TOCTOU check (C1): right before the rename, re-read
     //    the target and re-hash; if it no longer matches `snapshot_hash`, refuse rather
     //    than clobber an edit that landed in our window.
+    match atomic_write(&note_abs, &new_bytes, &snapshot_hash)? {
+        WriteResult::Written => Ok(ApplyOutcome::Applied),
+        WriteResult::Conflict => Ok(ApplyOutcome::ConflictNoteChanged),
+    }
+}
+
+/// Execute one pending `set_scheduled` write (ADR-0009 Phase 2) — structurally
+/// parallel to [`process_action`] and reusing the **same** [`atomic_write`],
+/// [`lookup_task_for_action`], [`line_byte_range`], [`find_checkbox_char_any`],
+/// and [`content_hash`] helpers unchanged. The vault is mutated **only** on a
+/// successful [`ApplyOutcome::Applied`]; every other path leaves it untouched.
+///
+/// The only new logic vs `process_action` is variable-length line surgery driven
+/// by the pure [`taski_core::rewrite_scheduled`] oracle; the TOCTOU whole-file
+/// re-hash inside `atomic_write` is agnostic to mutation size, so it is reused
+/// verbatim. Sequence:
+///
+/// 1. Look up the current task row (surrogate rowid, ADR-0005).
+/// 2. Read the note fresh; authoritative conflict check (`content_hash` ==
+///    `row.note_hash`).
+/// 3. Resolve the row's CURRENT `line_number` (ADR-0005 §4), not the stale action
+///    value.
+/// 4. Byte-verify the line still holds a `[<char>]` checkbox (`find_checkbox_char_any`).
+/// 5. Decode the line as UTF-8 and call `rewrite_scheduled(line, desired)` where
+///    `desired` comes from `action.payload`.
+///    - `Unchanged` → `Applied` (idempotent; no write — mirrors `process_action`'s
+///      already-matches short-circuit).
+///    - `Unparseable` → `MetadataUnparseable` (refuse; never guess).
+///    - `Rewritten(new_line)` → splice the new line bytes into the full note
+///      buffer, replacing ONLY the target line (every other byte + all line
+///      endings preserved), then `atomic_write` (same function, same TOCTOU).
+pub fn process_metadata_action(
+    conn: &Connection,
+    vault_root: &Path,
+    action: &PendingAction,
+) -> Result<ApplyOutcome> {
+    // 1. Current task row (the DB row is a *claim*, not truth — bytes are re-verified).
+    let Some(row) = lookup_task_for_action(conn, action.task_id)? else {
+        return Ok(ApplyOutcome::TaskNotFound);
+    };
+
+    // 2. Read the note fresh from the vault.
+    let note_abs = vault_root.join(&row.note_path);
+    let bytes = match fs::read(&note_abs) {
+        Ok(b) => b,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(ApplyOutcome::TaskNotFound),
+        Err(e) => return Err(e).with_context(|| format!("reading note {:?}", note_abs)),
+    };
+
+    // Authoritative conflict check via content hash (mtime is informational only).
+    let snapshot_hash = content_hash(&bytes);
+    if Some(&snapshot_hash) != row.note_hash.as_ref() {
+        return Ok(ApplyOutcome::ConflictNoteChanged);
+    }
+
+    // 3. Target the task's CURRENT line (ADR-0005 §4) — the row's `line_number`,
+    //    updated by reconciliation if the task moved, NOT the stale `action.line_number`.
+    let Some(line_range) = line_byte_range(&bytes, row.line_number) else {
+        return Ok(ApplyOutcome::TaskLineMismatch);
+    };
+
+    // 4. Byte-verify the line is still a checkbox line (reuse the same detection
+    //    `process_action` uses). If the line no longer holds a `[<char>]` pattern,
+    //    refuse rather than rewrite an arbitrary line.
+    if find_checkbox_char_any(&bytes, line_range.clone()).is_none() {
+        return Ok(ApplyOutcome::TaskLineMismatch);
+    }
+
+    // 5. Decode the target line to a `&str` (Obsidian notes are UTF-8; if a
+    //    concurrent edit produced invalid UTF-8 on this line, refuse). `line_byte_range`
+    //    delimits lines on `\n` only, so a trailing `\r` (CRLF notes) is INCLUDED in
+    //    `line_range`. We must treat that `\r` as part of the terminator — exactly as
+    //    the read path's `str::lines()` does — so the rewritten content ends *before*
+    //    any CR/LF. Otherwise `rewrite_scheduled`'s append path would insert the `⏳`
+    //    *between* the CR and the LF (`"- [ ] task\r ⏳ …"`), and the next `parse_tasks`
+    //    (which strips a `\r` adjacent to `\n`) would fold that CR into the task body,
+    //    permanently polluting the text + `text_hash`. (This hazard is novel vs the
+    //    checkbox path, which flips a char at line START, far from the `\r`.)
+    let content_end = if line_range.end > line_range.start && bytes[line_range.end - 1] == b'\r' {
+        line_range.end - 1
+    } else {
+        line_range.end
+    };
+    let line = match std::str::from_utf8(&bytes[line_range.start..content_end]) {
+        Ok(s) => s,
+        Err(_) => return Ok(ApplyOutcome::TaskLineMismatch),
+    };
+
+    // `desired` flows from `action.payload`: Some(date) → mark/re-schedule;
+    // None → unmark. The pure oracle decides whether to write at all.
+    let desired = action.payload.as_deref();
+    let new_line = match rewrite_scheduled(line, desired) {
+        RewriteResult::Unchanged => return Ok(ApplyOutcome::Applied),
+        RewriteResult::Unparseable => return Ok(ApplyOutcome::MetadataUnparseable),
+        RewriteResult::Rewritten(s) => s,
+    };
+
+    // Splice the rewritten line into the full note buffer, replacing ONLY the
+    // content bytes `[line_range.start, content_end)` (every other byte and ALL
+    // line endings — including the `\r` in a CRLF note — preserved, since they live
+    // in `bytes[content_end..]`). The same discipline as `process_action`'s
+    // single-char swap, generalized to N bytes.
+    let mut new_bytes = Vec::with_capacity(bytes.len() + new_line.len());
+    new_bytes.extend_from_slice(&bytes[..line_range.start]);
+    new_bytes.extend_from_slice(new_line.as_bytes());
+    new_bytes.extend_from_slice(&bytes[content_end..]);
+
+    // Atomic write with a final TOCTOU check (C1) — the SAME function
+    // `process_action` uses, unchanged. Its whole-file re-hash is agnostic to
+    // whether we changed 1 byte or N.
     match atomic_write(&note_abs, &new_bytes, &snapshot_hash)? {
         WriteResult::Written => Ok(ApplyOutcome::Applied),
         WriteResult::Conflict => Ok(ApplyOutcome::ConflictNoteChanged),

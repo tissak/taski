@@ -59,7 +59,7 @@ Supporting: `docs/` (PRD, tech, ADRs, setup, this file), `scripts/install-launch
 ```sh
 cargo build --workspace                       # dev build
 cargo build --release --workspace             # optimized daily-driver binaries
-cargo test --workspace                        # all tests (130 as of v0.2; +17 from ADR-0009 Phase 1)
+cargo test --workspace                        # all tests (149 as of v0.2; +19 from ADR-0009 Phases 1–2)
 cargo test -p taski-daemon writeback          # run one suite / filter by name
 ```
 
@@ -168,13 +168,14 @@ rather than corrupting the TUI mid-session.
 
 ---
 
-## Data Model (schema v4)
+## Data Model (schema v5)
 
 Defined in `taski-db::SCHEMA`. `PRAGMA user_version` tracks the version; older DBs are
 dropped and recreated (pre-MVP, no data to preserve). v3 added the `note_contents` cache
 that backs the read-only TUI context pane ([ADR-0006](./adr/0006-note-content-cached-in-index.md));
-v4 added `tasks.scheduled_date` (`⏳`) backing the read-only "Today" view
-([ADR-0009](./adr/0009-scheduled-date-today.md), Phase 1).
+v4 added `tasks.scheduled_date` (`⏳`) backing the "Today" view
+([ADR-0009](./adr/0009-scheduled-date-today.md), Phase 1); v5 added
+`pending_actions.action_type` + `payload` for the `⏳` write gesture (ADR-0009, Phase 2).
 
 **`tasks`** — one row per checkbox task found in the vault:
 
@@ -188,12 +189,15 @@ v4 added `tasks.scheduled_date` (`⏳`) backing the read-only "Today" view
 | `note_hash` | Content hash of the note at last scan — **the** conflict-detection input (re-checked before write-back). |
 | `note_mtime` | Note mtime at last scan — **informational only**, not used by conflict detection. |
 | `due_date` | Parsed 📅/📆/🗓 date (Obsidian Tasks-plugin syntax). |
-| `scheduled_date` *(v4)* | Parsed `⏳` scheduled date (Obsidian Tasks-plugin syntax — "plan to work on this"). Backs the read-only Today view (`T`); a future Phase 2 will *write* it to mark tasks for today ([ADR-0009](./adr/0009-scheduled-date-today.md)). |
+| `scheduled_date` *(v4)* | Parsed `⏳` scheduled date (Obsidian Tasks-plugin syntax — "plan to work on this"). Backs the Today view (`T`) and is *written* by the `t` "mark for today" gesture ([ADR-0009](./adr/0009-scheduled-date-today.md)). |
 | `updated_at` | Last-seen timestamp. |
 
 **`pending_actions`** — the TUI→daemon command queue. Lifecycle `pending → done | failed`.
-Holds `task_id`, the `expected_char`/`new_char` for the flip, and on failure an `error`.
-Resolved rows older than 7 days are pruned on daemon startup (`ACTION_RETENTION_SECS`).
+Each row carries `task_id`, an `action_type` (`checkbox` or `set_scheduled`, v5), and a
+`payload` (NULL for checkbox flips; the desired date / NULL-to-unmark for `set_scheduled`).
+Checkbox rows also hold `expected_char`/`new_char`; `set_scheduled` rows leave them empty
+and the daemon dispatches on `action_type`. On failure an `error` is recorded. Resolved rows
+older than 7 days are pruned on daemon startup (`ACTION_RETENTION_SECS`).
 
 **`note_contents`** *(v3)* — per-note full-text cache backing the read-only TUI context
 pane ([ADR-0006](./adr/0006-note-content-cached-in-index.md)). One row per indexed note:
@@ -249,11 +253,14 @@ understanding the failure mode it prevents.**
 7. **Unified launcher + single-writer lock** ([ADR-0007](./adr/0007-unified-in-process-launcher.md), [ADR-0008](./adr/0008-single-writer-file-lock.md)) — one `taski` binary runs daemon + TUI in-process; a `flock` on `<db_dir>/daemon.lock` guarantees a sole writer across all startup combinations (launchd + `taski`, etc.), closing the two-daemon corruption vector ADR-0004 doesn't cover.
 
 8. **Scheduled date `⏳` + Today view** ([ADR-0009](./adr/0009-scheduled-date-today.md)) —
-   Taski parses Obsidian's `⏳` scheduled date (Phase 1, shipped: parser + schema v4 +
-   read-only `T` Today view) and will *write* `⏳ today` as the "mark for today" triage
-   gesture (Phase 2, not yet shipped — amends ADR-0003). The view is strict
+   Taski parses Obsidian's `⏳` scheduled date and writes `⏳ today` as the "mark for today"
+   triage gesture. Phase 1 (parser + schema v4 + read-only `T` Today view) and Phase 2 (the
+   `t` toggle write gesture, schema v5 `pending_actions.action_type`/`payload`, the pure
+   `taski_core::rewrite_scheduled` line-rewrite + daemon `process_metadata_action` reusing
+   `atomic_write` unchanged) are both shipped. This is Taski's **first non-checkbox vault
+   write**; it amends ADR-0003 (write-back scope) but not ADR-0005. The view is strict
    `scheduled_date == today`, orthogonal to the `f` status-cycle. "Today" is computed by the
-   pure `taski_core::ymd_from_unix` (no date crate).
+   pure `taski_core::ymd_from_unix` (no date crate). Two 256-case proptests guard the write.
 
 ---
 
@@ -395,7 +402,7 @@ exercised only at runtime (its `taski.db` is gitignored).
 | Change how tasks are parsed / add metadata extraction | `taski-core/src/lib.rs` (`parse_tasks`, `extract_due_date`/`extract_scheduled_date` via shared `extract_emoji_date`, `ymd_from_unix`) |
 | Change the DB schema | `taski-db::SCHEMA` + bump `SCHEMA_VERSION`; update `reconcile_note`/`upsert_task` |
 | Cache/read note content for the TUI context pane | `taski-db`: `note_contents` table + `upsert_note_content`/`note_content`/`delete_note_content`; daemon writes it in `index_note` ([ADR-0006](./adr/0006-note-content-cached-in-index.md)) |
-| Change write-back behavior | `taski-daemon`: `process_action`, `atomic_write` (mind ADR-0004 TOCTOU) |
+| Change write-back behavior | `taski-daemon`: `process_action` (checkbox flips) / `process_metadata_action` (`⏳` writes, ADR-0009), `atomic_write` (mind ADR-0004 TOCTOU); the drain loop dispatches on `pending_actions.action_type` |
 | Change how the TUI looks/behaves | `taski-tui/src/lib.rs`: `App`, `build_view`, `context_view`/`draw_context_pane`, key handling |
 | Change context-pane keybindings/behavior | `taski-tui/src/lib.rs` key match in `run_loop` (`J`/`K` scroll, `p` toggle) + `MIN_SPLIT_WIDTH` auto-hide; `sync_context` for the read path |
 | Change launcher behavior (combined/daemon/tui dispatch, attach-or-spawn, shutdown handshake) | `crates/taski/src/main.rs` (`run_combined`/`run_combined_spawn`/`run_daemon_only`); ADR-0007 |

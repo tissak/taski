@@ -16,10 +16,12 @@ use rusqlite::Connection;
 // TUI's "today" derivation (ADR-0009 Phase 1).
 pub use taski_core::{Status, Task, ymd_from_unix};
 
-/// The canonical schema v4. v2 added surrogate rowid identity + content-hash
+/// The canonical schema v5. v2 added surrogate rowid identity + content-hash
 /// reconciliation (ADR-0005); v3 added the `note_contents` cache that backs the
-/// read-only TUI context pane (ADR-0006); v4 adds `tasks.scheduled_date` for the
-/// Obsidian Tasks-plugin `⏳` read path (ADR-0009 Phase 1). Created with
+/// read-only TUI context pane (ADR-0006); v4 added `tasks.scheduled_date` for the
+/// Obsidian Tasks-plugin `⏳` read path (ADR-0009 Phase 1); v5 extends
+/// `pending_actions` with `action_type`/`payload` so the same queue carries both
+/// checkbox flips and `set_scheduled` writes (ADR-0009 Phase 2). Created with
 /// `IF NOT EXISTS` so [`ensure_schema`] is idempotent.
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS tasks (
@@ -44,12 +46,17 @@ CREATE TABLE IF NOT EXISTS pending_actions (
   task_id           INTEGER NOT NULL,
   note_path         TEXT NOT NULL,
   line_number       INTEGER NOT NULL,
-  expected_char     TEXT NOT NULL,   -- raw_checkbox_char the user saw (byte verify)
-  new_char          TEXT NOT NULL,   -- desired checkbox char after flip
+  expected_char     TEXT NOT NULL,   -- raw_checkbox_char the user saw (byte verify); unused for non-checkbox action types
+  new_char          TEXT NOT NULL,   -- desired checkbox char after flip; unused for non-checkbox action types
   state             TEXT NOT NULL DEFAULT 'pending',  -- pending | done | failed
   created_at        INTEGER NOT NULL,
   resolved_at       INTEGER,
-  error             TEXT
+  error             TEXT,
+  -- ADR-0009 Phase 2: dispatch key + payload so one queue serves every action kind.
+  -- 'checkbox' rows carry payload=NULL (expected/new_char hold the flip); a new
+  -- 'set_scheduled' row carries payload = the desired YYYY-MM-DD (or NULL to unmark).
+  action_type       TEXT NOT NULL DEFAULT 'checkbox',
+  payload           TEXT
 );
 
 -- ADR-0006: full-text cache of each indexed note, so the read-only TUI can render a
@@ -67,7 +74,7 @@ CREATE TABLE IF NOT EXISTS note_contents (
 
 /// Schema version tag stored in `PRAGMA user_version`. Increment when the schema
 /// changes in a backward-incompatible way.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// Ensure the database schema exists and is at the current version. If the DB predates
 /// the current version, the old tables are dropped and recreated (pre-MVP: no data to
@@ -365,8 +372,12 @@ pub fn reconcile_note(
 // pending_actions: the TUI -> daemon write-back queue (ADR-0002 / ADR-0003).
 // ---------------------------------------------------------------------------
 
-/// One requested checkbox flip, queued by the TUI for the daemon to execute. The
-/// lifecycle is `pending` -> `done` (applied) or `failed` (refused/errored).
+/// One requested write-back action, queued by the TUI for the daemon to execute.
+/// The lifecycle is `pending` -> `done` (applied) or `failed` (refused/errored).
+/// ADR-0009 Phase 2: the queue now carries two action kinds via `action_type` —
+/// `'checkbox'` (a flip; `expected_char`/`new_char` hold the chars) and
+/// `'set_scheduled'` (a `⏳` write; `payload` holds the desired `YYYY-MM-DD`, or
+/// `NULL` to unmark). The daemon dispatches on `action_type`.
 #[derive(Debug, Clone)]
 pub struct PendingAction {
     /// Row id (AUTOINCREMENT).
@@ -379,8 +390,10 @@ pub struct PendingAction {
     pub line_number: usize,
     /// The `raw_checkbox_char` the user saw when requesting the flip; the daemon
     /// re-verifies this exact byte is still present before writing (ADR-0004).
+    /// Unused for non-checkbox action types (empty string).
     pub expected_char: String,
-    /// Desired checkbox char after the flip (e.g. `"x"`, `" "`, `"/"`).
+    /// Desired checkbox char after the flip (e.g. `"x"`, `" "`, `"/"`). Unused
+    /// for non-checkbox action types (empty string).
     pub new_char: String,
     /// `pending` | `done` | `failed`.
     pub state: String,
@@ -390,10 +403,15 @@ pub struct PendingAction {
     pub resolved_at: Option<i64>,
     /// Error/explanation message set when `state = "failed"`.
     pub error: Option<String>,
+    /// Action kind: `'checkbox'` (default) or `'set_scheduled'` (ADR-0009 P2).
+    pub action_type: String,
+    /// Type-specific payload. For `'set_scheduled'`: the desired `YYYY-MM-DD`,
+    /// or `None` to unmark. For `'checkbox'`: always `None`.
+    pub payload: Option<String>,
 }
 
-/// Enqueue a checkbox-flip request from the TUI. Inserts with `state='pending'` and
-/// returns the new row id.
+/// Enqueue a checkbox-flip request from the TUI. Inserts with `state='pending'`,
+/// `action_type='checkbox'`, `payload=NULL`, and returns the new row id.
 pub fn enqueue_action(
     conn: &Connection,
     task_id: i64,
@@ -404,8 +422,9 @@ pub fn enqueue_action(
 ) -> rusqlite::Result<i64> {
     conn.execute(
         "INSERT INTO pending_actions
-            (task_id, note_path, line_number, expected_char, new_char, state, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
+            (task_id, note_path, line_number, expected_char, new_char, state,
+             created_at, action_type, payload)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, 'checkbox', NULL)",
         rusqlite::params![
             task_id,
             note_path,
@@ -418,11 +437,35 @@ pub fn enqueue_action(
     Ok(conn.last_insert_rowid())
 }
 
+/// Enqueue a "set scheduled date" write request (ADR-0009 Phase 2). `desired =
+/// Some("YYYY-MM-DD")` marks/re-schedules the task for that date; `desired = None`
+/// removes an existing `⏳`. The daemon's `process_metadata_action` performs the
+/// vault write via `taski_core::rewrite_scheduled` + `atomic_write`. `expected_char`
+/// and `new_char` are unused for this action type (stored empty; the daemon
+/// dispatches on `action_type='set_scheduled'` and reads `payload`). Returns the
+/// new row id, like [`enqueue_action`].
+pub fn enqueue_set_scheduled(
+    conn: &Connection,
+    task_id: i64,
+    note_path: &str,
+    line_number: usize,
+    desired: Option<&str>,
+) -> rusqlite::Result<i64> {
+    conn.execute(
+        "INSERT INTO pending_actions
+            (task_id, note_path, line_number, expected_char, new_char, state,
+             created_at, action_type, payload)
+         VALUES (?1, ?2, ?3, '', '', 'pending', ?4, 'set_scheduled', ?5)",
+        rusqlite::params![task_id, note_path, line_number as i64, unix_now(), desired],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
 /// All actions still awaiting processing, oldest first.
 pub fn pending_actions(conn: &Connection) -> rusqlite::Result<Vec<PendingAction>> {
     let mut stmt = conn.prepare(
         "SELECT id, task_id, note_path, line_number, expected_char, new_char,
-                state, created_at, resolved_at, error
+                state, created_at, resolved_at, error, action_type, payload
          FROM pending_actions
          WHERE state = 'pending'
          ORDER BY id ASC",
@@ -439,6 +482,8 @@ pub fn pending_actions(conn: &Connection) -> rusqlite::Result<Vec<PendingAction>
             created_at: row.get(7)?,
             resolved_at: row.get(8)?,
             error: row.get(9)?,
+            action_type: row.get(10)?,
+            payload: row.get(11)?,
         })
     })?;
     rows.collect()
@@ -452,7 +497,7 @@ pub fn pending_actions(conn: &Connection) -> rusqlite::Result<Vec<PendingAction>
 pub fn recent_actions(conn: &Connection, limit: i64) -> rusqlite::Result<Vec<PendingAction>> {
     let mut stmt = conn.prepare(
         "SELECT id, task_id, note_path, line_number, expected_char, new_char,
-                state, created_at, resolved_at, error
+                state, created_at, resolved_at, error, action_type, payload
          FROM pending_actions
          WHERE state IN ('done', 'failed')
          ORDER BY resolved_at DESC NULLS LAST, id DESC
@@ -470,6 +515,8 @@ pub fn recent_actions(conn: &Connection, limit: i64) -> rusqlite::Result<Vec<Pen
             created_at: row.get(7)?,
             resolved_at: row.get(8)?,
             error: row.get(9)?,
+            action_type: row.get(10)?,
+            payload: row.get(11)?,
         })
     })?;
     rows.collect()
@@ -902,5 +949,57 @@ mod tests {
             "identity preserved across a matched UPDATE"
         );
         assert_eq!(got2[0].scheduled_date.as_deref(), Some("2026-06-20"));
+    }
+
+    /// ADR-0009 Phase 2: the queue carries both action kinds via `action_type`/
+    /// `payload`. A checkbox flip enqueues `action_type='checkbox'`, `payload=None`;
+    /// `enqueue_set_scheduled` enqueues `action_type='set_scheduled'` with the date
+    /// (or NULL) in `payload`. Both are read back verbatim by `pending_actions`.
+    #[test]
+    fn enqueue_set_scheduled_round_trips_with_checkbox_actions() {
+        let conn = open(":memory:").unwrap();
+
+        // A checkbox action (the proven path) — action_type defaults/sets to checkbox.
+        let cb_id = enqueue_action(&conn, 1, "n.md", 3, " ", "x").unwrap();
+        // A set_scheduled mark (Some date).
+        let mark_id = enqueue_set_scheduled(&conn, 2, "n.md", 4, Some("2026-06-20")).unwrap();
+        // A set_scheduled unmark (None).
+        let unmark_id = enqueue_set_scheduled(&conn, 3, "n.md", 5, None).unwrap();
+
+        let pending = pending_actions(&conn).unwrap();
+        assert_eq!(pending.len(), 3);
+
+        let cb = pending.iter().find(|a| a.id == cb_id).unwrap();
+        assert_eq!(cb.action_type, "checkbox");
+        assert!(cb.payload.is_none(), "checkbox payload is always NULL");
+        assert_eq!(cb.expected_char, " ");
+        assert_eq!(cb.new_char, "x");
+
+        let mark = pending.iter().find(|a| a.id == mark_id).unwrap();
+        assert_eq!(mark.action_type, "set_scheduled");
+        assert_eq!(mark.payload.as_deref(), Some("2026-06-20"));
+        assert_eq!(mark.expected_char, "", "unused for set_scheduled");
+        assert_eq!(mark.new_char, "", "unused for set_scheduled");
+
+        let unmark = pending.iter().find(|a| a.id == unmark_id).unwrap();
+        assert_eq!(unmark.action_type, "set_scheduled");
+        assert!(
+            unmark.payload.is_none(),
+            "None desired round-trips as NULL payload"
+        );
+
+        // recent_actions surfaces the same fields after resolution.
+        resolve_action(
+            &conn,
+            mark_id,
+            "failed",
+            Some("scheduled date is malformed"),
+        )
+        .unwrap();
+        let recent = recent_actions(&conn, 8).unwrap();
+        let r = recent.iter().find(|a| a.id == mark_id).unwrap();
+        assert_eq!(r.action_type, "set_scheduled");
+        assert_eq!(r.payload.as_deref(), Some("2026-06-20"));
+        assert_eq!(r.error.as_deref(), Some("scheduled date is malformed"));
     }
 }

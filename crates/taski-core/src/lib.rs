@@ -141,19 +141,18 @@ fn parse_task_line(raw_line: &str, note_path: &str, line_number: usize, now: i64
 /// emoji-style rendering.
 const VS16: char = '\u{FE0F}';
 
-/// Extract the first date from a task body matching the Obsidian Tasks emoji
-/// convention: one of `emojis` + optional VS16 + whitespace + strict
-/// `YYYY-MM-DD`. Returns the normalized `"YYYY-MM-DD"` string, or `None` if no
-/// valid date is present.
+/// Locate the first parseable date token in `body` matching one of `emojis`,
+/// returning `(byte_span, date_string)` where `byte_span` is the `[start, end)`
+/// byte range of the ENTIRE token — `emoji` + optional VS16 + ≥1 ASCII whitespace
+/// + strict `YYYY-MM-DD` — and `date_string` is the normalized `YYYY-MM-DD`.
 ///
-/// Scans the body left-to-right; at each occurrence of an emoji in `emojis`,
-/// skips an optional VS16, requires at least one whitespace char, then attempts
-/// to read a strict `YYYY-MM-DD`. If the date is invalid (bad format or
-/// out-of-range month/day) the scan continues to the next emoji. Trailing text
-/// after the date is allowed. This is the shared helper behind
-/// [`extract_due_date`] and [`extract_scheduled_date`]; only the matched emoji
-/// set differs.
-fn extract_emoji_date(body: &str, emojis: &[char]) -> Option<String> {
+/// This is the **single source of truth** for the date-token grammar, shared by
+/// the read path ([`extract_emoji_date`] returns the date) and the write path
+/// ([`rewrite_scheduled`] rewrites the span). Scans left-to-right; at each emoji
+/// in `emojis` it skips an optional VS16, requires ≥1 ASCII whitespace, then
+/// attempts a strict `YYYY-MM-DD` (bad format / out-of-range → scan continues).
+/// "First valid date wins" — the same semantics the read path has always had.
+fn find_emoji_date_span(body: &str, emojis: &[char]) -> Option<(std::ops::Range<usize>, String)> {
     let bytes = body.as_bytes();
     for (emoji_off, ch) in body.char_indices() {
         if !emojis.contains(&ch) {
@@ -180,26 +179,143 @@ fn extract_emoji_date(body: &str, emojis: &[char]) -> Option<String> {
 
         // Attempt YYYY-MM-DD at this position.
         if let Some(date) = parse_date_at(bytes, pos) {
-            return Some(date);
+            // `parse_date_at` validated exactly 10 bytes here.
+            return Some((emoji_off..pos + 10, date));
         }
     }
     None
 }
 
+/// Extract the first date from a task body matching the Obsidian Tasks emoji
+/// convention: one of `emojis` + optional VS16 + whitespace + strict
+/// `YYYY-MM-DD`. Returns the normalized `"YYYY-MM-DD"` string, or `None` if no
+/// valid date is present. Thin wrapper over [`find_emoji_date_span`].
+fn extract_emoji_date(body: &str, emojis: &[char]) -> Option<String> {
+    find_emoji_date_span(body, emojis).map(|(_, date)| date)
+}
+
 /// Extract the due date (`📅`/`📆`/`🗓` + optional VS16 + whitespace +
 /// `YYYY-MM-DD`) from a task body, per the Obsidian Tasks emoji convention.
 /// Returns the normalized `"YYYY-MM-DD"` string, or `None` if no valid due date
-/// is present. See [`extract_emoji_date`] for the full scan semantics.
-fn extract_due_date(body: &str) -> Option<String> {
+/// is present. See [`find_emoji_date_span`] for the full scan semantics.
+pub fn extract_due_date(body: &str) -> Option<String> {
     extract_emoji_date(body, &['📅', '📆', '🗓'])
 }
 
 /// Extract the scheduled date (`⏳` U+23F3 + optional VS16 + whitespace +
 /// `YYYY-MM-DD`) from a task body, per the Obsidian Tasks emoji convention
 /// (ADR-0009). Grammar identical to [`extract_due_date`]; only the leading
-/// emoji differs.
-fn extract_scheduled_date(body: &str) -> Option<String> {
+/// emoji differs. Public so the write-path oracle proptest can verify
+/// `rewrite_scheduled`'s output through the same primitive the parser uses.
+pub fn extract_scheduled_date(body: &str) -> Option<String> {
     extract_emoji_date(body, &['⏳'])
+}
+
+/// Outcome of [`rewrite_scheduled`]: the pure line-rewrite behind the ADR-0009
+/// Phase 2 "mark for today" write gesture. `Unchanged` and `Unparseable` carry
+/// no data; `Rewritten` carries the full rewritten line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RewriteResult {
+    /// The line already has the desired scheduled state — the caller must not
+    /// write (idempotent). Reached when `desired` equals the existing date, or
+    /// when `desired = None` and there is no `⏳` to remove.
+    Unchanged,
+    /// The rewritten line (caller splices it into the note and writes).
+    Rewritten(String),
+    /// The existing `⏳` is malformed (bad date, NBSP, stray variation selector,
+    /// more than one `⏳`), or `desired` is not a strict `YYYY-MM-DD`. The
+    /// caller must refuse rather than guess.
+    Unparseable,
+}
+
+/// The hourglass emoji `⏳` (U+23F3) — the Obsidian Tasks "scheduled" marker.
+const SCHEDULED_EMOJI: char = '⏳';
+
+/// Pure line-rewrite for the ADR-0009 Phase 2 "mark/unmark for today" gesture.
+/// Given a full task line (including the `- [ ] ` prefix, WITHOUT its trailing
+/// `\n` — the caller handles line terminators) and a desired scheduled state:
+///
+/// - `desired = Some("YYYY-MM-DD")` (mark / re-schedule): if a parseable `⏳`
+///   token already exists, **replace** its date bytes with `desired` (keeping
+///   the `⏳`, its VS16, and its spacing); otherwise **append** ` ⏳ YYYY-MM-DD`
+///   at the end of the line.
+/// - `desired = None` (unmark): if a parseable `⏳` token exists, **remove** it
+///   together with its single preceding ASCII space; otherwise return
+///   [`RewriteResult::Unchanged`].
+///
+/// **Never guesses.** If the line carries a `⏳` that does not form a valid
+/// token (malformed date, NBSP, stray variation selectors), or carries more
+/// than one `⏳`, the result is [`RewriteResult::Unparseable`] — the caller
+/// refuses. `desired` is defensively validated; a malformed date also yields
+/// `Unparseable`. Idempotent: an already-matching date returns `Unchanged`.
+///
+/// The checkbox marker (`- [ ]`/`- [x]`) and every other byte (text, tags,
+/// other emojis like 📅/🛫) outside the `⏳` token's span is preserved
+/// byte-for-byte. Pure (no I/O) so it is exhaustively proptested in isolation.
+pub fn rewrite_scheduled(line: &str, desired: Option<&str>) -> RewriteResult {
+    // Defensive: the TUI passes `ymd_from_unix(now)`, but the write path never
+    // trusts the caller. A malformed `desired` is refused, never written.
+    if let Some(d) = desired
+        && parse_date_at(d.as_bytes(), 0).as_deref() != Some(d)
+    {
+        return RewriteResult::Unparseable;
+    }
+
+    let bytes = line.as_bytes();
+    // How many raw `⏳` chars are on the line. Zero/one is workable; two or more
+    // is ambiguous (which one to edit?) → refuse rather than guess.
+    let hourglass_count = line.chars().filter(|&c| c == SCHEDULED_EMOJI).count();
+    // The first parseable `⏳` token, if any (parser-consistent via the shared
+    // grammar helper). When exactly one `⏳` is present, this is Some iff that
+    // `⏳` forms a clean token; None means the lone `⏳` is malformed.
+    let token = find_emoji_date_span(line, &[SCHEDULED_EMOJI]);
+
+    match desired {
+        None => match (hourglass_count, token) {
+            (0, _) => RewriteResult::Unchanged,
+            (1, Some((span, _))) => {
+                // Remove the token and its single preceding ASCII space.
+                let remove_start = if span.start > 0 && bytes[span.start - 1] == b' ' {
+                    span.start - 1
+                } else {
+                    span.start
+                };
+                let mut out = String::with_capacity(line.len() - (span.end - remove_start));
+                out.push_str(&line[..remove_start]);
+                out.push_str(&line[span.end..]);
+                RewriteResult::Rewritten(out)
+            }
+            // 1 malformed `⏳`, or ≥2 `⏳` → never guess.
+            _ => RewriteResult::Unparseable,
+        },
+        Some(date) => match (hourglass_count, token) {
+            (0, None) => {
+                // No `⏳` at all → append ` ⏳ YYYY-MM-DD` at the logical line end.
+                let mut out = String::with_capacity(line.len() + 12);
+                out.push_str(line);
+                out.push(' ');
+                out.push(SCHEDULED_EMOJI);
+                out.push(' ');
+                out.push_str(date);
+                RewriteResult::Rewritten(out)
+            }
+            (1, Some((span, _))) => {
+                // Exactly one clean token: idempotent if the date already matches,
+                // else replace ONLY its date bytes (keep `⏳` + VS16 + whitespace).
+                let existing_date = &line[span.end - 10..span.end];
+                if existing_date == date {
+                    return RewriteResult::Unchanged;
+                }
+                let mut out = String::with_capacity(line.len() + 10);
+                out.push_str(&line[..span.end - 10]);
+                out.push_str(date);
+                out.push_str(&line[span.end..]);
+                RewriteResult::Rewritten(out)
+            }
+            // A `⏳` is present but malformed (lone bad token), or ≥2 `⏳` → refuse.
+            _ => RewriteResult::Unparseable,
+        },
+    }
 }
 
 /// Read and validate a `YYYY-MM-DD` starting at `bytes[pos]`. Returns the normalized
@@ -681,5 +797,155 @@ plain text
     fn ymd_from_unix_pre_epoch_floor_division() {
         // One second before the epoch lands on 1969-12-31 (floor toward -inf).
         assert_eq!(ymd_from_unix(-1), "1969-12-31");
+    }
+
+    // --- rewrite_scheduled unit tests (ADR-0009 Phase 2) -------------------
+
+    #[test]
+    fn rewrite_mark_appends_when_no_hourglass() {
+        let r = rewrite_scheduled("- [ ] buy shampoo", Some("2026-06-20"));
+        assert_eq!(
+            r,
+            RewriteResult::Rewritten("- [ ] buy shampoo ⏳ 2026-06-20".to_string())
+        );
+        // The appended token is parseable and is the only ⏳.
+        let RewriteResult::Rewritten(s) = r else {
+            unreachable!()
+        };
+        assert_eq!(extract_scheduled_date(&s).as_deref(), Some("2026-06-20"));
+    }
+
+    #[test]
+    fn rewrite_mark_replaces_existing_date() {
+        let r = rewrite_scheduled("- [ ] plan ⏳ 2026-06-21", Some("2026-06-20"));
+        assert_eq!(
+            r,
+            RewriteResult::Rewritten("- [ ] plan ⏳ 2026-06-20".to_string())
+        );
+    }
+
+    #[test]
+    fn rewrite_mark_preserves_due_date_tags_and_checkbox() {
+        // 📅 due date, #tags, and the checkbox marker are untouched; only ⏳ is added.
+        let r = rewrite_scheduled("- [x] ship 📅 2026-07-01 #urgent", Some("2026-06-20"));
+        assert_eq!(
+            r,
+            RewriteResult::Rewritten("- [x] ship 📅 2026-07-01 #urgent ⏳ 2026-06-20".to_string())
+        );
+        // Replacing an existing ⏳ must keep a preceding 📅 byte-for-byte.
+        let r2 = rewrite_scheduled("- [ ] ship 📅 2026-07-01 ⏳ 2026-06-21", Some("2026-06-20"));
+        assert_eq!(
+            r2,
+            RewriteResult::Rewritten("- [ ] ship 📅 2026-07-01 ⏳ 2026-06-20".to_string())
+        );
+    }
+
+    #[test]
+    fn rewrite_mark_keeps_vs16_and_spacing_when_replacing() {
+        // The token's leading ⏳ + VS16 + whitespace run is preserved; only the
+        // date bytes change.
+        let r = rewrite_scheduled("- [ ] x \u{23F3}\u{FE0F}  2026-06-21", Some("2026-06-20"));
+        assert_eq!(
+            r,
+            RewriteResult::Rewritten("- [ ] x \u{23F3}\u{FE0F}  2026-06-20".to_string())
+        );
+    }
+
+    #[test]
+    fn rewrite_mark_is_idempotent_when_already_matching() {
+        let r = rewrite_scheduled("- [ ] plan ⏳ 2026-06-20", Some("2026-06-20"));
+        assert_eq!(r, RewriteResult::Unchanged);
+    }
+
+    #[test]
+    fn rewrite_unmark_removes_token_and_preceding_space() {
+        let r = rewrite_scheduled("- [ ] plan ⏳ 2026-06-20", None);
+        assert_eq!(r, RewriteResult::Rewritten("- [ ] plan".to_string()));
+    }
+
+    #[test]
+    fn rewrite_unmark_keeps_surrounding_content() {
+        // Tags and the 📅 due date survive the unmark.
+        let r = rewrite_scheduled("- [ ] ship 📅 2026-07-01 #urgent ⏳ 2026-06-20", None);
+        assert_eq!(
+            r,
+            RewriteResult::Rewritten("- [ ] ship 📅 2026-07-01 #urgent".to_string())
+        );
+    }
+
+    #[test]
+    fn rewrite_unmark_is_unchanged_when_no_token() {
+        assert_eq!(
+            rewrite_scheduled("- [ ] no marker here", None),
+            RewriteResult::Unchanged
+        );
+    }
+
+    #[test]
+    fn rewrite_unparseable_when_existing_date_malformed() {
+        // ⏳ present but the date is garbage → refuse, never guess (never append a 2nd ⏳).
+        assert_eq!(
+            rewrite_scheduled("- [ ] x ⏳ not-a-date", Some("2026-06-20")),
+            RewriteResult::Unparseable
+        );
+        assert_eq!(
+            rewrite_scheduled("- [ ] x ⏳ not-a-date", None),
+            RewriteResult::Unparseable
+        );
+    }
+
+    #[test]
+    fn rewrite_unparseable_when_nbsp_instead_of_ascii_space() {
+        // NBSP (U+00A0) is not ASCII whitespace → the lone ⏳ is malformed → refuse.
+        let nbsp = "\u{00A0}";
+        let line = format!("- [ ] x ⏳{nbsp}2026-06-20");
+        assert_eq!(
+            rewrite_scheduled(&line, Some("2026-06-21")),
+            RewriteResult::Unparseable
+        );
+    }
+
+    #[test]
+    fn rewrite_unparseable_when_two_hourglasses() {
+        // Ambiguous: which one do we edit? Refuse rather than guess.
+        let line = "- [ ] x ⏳ 2026-06-20 ⏳ 2026-06-21";
+        assert_eq!(
+            rewrite_scheduled(line, Some("2026-06-22")),
+            RewriteResult::Unparseable
+        );
+        assert_eq!(rewrite_scheduled(line, None), RewriteResult::Unparseable);
+    }
+
+    #[test]
+    fn rewrite_unparseable_when_desired_malformed() {
+        // Defensive: the write path never trusts the caller's date.
+        assert_eq!(
+            rewrite_scheduled("- [ ] x", Some("2026/06/20")),
+            RewriteResult::Unparseable
+        );
+        assert_eq!(
+            rewrite_scheduled("- [ ] x", Some("2026-13-40")),
+            RewriteResult::Unparseable
+        );
+        assert_eq!(
+            rewrite_scheduled("- [ ] x", Some("not-a-date")),
+            RewriteResult::Unparseable
+        );
+    }
+
+    #[test]
+    fn rewrite_never_panics_on_arbitrary_input() {
+        // A sampling of weird inputs must produce a result, not a panic.
+        for (line, desired) in [
+            ("", None),
+            ("", Some("2026-06-20")),
+            ("⏳", None),
+            ("⏳ 2026-06-20", None),
+            ("\u{FE0F}\u{FE0F}⏳", Some("2026-06-20")),
+            ("- [ ] 🇯🇵 emoji ⏳", Some("2026-06-20")),
+            ("- [ ] \0 binary ⏳ 2026-06-20", None),
+        ] {
+            let _ = rewrite_scheduled(line, desired);
+        }
     }
 }

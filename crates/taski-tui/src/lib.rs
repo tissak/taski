@@ -645,6 +645,15 @@ impl App {
             };
             enqueue_toggle(conn, task)
         };
+        self.track_enqueued(result, "toggle");
+    }
+
+    /// Record the outcome of an enqueue ([`submit_toggle`] /
+    /// [`submit_set_scheduled`]): on success, track the new id so its resolution is
+    /// surfaced on a later refresh, clear any prior notice, and bound growth if the
+    /// daemon stalls; on error, log to stderr and never propagate. Shared so both
+    /// write gestures stay consistent.
+    fn track_enqueued(&mut self, result: Result<i64>, label: &str) {
         match result {
             Ok(id) => {
                 self.notice = None;
@@ -655,8 +664,30 @@ impl App {
                     self.pending_session_actions.drain(0..drop_count);
                 }
             }
-            Err(e) => eprintln!("taski: could not enqueue toggle: {e:#}"),
+            Err(e) => eprintln!("taski: could not enqueue {label}: {e:#}"),
         }
+    }
+
+    /// `t` (ADR-0009 Phase 2): toggle the selected task's "mark for today" gesture.
+    /// If the task's `scheduled_date` already equals `today`, the `⏳` token is
+    /// cleared (desired = `None`); otherwise it's set to today (desired =
+    /// `Some(today)`). No-op on a header or empty list, exactly like
+    /// [`submit_toggle`]. The actual vault write is the daemon's job via
+    /// [`db::enqueue_set_scheduled`]; the TUI never touches files directly.
+    fn submit_set_scheduled(&mut self, conn: &Connection) {
+        let result = {
+            let Some(task) = self.selected_task() else {
+                return;
+            };
+            // Toggle semantics: already-scheduled-today -> clear; otherwise mark.
+            let desired = if task.scheduled_date.as_deref() == Some(self.today.as_str()) {
+                None
+            } else {
+                Some(self.today.clone())
+            };
+            enqueue_set_scheduled(conn, task, desired.as_deref())
+        };
+        self.track_enqueued(result, "set scheduled date");
     }
 }
 
@@ -720,8 +751,13 @@ fn run_loop(
             KeyCode::Right => app.toggle_at_cursor(ToggleMode::Expand),
             KeyCode::Left => app.toggle_at_cursor(ToggleMode::Collapse),
             KeyCode::Char('f') => app.cycle_filter(),
+            // ADR-0009 Phase 2: `t` marks the selected task for today (or clears it
+            // if already scheduled today) via the daemon's write-back queue — the
+            // first non-checkbox vault write. Uppercase `T` toggles the read-only
+            // Today view (below).
+            KeyCode::Char('t') => app.submit_set_scheduled(conn),
             // ADR-0009 Phase 1: `T` toggles the Today view (read-only). Lowercase
-            // `t` is reserved for the Phase 2 mark-for-today write gesture.
+            // `t` is the Phase 2 mark-for-today write gesture (above).
             KeyCode::Char('T') => app.toggle_today(),
             KeyCode::Tab => app.expand_all(),
             KeyCode::BackTab => app.collapse_all(),
@@ -766,6 +802,17 @@ fn enqueue_toggle(conn: &Connection, task: &Task) -> Result<i64> {
     Ok(id)
 }
 
+/// Enqueue a "set scheduled date" request (ADR-0009 Phase 2) for `task` into the
+/// shared `pending_actions` table. `desired` is `Some(YYYY-MM-DD)` to mark (or
+/// re-schedule) the `⏳` token, or `None` to clear it. Non-blocking: just inserts a
+/// row; the daemon applies it. Returns the new row id so the caller can track its
+/// resolution across refreshes.
+fn enqueue_set_scheduled(conn: &Connection, task: &Task, desired: Option<&str>) -> Result<i64> {
+    let id = db::enqueue_set_scheduled(conn, task.id, &task.note_path, task.line_number, desired)
+        .context("enqueuing set-scheduled action")?;
+    Ok(id)
+}
+
 /// Translate a daemon failure `error` string into short, plain wording the user can
 /// act on. Keys off the stable phrases produced by the daemon's `ApplyOutcome` arms;
 /// unknown errors fall back to a trimmed copy of the daemon message.
@@ -779,6 +826,8 @@ fn friendly_failure_reason(error: &str) -> String {
         "the checkbox line changed".to_string()
     } else if e.contains("invalid new_char") {
         "the request was not valid".to_string()
+    } else if e.contains("malformed or unparseable") {
+        "the scheduled date on this line couldn't be parsed".to_string()
     } else if e.is_empty() {
         "it could not be applied".to_string()
     } else {
@@ -787,15 +836,21 @@ fn friendly_failure_reason(error: &str) -> String {
 }
 
 /// Compose the one-line failure notice for a refused action: the outcome, the plain
-/// reason, and the source note for context.
+/// reason, and the source note for context. The verb and the "try again" key are
+/// chosen by action kind — each write gesture has its own retry key.
 fn render_failure_notice(action: &PendingAction) -> String {
     let reason = action
         .error
         .as_deref()
         .map(friendly_failure_reason)
         .unwrap_or_else(|| "it could not be applied".to_string());
+    let (verb, retry_key) = match action.action_type.as_str() {
+        "set_scheduled" => ("Mark", "t"),
+        // The default/checkbox path.
+        _ => ("Toggle", "Space"),
+    };
     format!(
-        "Toggle not applied — {reason} ({}). Press Space to try again.",
+        "{verb} not applied — {reason} ({}). Press {retry_key} to try again.",
         action.note_path
     )
 }
@@ -936,6 +991,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
         Span::raw(" filter  ·  "),
         Span::styled("T", Style::default().fg(Color::Yellow)),
         Span::raw(" today  ·  "),
+        Span::styled("t", Style::default().fg(Color::Yellow)),
+        Span::raw(" mark today  ·  "),
         Span::styled("Tab/⇧Tab", Style::default().fg(Color::Yellow)),
         Span::raw(" expand/collapse all  ·  "),
         Span::styled("J/K", Style::default().fg(Color::Yellow)),
@@ -1402,6 +1459,51 @@ mod tests {
         assert_eq!(pending[0].new_char, " ");
     }
 
+    /// `t` (ADR-0009 Phase 2) marks the cursor task for today when it isn't
+    /// scheduled today, clears the `⏳` when it already is, and never fires on a
+    /// header. End-to-end through the real DB queue.
+    #[test]
+    fn submit_set_scheduled_marks_and_unmarks() {
+        let conn = db::open(":memory:").unwrap();
+        let mut app = App::new();
+        let today = app.today.clone();
+        // T1: not scheduled -> `t` should mark for today.
+        db::upsert_task(&conn, &task(1, " ", 1, "alpha.md")).unwrap();
+        // T2: already scheduled today -> `t` should clear.
+        db::upsert_task(&conn, &task_with_scheduled(2, " ", 2, "alpha.md", &today)).unwrap();
+        app.filter = StatusFilter::All;
+        app.refresh(&conn).unwrap();
+        app.expanded.insert("alpha.md".to_string());
+        app.rebuild();
+        // rows: [H alpha, T1, T2]
+
+        // Header -> no enqueue.
+        app.state.select(Some(0));
+        app.submit_set_scheduled(&conn);
+        assert!(
+            db::pending_actions(&conn).unwrap().is_empty(),
+            "header must not mark"
+        );
+
+        // T1 (not scheduled) -> enqueue mark = Some(today).
+        app.state.select(Some(1));
+        app.submit_set_scheduled(&conn);
+        let pending = db::pending_actions(&conn).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].action_type, "set_scheduled");
+        assert_eq!(pending[0].task_id, 1);
+        assert_eq!(pending[0].payload.as_deref(), Some(today.as_str()));
+
+        // T2 (already scheduled today) -> enqueue clear = None.
+        app.state.select(Some(2));
+        app.submit_set_scheduled(&conn);
+        let pending = db::pending_actions(&conn).unwrap();
+        assert_eq!(pending.len(), 2);
+        let clear = pending.iter().find(|a| a.task_id == 2).unwrap();
+        assert_eq!(clear.action_type, "set_scheduled");
+        assert!(clear.payload.is_none(), "already-today -> clear (None)");
+    }
+
     /// Collapsing a group from inside it (via `←`) drops the cursor on that group's
     /// header rather than letting it drift to an unrelated row.
     #[test]
@@ -1613,6 +1715,13 @@ mod tests {
             friendly_failure_reason("invalid new_char; action not applied"),
             "the request was not valid",
         );
+        // ADR-0009 Phase 2: the set_scheduled unparseable phrase.
+        assert_eq!(
+            friendly_failure_reason(
+                "scheduled date is malformed or unparseable; action not applied"
+            ),
+            "the scheduled date on this line couldn't be parsed",
+        );
         // Unknown -> trimmed copy.
         assert_eq!(
             friendly_failure_reason("  something unusual happened  "),
@@ -1666,6 +1775,59 @@ mod tests {
         assert!(
             app.pending_session_actions.is_empty(),
             "resolved id should drop from tracking"
+        );
+    }
+
+    /// ADR-0009 Phase 2: a refused `set_scheduled` action surfaces a notice worded
+    /// for the mark gesture ("Mark not applied") that hints the `t` retry key (not
+    /// `Space`), carrying the plain unparseable reason and the note name.
+    #[test]
+    fn failed_set_scheduled_surfaces_mark_notice() {
+        let conn = db::open(":memory:").unwrap();
+        let mut app = App::new();
+        let today = app.today.clone();
+        db::upsert_task(&conn, &task(1, " ", 1, "alpha.md")).unwrap();
+        app.filter = StatusFilter::All;
+        app.refresh(&conn).unwrap();
+        app.expanded.insert("alpha.md".to_string());
+        app.rebuild();
+        app.state.select(Some(1)); // on the task
+        app.submit_set_scheduled(&conn);
+        let pending = db::pending_actions(&conn).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].action_type, "set_scheduled");
+        assert_eq!(pending[0].payload.as_deref(), Some(today.as_str()));
+
+        // Daemon refuses it: the line's scheduled date is malformed/unparseable.
+        db::resolve_action(
+            &conn,
+            pending[0].id,
+            "failed",
+            Some("scheduled date is malformed or unparseable; action not applied"),
+        )
+        .unwrap();
+        app.refresh(&conn).unwrap();
+
+        let notice = app
+            .notice
+            .as_deref()
+            .expect("set_scheduled failure should surface a notice");
+        assert!(
+            notice.starts_with("Mark not applied"),
+            "set_scheduled notice should be worded for the mark gesture: {notice}"
+        );
+        assert!(notice.contains("alpha.md"), "notice should name the note");
+        assert!(
+            notice.contains("couldn't be parsed"),
+            "notice should carry the plain reason"
+        );
+        assert!(
+            notice.contains("Press t"),
+            "notice should hint the `t` retry key, not Space: {notice}"
+        );
+        assert!(
+            !notice.contains("Space"),
+            "set_scheduled notice must NOT hint the checkbox retry key: {notice}"
         );
     }
 

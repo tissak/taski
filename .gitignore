@@ -5,3 +5,6 @@
 *.taski.tmp
 .DS_Store
 **/*.rs.bk
+
+# proptest persistent failing-seed artifacts (local only)
+**/*.proptest-regressions
