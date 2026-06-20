@@ -14,15 +14,18 @@ use rusqlite::Connection;
 // `taski-db` alone without a direct `taski-core` dependency. This also brings `Status`
 // and `Task` into scope within this module. `ymd_from_unix` is re-exported for the
 // TUI's "today" derivation (ADR-0009 Phase 1).
-pub use taski_core::{Status, Task, ymd_from_unix};
+pub use taski_core::{Priority, Status, Task, ymd_from_unix};
 
-/// The canonical schema v5. v2 added surrogate rowid identity + content-hash
+/// The canonical schema v6. v2 added surrogate rowid identity + content-hash
 /// reconciliation (ADR-0005); v3 added the `note_contents` cache that backs the
 /// read-only TUI context pane (ADR-0006); v4 added `tasks.scheduled_date` for the
-/// Obsidian Tasks-plugin `⏳` read path (ADR-0009 Phase 1); v5 extends
+/// Obsidian Tasks-plugin `⏳` read path (ADR-0009 Phase 1); v5 extended
 /// `pending_actions` with `action_type`/`payload` so the same queue carries both
-/// checkbox flips and `set_scheduled` writes (ADR-0009 Phase 2). Created with
-/// `IF NOT EXISTS` so [`ensure_schema`] is idempotent.
+/// checkbox flips and `set_scheduled` writes (ADR-0009 Phase 2); v6 adds the
+/// Tier 1 read-only metadata columns to `tasks` — `tags`, `priority`,
+/// `start_date`, `created_date`, `done_date`, `cancelled_date` — parsed from
+/// Obsidian Tasks-plugin inline syntax (no vault writes; read path only).
+/// Created with `IF NOT EXISTS` so [`ensure_schema`] is idempotent.
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS tasks (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -36,6 +39,12 @@ CREATE TABLE IF NOT EXISTS tasks (
   note_mtime        INTEGER,
   due_date          TEXT,
   scheduled_date    TEXT,
+  tags              TEXT NOT NULL DEFAULT '',
+  priority          TEXT,
+  start_date        TEXT,
+  created_date      TEXT,
+  done_date         TEXT,
+  cancelled_date    TEXT,
   updated_at        INTEGER NOT NULL
 );
 
@@ -74,7 +83,7 @@ CREATE TABLE IF NOT EXISTS note_contents (
 
 /// Schema version tag stored in `PRAGMA user_version`. Increment when the schema
 /// changes in a backward-incompatible way.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Ensure the database schema exists and is at the current version. If the DB predates
 /// the current version, the old tables are dropped and recreated (pre-MVP: no data to
@@ -126,8 +135,9 @@ pub fn upsert_task(conn: &Connection, task: &Task) -> rusqlite::Result<()> {
         "INSERT OR REPLACE INTO tasks (
             id, note_path, line_number, text, text_hash, status,
             raw_checkbox_char, note_hash, note_mtime, due_date, scheduled_date,
+            tags, priority, start_date, created_date, done_date, cancelled_date,
             updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         rusqlite::params![
             task.id,
             task.note_path,
@@ -140,10 +150,40 @@ pub fn upsert_task(conn: &Connection, task: &Task) -> rusqlite::Result<()> {
             task.note_mtime,
             task.due_date,
             task.scheduled_date,
+            encode_tags(&task.tags),
+            task.priority.as_ref().and_then(Priority::to_emoji),
+            task.start_date,
+            task.created_date,
+            task.done_date,
+            task.cancelled_date,
             task.updated_at,
         ],
     )?;
     Ok(())
+}
+
+/// Encode a `Vec<String>` of tags into the storage TEXT form: space-separated,
+/// with leading + trailing single-space sentinels. Empty Vec → `""`;
+/// `["foo","bar"]` → `" foo bar "`. The sentinels make Tier 2 whole-tag SQL
+/// matching cheap (`WHERE ' ' || tags || ' ' LIKE '% foo %'`) and reverse
+/// cleanly via [`decode_tags`] (the sentinels are whitespace, trimmed away).
+fn encode_tags(tags: &[String]) -> String {
+    if tags.is_empty() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(tags.iter().map(|t| t.len() + 1).sum::<usize>() + 2);
+    out.push(' ');
+    out.push_str(&tags.join(" "));
+    out.push(' ');
+    out
+}
+
+/// Reverse of [`encode_tags`]: split the stored TEXT on any whitespace run and
+/// collect the non-empty pieces into a `Vec<String>`. The leading/trailing
+/// sentinel spaces are naturally skipped (`split_whitespace` ignores leading /
+/// trailing whitespace); tolerates an empty column (returns `Vec::new()`).
+fn decode_tags(text: &str) -> Vec<String> {
+    text.split_whitespace().map(str::to_string).collect()
 }
 
 /// Delete every task belonging to a single note, keyed on its `note_path` (relative
@@ -323,7 +363,9 @@ pub fn reconcile_note(
                     "UPDATE tasks SET
                         line_number = ?2, text = ?3, status = ?4,
                         raw_checkbox_char = ?5, note_hash = ?6, note_mtime = ?7,
-                        due_date = ?8, scheduled_date = ?9, updated_at = ?10
+                        due_date = ?8, scheduled_date = ?9, tags = ?10,
+                        priority = ?11, start_date = ?12, created_date = ?13,
+                        done_date = ?14, cancelled_date = ?15, updated_at = ?16
                      WHERE id = ?1",
                     rusqlite::params![
                         old_id,
@@ -335,6 +377,12 @@ pub fn reconcile_note(
                         note_mtime,
                         task.due_date,
                         task.scheduled_date,
+                        encode_tags(&task.tags),
+                        task.priority.as_ref().and_then(Priority::to_emoji),
+                        task.start_date,
+                        task.created_date,
+                        task.done_date,
+                        task.cancelled_date,
                         now,
                     ],
                 )?;
@@ -346,8 +394,9 @@ pub fn reconcile_note(
                 "INSERT INTO tasks (
                     note_path, line_number, text, text_hash, status,
                     raw_checkbox_char, note_hash, note_mtime, due_date, scheduled_date,
+                    tags, priority, start_date, created_date, done_date, cancelled_date,
                     updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 rusqlite::params![
                     note_path,
                     task.line_number as i64,
@@ -359,6 +408,12 @@ pub fn reconcile_note(
                     note_mtime,
                     task.due_date,
                     task.scheduled_date,
+                    encode_tags(&task.tags),
+                    task.priority.as_ref().and_then(Priority::to_emoji),
+                    task.start_date,
+                    task.created_date,
+                    task.done_date,
+                    task.cancelled_date,
                     now,
                 ],
             )?;
@@ -610,13 +665,25 @@ pub fn all_tasks(conn: &Connection) -> rusqlite::Result<Vec<Task>> {
     let mut stmt = conn.prepare(
         "SELECT id, note_path, line_number, text, text_hash, status,
                 raw_checkbox_char, note_hash, note_mtime, due_date, scheduled_date,
+                tags, priority, start_date, created_date, done_date, cancelled_date,
                 updated_at
          FROM tasks
          ORDER BY note_path ASC, line_number ASC",
     )?;
     let rows = stmt.query_map([], |row| {
+        // Column → index map (verify every index when adding/removing columns):
+        //  0: id              7: note_hash        14: created_date
+        //  1: note_path       8: note_mtime       15: done_date
+        //  2: line_number     9: due_date         16: cancelled_date
+        //  3: text           10: scheduled_date   17: updated_at
+        //  4: text_hash      11: tags
+        //  5: status         12: priority
+        //  6: raw_checkbox_  13: start_date
+        //    char
         let raw_checkbox_char: String = row.get(6)?;
         let status = Status::from_checkbox_char(&raw_checkbox_char);
+        let tags_text: String = row.get(11)?;
+        let priority_text: Option<String> = row.get(12)?;
         Ok(Task {
             id: row.get::<_, i64>(0)?,
             note_path: row.get(1)?,
@@ -631,7 +698,13 @@ pub fn all_tasks(conn: &Connection) -> rusqlite::Result<Vec<Task>> {
             note_mtime: row.get(8)?,
             due_date: row.get(9)?,
             scheduled_date: row.get(10)?,
-            updated_at: row.get(11)?,
+            tags: decode_tags(&tags_text),
+            priority: priority_text.and_then(|s| Priority::from_emoji_str(&s)),
+            start_date: row.get(13)?,
+            created_date: row.get(14)?,
+            done_date: row.get(15)?,
+            cancelled_date: row.get(16)?,
+            updated_at: row.get(17)?,
         })
     })?;
     rows.collect()
@@ -655,6 +728,12 @@ mod tests {
             note_mtime: None,
             due_date: None,
             scheduled_date: None,
+            tags: Vec::new(),
+            priority: None,
+            start_date: None,
+            created_date: None,
+            done_date: None,
+            cancelled_date: None,
             updated_at: 123,
         }
     }
@@ -1045,5 +1124,125 @@ mod tests {
         assert_eq!(r.action_type, "set_scheduled");
         assert_eq!(r.payload.as_deref(), Some("2026-06-20"));
         assert_eq!(r.error.as_deref(), Some("scheduled date is malformed"));
+    }
+
+    // --- Tier 1: parsed-metadata round-trips (tags, priority, dates) -------
+
+    /// Tier 1: all six parsed-metadata fields round-trip through
+    /// `upsert_task` and `all_tasks`, exercising both the Some- and None-paths.
+    /// Mirrors the existing `scheduled_date_round_trips_some_and_none` pattern.
+    #[test]
+    fn tier1_metadata_round_trips_some_and_none() {
+        let conn = open(":memory:").unwrap();
+
+        // Task A: every Tier 1 field populated.
+        let mut with_meta = sample_task(1, " ", 1);
+        with_meta.tags = vec!["a".to_string(), "b".to_string()];
+        with_meta.priority = Priority::from_emoji('\u{23EB}'); // ⏫ → High
+        with_meta.start_date = Some("2026-06-15".to_string());
+        with_meta.created_date = Some("2026-01-01".to_string());
+        with_meta.done_date = Some("2026-06-20".to_string());
+        with_meta.cancelled_date = Some("2026-06-21".to_string());
+
+        // Task B: every Tier 1 field empty / None (must not bleed from A).
+        let without_meta = sample_task(2, " ", 2);
+
+        upsert_task(&conn, &with_meta).unwrap();
+        upsert_task(&conn, &without_meta).unwrap();
+
+        let got = all_tasks(&conn).unwrap();
+        assert_eq!(got.len(), 2);
+
+        let a = got.iter().find(|t| t.id == 1).unwrap();
+        assert_eq!(a.tags, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(a.priority, Some(Priority::High));
+        assert_eq!(a.start_date.as_deref(), Some("2026-06-15"));
+        assert_eq!(a.created_date.as_deref(), Some("2026-01-01"));
+        assert_eq!(a.done_date.as_deref(), Some("2026-06-20"));
+        assert_eq!(a.cancelled_date.as_deref(), Some("2026-06-21"));
+
+        let b = got.iter().find(|t| t.id == 2).unwrap();
+        assert!(b.tags.is_empty(), "tags must not bleed between rows");
+        assert!(b.priority.is_none(), "priority must not bleed between rows");
+        assert!(b.start_date.is_none());
+        assert!(b.created_date.is_none());
+        assert!(b.done_date.is_none());
+        assert!(b.cancelled_date.is_none());
+    }
+
+    /// Tier 1: `reconcile_note` carries all six parsed-metadata fields through
+    /// its UPDATE path (matched row keeps its id; Tier 1 fields refreshed), and
+    /// re-reconciling the same parse is stable. Mirrors the existing
+    /// `reconcile_note_carries_scheduled_date_through_update` test.
+    #[test]
+    fn reconcile_note_carries_tier1_metadata_through_update() {
+        let conn = open(":memory:").unwrap();
+        let body = "ship it \u{1F4C5} 2026-07-01 \u{23F3} 2026-06-20 \u{1F6EB} 2026-06-15 \
+                    \u{2795} 2026-01-01 \u{2705} 2026-06-30 #urgent #backend \u{1F53C}";
+        let initial = taski_core::parse_tasks(&format!("- [ ] {body}\n"), "n.md");
+        assert_eq!(initial.len(), 1);
+        reconcile_note(&conn, "n.md", &initial, Some("h1"), None).unwrap();
+        let got = all_tasks(&conn).unwrap();
+        assert_eq!(got.len(), 1);
+        let preserved_id = got[0].id;
+        assert_eq!(
+            got[0].tags,
+            vec!["urgent".to_string(), "backend".to_string()]
+        );
+        assert_eq!(got[0].priority, Some(Priority::Medium));
+        assert_eq!(got[0].start_date.as_deref(), Some("2026-06-15"));
+        assert_eq!(got[0].created_date.as_deref(), Some("2026-01-01"));
+        assert_eq!(got[0].done_date.as_deref(), Some("2026-06-30"));
+        assert!(got[0].cancelled_date.is_none());
+
+        // Re-reconcile the same parse (identical text_hash → UPDATE in place).
+        // Identity preserved; Tier 1 fields stable.
+        reconcile_note(&conn, "n.md", &initial, Some("h2"), None).unwrap();
+        let got2 = all_tasks(&conn).unwrap();
+        assert_eq!(got2.len(), 1);
+        assert_eq!(got2[0].id, preserved_id, "identity preserved across UPDATE");
+        assert_eq!(
+            got2[0].tags,
+            vec!["urgent".to_string(), "backend".to_string()]
+        );
+        assert_eq!(got2[0].priority, Some(Priority::Medium));
+        assert_eq!(got2[0].start_date.as_deref(), Some("2026-06-15"));
+        assert_eq!(got2[0].created_date.as_deref(), Some("2026-01-01"));
+        assert_eq!(got2[0].done_date.as_deref(), Some("2026-06-30"));
+    }
+
+    /// Tier 1: the sentinel tag-storage format round-trips through
+    /// `encode_tags` and `decode_tags`, AND the raw stored bytes are exactly
+    /// the sentinel form (`" foo bar "` for `["foo","bar"]`). This pins the
+    /// on-disk format so a future change can't silently break Tier 2 whole-tag
+    /// SQL matching.
+    #[test]
+    fn tags_storage_sentinel_format_round_trips() {
+        // Empty Vec ↔ "".
+        assert_eq!(encode_tags(&[]), "");
+        assert!(decode_tags("").is_empty());
+
+        // Single tag.
+        assert_eq!(encode_tags(&["foo".to_string()]), " foo ");
+        assert_eq!(decode_tags(" foo "), vec!["foo".to_string()]);
+
+        // Multi-tag round-trip preserves order.
+        let tags = vec!["foo".to_string(), "bar".to_string()];
+        assert_eq!(encode_tags(&tags), " foo bar ");
+        assert_eq!(decode_tags(" foo bar "), tags);
+
+        // End-to-end: store via upsert_task, read raw bytes back directly.
+        let conn = open(":memory:").unwrap();
+        let mut t = sample_task(1, " ", 1);
+        t.tags = tags.clone();
+        upsert_task(&conn, &t).unwrap();
+        let raw: String = conn
+            .query_row("SELECT tags FROM tasks WHERE id = 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(raw, " foo bar ", "stored bytes must be the sentinel form");
+
+        // And read back through all_tasks.
+        let got = all_tasks(&conn).unwrap();
+        assert_eq!(got[0].tags, tags);
     }
 }

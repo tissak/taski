@@ -1,6 +1,6 @@
 # Taski — Roadmap
 
-*Status: Living document. Last updated: 2026-06-20.*
+*Status: Living document. Last updated: 2026-06-20 (Tier 1 metadata parsing shipped: tags, priority, start/created/done/cancelled dates; schema v6; 218 tests).*
 *Source: feature-gap analysis synthesizing the [Obsidian Tasks](https://publish.obsidian.md/tasks) plugin feature set, [`PRD.md`](./PRD.md) §14 non-goals, and the "Deferred / Intentionally Not Done" list in [`context.md`](./context.md). This file is the single view of "what's next"; it supersedes the scattered deferred/parking-lot notes.*
 
 ---
@@ -12,26 +12,30 @@
 - **Write-path items** touch the vault and must follow the [ADR-0009 pattern](./adr/0009-scheduled-date-today.md): a pure rewrite oracle in `taski-core`, a 256-case proptest, a new `pending_actions.action_type`, and a daemon dispatch branch. Each is marked **(needs ADR)**.
 - Effort is relative: **S** ≈ a focused slice, **M** ≈ a multi-day slice, **L** ≈ a multi-slice feature.
 
-## Where Taski is today (v0.4)
+## Where Taski is today (v0.4 + Tier 1)
 
-- **Reads:** every checkbox task in the vault, `📅`/`📆`/`🗓` due date, `⏳` scheduled date.
+- **Reads:** every checkbox task in the vault, `📅`/`📆`/`🗓` due date, `⏳` scheduled date, `🛫` start date, `➕`/`✅`/`❌` created/done/cancelled dates, `#tags` (multi-value), `🔺`/`⏫`/`🔼`/`🔽`/`⏬` priority.
 - **Writes:** checkbox toggle, `⏳` mark-for-today, checkbox↔bullet conversion, undo.
 - **Views:** status cycle (`f`), Today (`T`), text search (`/`), file search (`F`), note context pane (`p`).
 
-Taski parses **2 of ~15** Obsidian Tasks metadata tokens and has **no tag or priority awareness**. That is where the gaps — and most of the untapped value — concentrate.
+Taski now parses **8 of ~15** Obsidian Tasks metadata tokens (up from 2). The remaining gaps are on the **view** side — the parsed metadata is indexed but not yet surfaced as filters, groupings, or sorts (Tier 2).
 
 ---
 
-## Tier 1 — Foundational metadata parsing (read-only, low effort, low risk)
+## Tier 1 — Foundational metadata parsing (read-only, low effort, low risk) — ✅ SHIPPED
 
 Each item extends the parser and the `tasks` schema only. No vault writes, no ADR required. Every Tier 2 view and Tier 3 write depends on at least one of these.
 
-| Item | Tokens | Unlocks | Effort | Depends on |
-|---|---|---|---|---|
-| **Tag parsing** | `#tag` in task text | tag filter, group-by-tag, project/context views — the #1 organizational axis in the Tasks ecosystem | S | — |
-| **Priority parsing** | `⏫` `🔼` `🔽` `🔺` `⏬` | priority filter, urgency-score sort | S | — |
-| **Start date** | `🛫` | "hide can't-start-yet" tasks — declutters daily views | S | — |
-| **Created / done / cancelled dates** | `➕` `✅` `❌` | done-task review ("completed this week"), task age | S | — |
+**Status: complete (schema v6).** All four items shipped in one read-path slice: six new `Task` fields (`tags`, `priority`, `start_date`, `created_date`, `done_date`, `cancelled_date`), six new `tasks` columns, four date extractors wrapping the existing `extract_emoji_date` primitive, plus custom `extract_priority` (first-match, UTF-8-safe) and `extract_tags` (Obsidian-core grammar, sentinel-padded TEXT storage). 218 tests pass. See `git log` for the `feat: parse Tier 1 metadata` commit.
+
+| Item | Tokens | Unlocks | Effort | Depends on | Status |
+|---|---|---|---|---|---|
+| **Tag parsing** | `#tag` in task text | tag filter, group-by-tag, project/context views — the #1 organizational axis in the Tasks ecosystem | S | — | ✅ parsed + indexed |
+| **Priority parsing** | `🔺` `⏫` `🔼` `🔽` `⏬` | priority filter, urgency-score sort | S | — | ✅ parsed + indexed |
+| **Start date** | `🛫` | "hide can't-start-yet" tasks — declutters daily views | S | — | ✅ parsed + indexed |
+| **Created / done / cancelled dates** | `➕` `✅` `❌` | done-task review ("completed this week"), task age | S | — | ✅ parsed + indexed |
+
+> **Note:** parsing is the read path; the Tier 2 *views* (tag filter, group-by-tag, urgency sort, overdue/happens) and the Tier 3 `✅`-on-toggle interop fix remain open — the metadata is now available for them to consume.
 
 ---
 
@@ -97,7 +101,7 @@ Confirmed out of scope for a personal single-user tool by both the PRD (§14) an
 
 Matches the project's vertical-slice philosophy and the architecture (read path is cheap; write path stays ADR-gated):
 
-1. **Tier 1 metadata parsing** — tags, priority, start, created/done/cancelled. Read-only, no risk, unlocks everything below.
+1. **~~Tier 1 metadata parsing~~** — tags, priority, start, created/done/cancelled. Read-only, no risk, unlocks everything below. **✅ Done (schema v6).**
 2. **Tier 2 views** — overdue, happens, group-by, urgency sort (each as its dependency lands).
 3. **The `✅`/`❌`-on-toggle interop fix** — small write-path slice, high correctness value.
 4. **Bulk operations** — the highest-impact single feature; do after metadata is rich enough to act on.

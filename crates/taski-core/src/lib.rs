@@ -45,6 +45,89 @@ impl Status {
     }
 }
 
+/// Obsidian Tasks-plugin priority (Tier 1 read path). The five variants map 1:1
+/// to the bare priority emojis; see [`Priority::from_emoji`] for the canonical
+/// mapping (source-verified against `Priority.ts` + `DefaultTaskSerializer.ts`
+/// in the Obsidian Tasks plugin).
+///
+/// `Other` is reserved for future round-trip safety (an unknown glyph the user
+/// *did* mean as priority). It is **never produced by [`extract_priority`]** —
+/// there is no reliable way to know an unknown bare emoji was meant as a
+/// priority marker, so the extractor returns `None` rather than guessing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Priority {
+    /// `🔺` (U+1F53A) — highest priority.
+    Highest,
+    /// `⏫` (U+23EB) — high priority. (NOT Highest — common mix-up source.)
+    High,
+    /// `🔼` (U+1F53C) — medium priority.
+    Medium,
+    /// `🔽` (U+1F53D) — low priority.
+    Low,
+    /// `⏬` (U+23EC) — lowest priority.
+    Lowest,
+    /// Reserved for future round-trip safety: an unknown priority glyph. Not
+    /// produced by [`extract_priority`]; kept here so future code can model
+    /// glyphs Taski doesn't yet understand without redefining the enum.
+    Other(String),
+}
+
+/// Canonical emoji → [`Priority`] lookup table. The single source of truth for
+/// the mapping; the extractor and the DB read/write paths both go through the
+/// helpers below.
+///
+/// ⚠️ `⏫` is **High**, not Highest. `🔺` is Highest. This was verified against
+/// `Priority.ts` + `DefaultTaskSerializer.ts` in the Obsidian Tasks plugin.
+const PRIORITY_EMOJIS: &[(char, Priority)] = &[
+    ('\u{1F53A}', Priority::Highest), // 🔺
+    ('\u{23EB}', Priority::High),     // ⏫
+    ('\u{1F53C}', Priority::Medium),  // 🔼
+    ('\u{1F53D}', Priority::Low),     // 🔽
+    ('\u{23EC}', Priority::Lowest),   // ⏬
+];
+
+impl Priority {
+    /// Map a single char to a known [`Priority`] variant. Returns `None` for any
+    /// char that is not one of the five canonical priority emojis; the caller
+    /// (extractor, DB read path) decides whether to treat `None` as
+    /// "no priority" or to wrap as [`Priority::Other`]. The extractor does the
+    /// former; `Other` is reserved for future use.
+    pub fn from_emoji(ch: char) -> Option<Priority> {
+        PRIORITY_EMOJIS
+            .iter()
+            .find(|(c, _)| *c == ch)
+            .map(|(_, p)| p.clone())
+    }
+
+    /// Render this priority back to its canonical emoji char, or `None` for
+    /// [`Priority::Other`] (unknown glyph has no canonical form to emit). Used
+    /// by the DB write path to store the emoji glyph itself.
+    pub fn to_emoji(&self) -> Option<&'static str> {
+        match self {
+            Priority::Highest => Some("\u{1F53A}"), // 🔺
+            Priority::High => Some("\u{23EB}"),     // ⏫
+            Priority::Medium => Some("\u{1F53C}"),  // 🔼
+            Priority::Low => Some("\u{1F53D}"),     // 🔽
+            Priority::Lowest => Some("\u{23EC}"),   // ⏬
+            Priority::Other(_) => None,
+        }
+    }
+
+    /// Lenient reverse of [`Priority::to_emoji`] for the DB read path. Accepts
+    /// the canonical emoji string for each variant; returns `None` for NULL,
+    /// empty, unrecognised, or `Other`-preserved strings. The read path never
+    /// reconstructs `Other` — it stays lenient (unknown glyph → `None`).
+    pub fn from_emoji_str(s: &str) -> Option<Priority> {
+        // A single char is the common case; `s` is exactly one emoji glyph (or
+        // empty / NULL on read). Use `chars().next()` to accept the first char
+        // and ignore any stray variation selector.
+        match s.chars().next() {
+            Some(ch) => Priority::from_emoji(ch),
+            None => None,
+        }
+    }
+}
+
 /// A single extracted task. See PRD §9 for the full field-by-field rationale.
 #[derive(Debug, Clone)]
 pub struct Task {
@@ -75,6 +158,20 @@ pub struct Task {
     /// Parsed scheduled date (Tasks-plugin `⏳` U+23F3, ADR-0009). `None` when the
     /// task body carries no valid scheduled date. Independent of `due_date`.
     pub scheduled_date: Option<String>,
+    /// Parsed inline tags (`#foo`, with the `#` stripped). Empty when the body
+    /// has no tags; deduped, first-seen order preserved. Tier 1 read-only.
+    pub tags: Vec<String>,
+    /// Parsed priority (single bare priority emoji `🔺`/`⏫`/`🔼`/`🔽`/`⏬`).
+    /// `None` when no known priority emoji is present on the line.
+    pub priority: Option<Priority>,
+    /// Parsed start date (`🛫` + whitespace + `YYYY-MM-DD`). `None` when absent.
+    pub start_date: Option<String>,
+    /// Parsed created date (`➕` + whitespace + `YYYY-MM-DD`). `None` when absent.
+    pub created_date: Option<String>,
+    /// Parsed done date (`✅` + whitespace + `YYYY-MM-DD`). `None` when absent.
+    pub done_date: Option<String>,
+    /// Parsed cancelled date (`❌` + whitespace + `YYYY-MM-DD`). `None` when absent.
+    pub cancelled_date: Option<String>,
     /// Last-seen timestamp, unix seconds.
     pub updated_at: i64,
 }
@@ -133,6 +230,12 @@ fn parse_task_line(raw_line: &str, note_path: &str, line_number: usize, now: i64
         note_mtime: None,
         due_date: extract_due_date(body),
         scheduled_date: extract_scheduled_date(body),
+        tags: extract_tags(body),
+        priority: extract_priority(body),
+        start_date: extract_start_date(body),
+        created_date: extract_created_date(body),
+        done_date: extract_done_date(body),
+        cancelled_date: extract_cancelled_date(body),
         updated_at: now,
     })
 }
@@ -209,6 +312,110 @@ pub fn extract_due_date(body: &str) -> Option<String> {
 /// `rewrite_scheduled`'s output through the same primitive the parser uses.
 pub fn extract_scheduled_date(body: &str) -> Option<String> {
     extract_emoji_date(body, &['⏳'])
+}
+
+/// Extract the start date (`🛫` + optional VS16 + whitespace + `YYYY-MM-DD`)
+/// from a task body, per the Obsidian Tasks emoji convention. Thin wrapper
+/// over [`extract_emoji_date`]; only the leading emoji differs.
+pub fn extract_start_date(body: &str) -> Option<String> {
+    extract_emoji_date(body, &['🛫'])
+}
+
+/// Extract the created date (`➕` + optional VS16 + whitespace + `YYYY-MM-DD`)
+/// from a task body, per the Obsidian Tasks emoji convention.
+pub fn extract_created_date(body: &str) -> Option<String> {
+    extract_emoji_date(body, &['➕'])
+}
+
+/// Extract the done date (`✅` + optional VS16 + whitespace + `YYYY-MM-DD`)
+/// from a task body, per the Obsidian Tasks emoji convention.
+pub fn extract_done_date(body: &str) -> Option<String> {
+    extract_emoji_date(body, &['✅'])
+}
+
+/// Extract the cancelled date (`❌` + optional VS16 + whitespace + `YYYY-MM-DD`)
+/// from a task body, per the Obsidian Tasks emoji convention.
+pub fn extract_cancelled_date(body: &str) -> Option<String> {
+    extract_emoji_date(body, &['❌'])
+}
+
+/// Extract the priority from a task body — the **first** occurrence (left to
+/// right) of any of the five canonical Obsidian Tasks priority emojis. Returns
+/// `None` when no priority emoji is present. **Does not emit** [`Priority::Other`]
+/// — there is no reliable way to know an unknown bare glyph was meant as a
+/// priority marker, so this stays a closed set (matches `find_emoji_date_span`'s
+/// "first match wins" precedent).
+///
+/// Walks via `char_indices()` (UTF-8-safe; all priority emojis are multi-byte).
+/// A trailing VS16 after a non-matching emoji is irrelevant because the scan
+/// never advances past a matched emoji (first match returns immediately).
+pub fn extract_priority(body: &str) -> Option<Priority> {
+    for (_, ch) in body.char_indices() {
+        if let Some(p) = Priority::from_emoji(ch) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Extract inline tags (`#foo`) from a task body. Always returns a `Vec` (empty
+/// when none). Tags are returned **without** the `#` prefix, deduped preserving
+/// first-seen order.
+///
+/// Grammar (matches Obsidian core's tag-recognition rules, intentionally
+/// stricter than the Tasks plugin's regex):
+/// - A tag starts at a `#` that is either at the body start **or** immediately
+///   preceded by ASCII whitespace (space / tab). (`foo#bar` and URL fragments
+///   like `https://x.com/y#section` are rejected.)
+/// - The char immediately after `#` must be an ASCII letter (`a-z`/`A-Z`) or
+///   `_`. (Rejects `#123`, `#!`, `#-`.)
+/// - The run continues with ASCII letters/digits/`_`/`-`/`/` until any other
+///   char or whitespace. (Allows nested `#project/sub`, hyphenated `#foo-bar`.)
+///
+/// Walks via `char_indices()` (UTF-8-safe).
+pub fn extract_tags(body: &str) -> Vec<String> {
+    let bytes = body.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let mut i = 0;
+    while i < bytes.len() {
+        // Tag boundary: a `#` at body start or immediately preceded by ASCII ws.
+        let is_boundary = i == 0 || bytes[i - 1].is_ascii_whitespace();
+        if bytes[i] != b'#' || !is_boundary {
+            i += 1;
+            continue;
+        }
+        // Skip the `#`.
+        i += 1;
+
+        // The char after `#` must be ASCII letter or `_`.
+        if i >= bytes.len() || !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+            continue;
+        }
+
+        // Walk the run in `char_indices()` to find the tag's UTF-8-safe end.
+        // Start scanning from the current byte offset; collect bytes for the tag.
+        let tag_start_byte = i;
+        let mut tag_end_byte = i;
+        for (off, ch) in body[i..].char_indices() {
+            let abs = i + off;
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '/' {
+                tag_end_byte = abs + ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let tag = &body[tag_start_byte..tag_end_byte];
+        let tag_string = tag.to_string();
+        if seen.insert(tag_string.clone()) {
+            out.push(tag_string);
+        }
+        // Advance `i` past the consumed tag.
+        i = tag_end_byte;
+    }
+
+    out
 }
 
 /// Outcome of [`rewrite_scheduled`]: the pure line-rewrite behind the ADR-0009
@@ -835,6 +1042,300 @@ plain text
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].scheduled_date.as_deref(), Some("2026-06-20"));
         assert!(tasks[0].due_date.is_none());
+    }
+
+    // --- Tier 1: extract_start_date / created / done / cancelled ------------
+
+    #[test]
+    fn extract_start_date_plain_departure_emoji() {
+        assert_eq!(
+            extract_start_date("ship 🛫 2025-12-31"),
+            Some("2025-12-31".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_start_date_none_when_no_emoji() {
+        assert_eq!(extract_start_date("plain task"), None);
+    }
+
+    #[test]
+    fn extract_start_date_tolerates_vs16() {
+        // VS16 (U+FE0F) immediately after 🛫 is optional but accepted — this
+        // confirms the shared `extract_emoji_date` helper handles VS16 for the
+        // start-date emoji just as it does for 📅 and ⏳.
+        assert_eq!(
+            extract_start_date("\u{1F6EB}\u{FE0F} 2025-12-31"),
+            Some("2025-12-31".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_start_date_no_space_rejected_like_due() {
+        // Taski requires ≥1 whitespace between the emoji and the date; the
+        // Obsidian Tasks plugin's zero-space tolerance is a pre-existing interop
+        // gap NOT in scope for Tier 1. Pinning consistency with the existing
+        // date extractors here.
+        assert_eq!(extract_start_date("\u{1F6EB}2025-12-31"), None);
+    }
+
+    #[test]
+    fn extract_created_date_plain_plus_emoji() {
+        assert_eq!(
+            extract_created_date("ship ➕ 2025-12-31"),
+            Some("2025-12-31".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_created_date_none_when_no_emoji() {
+        assert_eq!(extract_created_date("plain task"), None);
+    }
+
+    #[test]
+    fn extract_created_date_tolerates_vs16() {
+        assert_eq!(
+            extract_created_date("\u{2795}\u{FE0F} 2025-12-31"),
+            Some("2025-12-31".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_created_date_no_space_rejected_like_due() {
+        assert_eq!(extract_created_date("\u{2795}2025-12-31"), None);
+    }
+
+    #[test]
+    fn extract_done_date_plain_check_emoji() {
+        assert_eq!(
+            extract_done_date("ship ✅ 2025-12-31"),
+            Some("2025-12-31".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_done_date_none_when_no_emoji() {
+        assert_eq!(extract_done_date("plain task"), None);
+    }
+
+    #[test]
+    fn extract_done_date_tolerates_vs16() {
+        assert_eq!(
+            extract_done_date("\u{2705}\u{FE0F} 2025-12-31"),
+            Some("2025-12-31".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_done_date_no_space_rejected_like_due() {
+        assert_eq!(extract_done_date("\u{2705}2025-12-31"), None);
+    }
+
+    #[test]
+    fn extract_cancelled_date_plain_cross_emoji() {
+        assert_eq!(
+            extract_cancelled_date("ship ❌ 2025-12-31"),
+            Some("2025-12-31".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_cancelled_date_none_when_no_emoji() {
+        assert_eq!(extract_cancelled_date("plain task"), None);
+    }
+
+    #[test]
+    fn extract_cancelled_date_tolerates_vs16() {
+        assert_eq!(
+            extract_cancelled_date("\u{274C}\u{FE0F} 2025-12-31"),
+            Some("2025-12-31".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_cancelled_date_no_space_rejected_like_due() {
+        assert_eq!(extract_cancelled_date("\u{274C}2025-12-31"), None);
+    }
+
+    // --- Tier 1: extract_priority ------------------------------------------
+
+    #[test]
+    fn extract_priority_maps_each_known_emoji() {
+        // Source-verified mapping against Obsidian Tasks `Priority.ts` +
+        // `DefaultTaskSerializer.ts`. ⚠️ `⏫` is High, NOT Highest; `🔺` is
+        // Highest — a common mix-up.
+        assert_eq!(extract_priority("task \u{1F53A}"), Some(Priority::Highest));
+        assert_eq!(extract_priority("task \u{23EB}"), Some(Priority::High));
+        assert_eq!(extract_priority("task \u{1F53C}"), Some(Priority::Medium));
+        assert_eq!(extract_priority("task \u{1F53D}"), Some(Priority::Low));
+        assert_eq!(extract_priority("task \u{23EC}"), Some(Priority::Lowest));
+    }
+
+    #[test]
+    fn extract_priority_none_when_no_emoji() {
+        assert_eq!(extract_priority("plain task"), None);
+    }
+
+    #[test]
+    fn extract_priority_takes_first_when_multiple() {
+        // note: first-wins matches find_emoji_date_span precedent; a line with
+        // two priority emojis is malformed regardless.
+        assert_eq!(
+            extract_priority("\u{1F53C} \u{1F53A}"),
+            Some(Priority::Medium)
+        );
+    }
+
+    #[test]
+    fn extract_priority_tolerates_vs16() {
+        // First-match-returns immediately, so a trailing VS16 after the match
+        // is irrelevant; this pins that behaviour. (A VS16 before the next
+        // non-matching char would also be skipped by the char-by-char scan.)
+        assert_eq!(
+            extract_priority("task \u{1F53C}\u{FE0F}"),
+            Some(Priority::Medium)
+        );
+    }
+
+    #[test]
+    fn priority_round_trips_through_emoji_helpers() {
+        // Each known variant maps to exactly one canonical emoji char and back.
+        for (emoji, variant) in [
+            ('\u{1F53A}', Priority::Highest),
+            ('\u{23EB}', Priority::High),
+            ('\u{1F53C}', Priority::Medium),
+            ('\u{1F53D}', Priority::Low),
+            ('\u{23EC}', Priority::Lowest),
+        ] {
+            assert_eq!(variant.to_emoji(), Some(emoji.to_string().as_str()));
+            assert_eq!(Priority::from_emoji(emoji), Some(variant.clone()));
+            assert_eq!(Priority::from_emoji_str(&emoji.to_string()), Some(variant));
+        }
+        // `Other` has no canonical glyph.
+        assert_eq!(Priority::Other("z".to_string()).to_emoji(), None);
+        // Unknown char → None on both paths.
+        assert_eq!(Priority::from_emoji('z'), None);
+        assert_eq!(Priority::from_emoji_str("z"), None);
+        assert_eq!(Priority::from_emoji_str(""), None);
+    }
+
+    // --- Tier 1: extract_tags -----------------------------------------------
+
+    #[test]
+    fn extract_tags_single() {
+        assert_eq!(extract_tags("body #foo"), vec!["foo".to_string()]);
+    }
+
+    #[test]
+    fn extract_tags_multiple() {
+        assert_eq!(
+            extract_tags("#foo #bar"),
+            vec!["foo".to_string(), "bar".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_tags_strips_hash_prefix() {
+        let tags = extract_tags("#foo #bar #baz");
+        assert!(
+            tags.iter().all(|t| !t.starts_with('#')),
+            "no tag should retain its '#' prefix: {tags:?}"
+        );
+    }
+
+    #[test]
+    fn extract_tags_nested_slash() {
+        assert_eq!(
+            extract_tags("#project/sub"),
+            vec!["project/sub".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_tags_allows_hyphen_and_underscore() {
+        assert_eq!(
+            extract_tags("#foo-bar_baz"),
+            vec!["foo-bar_baz".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_tags_empty_when_no_tag() {
+        assert!(extract_tags("plain task").is_empty());
+    }
+
+    #[test]
+    fn extract_tags_ignores_hash_followed_by_digit() {
+        // Obsidian core rule: a tag must start with a letter or `_`.
+        assert!(extract_tags("see #123").is_empty());
+    }
+
+    #[test]
+    fn extract_tags_ignores_hash_inside_word() {
+        assert!(extract_tags("foo#bar").is_empty());
+    }
+
+    #[test]
+    fn extract_tags_ignores_hash_in_url_fragment() {
+        assert!(extract_tags("see https://x.com/y#section").is_empty());
+    }
+
+    #[test]
+    fn extract_tags_dedups_preserving_order() {
+        assert_eq!(
+            extract_tags("#foo #bar #foo"),
+            vec!["foo".to_string(), "bar".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_tags_tag_at_body_start() {
+        // Start-of-string is a valid tag boundary (equivalent to a leading ws).
+        assert_eq!(extract_tags("#foo bar"), vec!["foo".to_string()]);
+    }
+
+    /// Documents a deliberate gap, not a bug.
+    #[test]
+    fn extract_tags_inside_inline_code_is_known_limitation() {
+        // TODO(tier-2): inline code spans are not handled (tech.md L35 —
+        // deferred until pulldown-cmark adoption); documenting so this is
+        // recognized as a known gap, not a future regression.
+        //
+        // The boundary rule ("`#` at body start or preceded by ASCII ws")
+        // happens to reject the backtick-adjacent form `` `#ref` `` (the
+        // backtick is not whitespace), but it does NOT reject the
+        // space-padded form `` ` #ref` `` — the space inside the code span
+        // counts as a tag boundary, so `ref` is extracted. Real inline-code
+        // awareness would skip both.
+        assert!(
+            extract_tags("`#ref`").is_empty(),
+            "backtick-adjacent form rejected"
+        );
+        assert_eq!(
+            extract_tags("` #ref`"),
+            vec!["ref".to_string()],
+            "space-padded form is a known false positive (no inline-code awareness)"
+        );
+    }
+
+    // --- Tier 1: coexistence (all metadata axes parse independently) -------
+
+    #[test]
+    fn parse_task_line_parses_all_metadata_independently() {
+        let body = "ship it \u{1F4C5} 2026-07-01 \u{23F3} 2026-06-20 \u{1F6EB} 2026-06-15 \u{2795} 2026-01-01 #urgent #backend \u{1F53C}";
+        let tasks = parse_tasks(&format!("- [ ] {body}\n"), "d.md");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].due_date.as_deref(), Some("2026-07-01"));
+        assert_eq!(tasks[0].scheduled_date.as_deref(), Some("2026-06-20"));
+        assert_eq!(tasks[0].start_date.as_deref(), Some("2026-06-15"));
+        assert_eq!(tasks[0].created_date.as_deref(), Some("2026-01-01"));
+        assert_eq!(
+            tasks[0].tags,
+            vec!["urgent".to_string(), "backend".to_string()]
+        );
+        assert_eq!(tasks[0].priority, Some(Priority::Medium));
+        assert!(tasks[0].done_date.is_none());
+        assert!(tasks[0].cancelled_date.is_none());
     }
 
     // --- ymd_from_unix unit tests (ADR-0009 Phase 1) -----------------------

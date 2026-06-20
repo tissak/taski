@@ -197,6 +197,13 @@ impl StatusFilter {
 /// One renderable row in the grouped list. `Header` carries per-note counts computed
 /// from the full (unfiltered) task set so the triage overview stays accurate under any
 /// filter; `Task` carries the task the cursor can act on.
+//
+// `large_enum_variant`: the `Task` arm dominates the enum's size (the Tier 1
+// metadata fields pushed `Task` past clippy's 200-byte threshold). Boxing the
+// field (`Box<Task>`) is the proper fix but would touch every match arm and
+// every construction site — a TUI-internal refactor outside Tier 1's stated
+// read-path scope. Deferred to a dedicated cleanup; the allow is intentional.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 enum DisplayRow {
     Header {
@@ -1557,6 +1564,12 @@ mod tests {
             note_mtime: None,
             due_date: None,
             scheduled_date: None,
+            tags: Vec::new(),
+            priority: None,
+            start_date: None,
+            created_date: None,
+            done_date: None,
+            cancelled_date: None,
             updated_at: 1,
         }
     }
