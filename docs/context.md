@@ -18,7 +18,7 @@ browse, filter, and toggle them — with toggles written safely back into the no
 Obsidian stays the source of truth; Taski is the fast "execution layer" over scattered
 tasks.
 
-Two Rust binaries + a shared SQLite file:
+A unified Rust binary (`taski` — daemon + TUI in one process) backed by a shared SQLite file (the standalone `taski-daemon` / `taski-tui` binaries are kept for backcompat):
 
 ```
  Obsidian vault ──watch──▶ taski-daemon ──write──▶ SQLite (taski.db) ◀──read─── taski-tui
@@ -30,13 +30,15 @@ Two Rust binaries + a shared SQLite file:
 
 The whole point of the architecture: **SQLite is the decoupling boundary.** The daemon
 writes; the TUI reads; write-back commands flow back through a `pending_actions` table
-that only the daemon executes. Neither binary talks to the other directly.
+that only the daemon executes. By default `taski` runs both roles together in one process
+(the diagram's two boxes are the standalone binaries, still kept for backcompat); neither
+side talks to the other directly.
 
 ---
 
 ## Repository Layout
 
-Cargo workspace, edition 2024, five crates. Dependencies point downward only (no cycles):
+Cargo workspace, edition 2024, six crates. Dependencies point downward only (no cycles):
 
 | Crate | Responsibility | Key file(s) |
 |---|---|---|
@@ -45,6 +47,7 @@ Cargo workspace, edition 2024, five crates. Dependencies point downward only (no
 | `taski-db` | The canonical SQLite schema, `open()` (WAL + schema + dir creation), and all read/write APIs (`all_tasks`, `reconcile_note`, `enqueue_action`, `pending_actions`, `prune_old_actions`, …). Owns `tasks` + `pending_actions`. | `crates/taski-db/src/lib.rs` |
 | `taski-daemon` | The watcher/scanner + **sole writer to the vault**: `run()`, `scan_vault`, `index_note`, `process_action`, `atomic_write` (TOCTOU-hardened), watch loop. Two binaries: `taski-daemon` (service) + tests. | `crates/taski-daemon/src/{lib,main}.rs`, `tests/` |
 | `taski-tui` | The `ratatui` client: polls the index, groups by note, filters, renders, submits toggle actions. Never touches vault files. | `crates/taski-tui/src/main.rs` |
+| `taski` | The **unified launcher** binary: runs the daemon (background thread) + TUI (main thread) together by default (`taski`), or either alone via `taski daemon` / `taski tui` subcommands. Attach-or-spawn + single-writer lock (ADRs 0007/0008). | `crates/taski/src/main.rs` |
 
 Supporting: `docs/` (PRD, tech, ADRs, setup, this file), `scripts/install-launchd.sh`
 + `uninstall-launchd.sh`, `.github/workflows/ci.yml`, `rust-toolchain.toml`.
@@ -75,9 +78,11 @@ step in CI — install and run it locally if you want it. `rust-toolchain.toml` 
 **Run it** (daily driver): see [`setup.md`](./setup.md). Short version:
 
 ```sh
+./target/release/taski                                                    # combined: daemon + TUI, drains on quit
+./target/release/taski daemon                                             # daemon only (what launchd runs)
+./target/release/taski tui                                                # TUI only (reader)
 ./target/release/taski-daemon --init-config --vault /path/to/your/vault   # one-time config
 ./target/release/taski-daemon --once --vault /path/to/vault               # single scan + exit (no watcher)
-./target/release/taski-tui                                                # the UI
 # or autostart the daemon at login:
 scripts/install-launchd.sh
 ```
@@ -212,6 +217,8 @@ understanding the failure mode it prevents.**
    a relaxation of ADR-0002. Chosen over "TUI reads the vault directly" so content and task
    locations stay consistent (same scan) and the SQLite decoupling boundary stays intact.
 
+7. **Unified launcher + single-writer lock** ([ADR-0007](./adr/0007-unified-in-process-launcher.md), [ADR-0008](./adr/0008-single-writer-file-lock.md)) — one `taski` binary runs daemon + TUI in-process; a `flock` on `<db_dir>/daemon.lock` guarantees a sole writer across all startup combinations (launchd + `taski`, etc.), closing the two-daemon corruption vector ADR-0004 doesn't cover.
+
 ---
 
 ## Gotchas & Landmines (read this before you change anything)
@@ -330,6 +337,9 @@ exercised only at runtime (its `taski.db` is gitignored).
 | Change context-pane keybindings/behavior | `taski-tui/src/main.rs` key match in `run()` (`J`/`K` scroll, `p` toggle) + `MIN_SPLIT_WIDTH` auto-hide; `sync_context` for the read path |
 | Add a CLI flag | `Cli` struct in the relevant binary's `lib.rs`/`main.rs` |
 | Change config format/precedence | `taski-config/src/lib.rs` |
+| Run the app (daemon + TUI combined) | `taski` (unified binary); see [setup.md](./setup.md) |
+| Run the daemon only | `taski daemon` (or the standalone `taski-daemon`) |
+| Run the TUI only | `taski tui` (or `taski-tui`); a reader, safe alongside any running daemon |
 | Run a one-shot scan (no watcher) | `taski-daemon --once --vault …` |
 | Generate a config file | `taski-daemon --init-config --vault …` |
 | Inspect the index / pending actions | `sqlite3 <db> "SELECT …"` (see Debugging) |

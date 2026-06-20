@@ -83,31 +83,44 @@ fn run_daemon_only(cli: Cli) -> Result<()> {
     run_daemon(opts, handle, guard)
 }
 
-/// `taski` (default): run the daemon (background thread) + TUI (main thread) together.
-/// The daemon's lifetime is scoped to the TUI session. If another daemon already holds
-/// the lock, Phase B **refuses** with guidance; Phase C will flip this to "attach"
-/// (TUI-only against the running daemon) — that flip lives in [`acquire_for_combined`].
+/// `taski` (default): run the daemon (background thread) + TUI (main thread) together,
+/// the daemon's lifetime scoped to this TUI session. **Attach-or-spawn** (ADR-0008):
+/// probe the single-writer lock — if free, spawn the daemon and run the TUI; if held
+/// (e.g. launchd's daemon is running), **attach**: run the TUI-only against the existing
+/// daemon (a reader) so the user's default command always works and a second daemon can
+/// never start.
 fn run_combined(cli: Cli) -> Result<()> {
     let (_db_path, lock_path) = resolve_db_and_lock(cli.db.as_deref())?;
 
+    match acquire_daemon_lock(&lock_path).context("acquiring daemon lock")? {
+        LockOutcome::Acquired(guard) => run_combined_spawn(cli, &lock_path, guard),
+        LockOutcome::HeldByOther(pid) => {
+            // Attach: the other process owns the lock and the write-back path; we're a
+            // reader. No daemon thread, no shutdown handshake, no log-file tracing (the
+            // running daemon owns its log). Not in the alt-screen yet, so stderr is safe.
+            eprintln!(
+                "taski: attached to running daemon{}. TUI only — the daemon keeps running after you quit.",
+                pid.map(|p| format!(" (PID {p})")).unwrap_or_default(),
+            );
+            // The TUI is a reader (WAL: many readers across processes); no lock check.
+            taski_tui::run_with_db(cli.db)
+        }
+    }
+}
+
+/// Combined mode, lock acquired: spawn the daemon on a background thread and run the TUI
+/// on the main thread. The daemon's tracing routes to the log FILE (never stderr) so it
+/// can't garble the TUI's alternate screen. On TUI quit the daemon observes the shared
+/// shutdown signal, drains pending actions, and exits.
+fn run_combined_spawn(
+    cli: Cli,
+    lock_path: &Path,
+    guard: taski_daemon::DaemonLockGuard,
+) -> Result<()> {
     // The daemon thread's tracing must go to the log FILE, never stderr: the TUI owns the
     // alternate screen, and any tracing→stderr on the daemon thread would garble it.
     let log_path = lock_path.with_file_name("daemon.log");
     init_tracing_to_file(&log_path);
-
-    let guard = match acquire_daemon_lock(&lock_path).context("acquiring daemon lock")? {
-        LockOutcome::Acquired(g) => g,
-        // Phase B: refuse with guidance. Phase C: flip to attach (run TUI-only against the
-        // existing daemon) here — the single spot that changes.
-        LockOutcome::HeldByOther(pid) => {
-            // Not in the alt-screen yet, so stderr is safe.
-            eprintln!(
-                "taski: a daemon is already running{}. Run `taski tui` to use it, or stop it first.",
-                pid.map(|p| format!(" (PID {p})")).unwrap_or_default(),
-            );
-            return Ok(());
-        }
-    };
 
     let (signal, handle) = ShutdownSignal::new();
     let signal_for_panic = signal.clone();
@@ -154,8 +167,9 @@ fn run_combined(cli: Cli) -> Result<()> {
     tui_result
 }
 
-/// Acquire the lock or refuse (used by `taski daemon`). Shared with the combined refuse
-/// branch's wording; Phase C will add an attach variant alongside this.
+/// Acquire the lock or refuse. Used by `taski daemon` (run-daemon-only): the user asked
+/// for a daemon explicitly, and a second one is a config mistake, so we refuse with a
+/// non-zero exit. (Combined mode attaches instead — see [`run_combined`].)
 fn acquire_or_refuse(lock_path: &Path) -> Result<taski_daemon::DaemonLockGuard> {
     match acquire_daemon_lock(lock_path).context("acquiring daemon lock")? {
         LockOutcome::Acquired(g) => Ok(g),

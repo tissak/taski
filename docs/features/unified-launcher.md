@@ -1,7 +1,6 @@
 # Unified Launcher (`taski`)
 
-*Status: Sketch — design decisions locked, pending implementation. Branch
-`experiment/unified-launcher`. See also the [ADR notes](#adrs-to-record) at the end.*
+*Status: Implemented — feature complete (Phases A/B/C merged on `experiment/unified-launcher`). See also the [ADR notes](#adrs-to-record) at the end.*
 
 **One-liner:** A single `taski` command that runs the daemon and the TUI together by
 default — the daemon's lifetime scoped to the TUI session — with `daemon`/`tui`
@@ -113,14 +112,14 @@ The daemon's global `ctrlc::set_handler` is therefore **dormant** in combined mo
 **so that** I can triage tasks without managing processes.
 
 **Acceptance Criteria:**
-- [ ] `taski` (no args) starts the daemon and the TUI together.
-- [ ] Quitting the TUI (`q`) drains pending actions and exits the daemon cleanly within
+- [x] `taski` (no args) starts the daemon and the TUI together.
+- [x] Quitting the TUI (`q`) drains pending actions and exits the daemon cleanly within
       ~1 s; no toggle done before quit is left unapplied beyond normal write-back latency.
-- [ ] `taski daemon` runs the daemon alone (the launchd entry point).
-- [ ] `taski tui` runs the TUI alone (a reader; works alongside any running daemon).
-- [ ] `--vault` / `--db` flags work on all three modes, with the existing
+- [x] `taski daemon` runs the daemon alone (the launchd entry point).
+- [x] `taski tui` runs the TUI alone (a reader; works alongside any running daemon).
+- [x] `--vault` / `--db` flags work on all three modes, with the existing
       CLI→config→default precedence.
-- [ ] Existing `taski-daemon` / `taski-tui` binaries keep working unchanged (back-compat).
+- [x] Existing `taski-daemon` / `taski-tui` binaries keep working unchanged (back-compat).
 
 ### Supporting Behaviors (Should Have)
 
@@ -128,10 +127,10 @@ The daemon's global `ctrlc::set_handler` is therefore **dormant** in combined mo
 **I want** `taski` to just work,
 **so that** I'm never told "daemon already running" by the default command.
 
-- [ ] `taski` detects an already-running daemon (held lock) and **attaches** — runs the
+- [x] `taski` detects an already-running daemon (held lock) and **attaches** — runs the
       TUI-only against it, printing `Attached to running daemon (PID X).`
-- [ ] `taski daemon` refuses (non-zero exit, clear message) if a daemon is already running.
-- [ ] `install-launchd.sh` installs `taski` and points the plist at `taski daemon`.
+- [x] `taski daemon` refuses (non-zero exit, clear message) if a daemon is already running.
+- [x] `install-launchd.sh` installs `taski` and points the plist at `taski daemon`.
 
 ### Future Considerations (Could Have)
 

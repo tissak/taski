@@ -2,7 +2,7 @@
 #
 # Uninstall the taski launchd autostart agent: stop it and remove the plist.
 #
-# Leaves the installed binaries (~/.local/bin/taski-*) and config
+# Leaves the installed binaries (~/.local/bin/taski, taski-daemon, taski-tui) and config
 # (~/.config/taski/) in place — this only removes the autostart. Remove those
 # manually if you want a full uninstall.
 #
@@ -25,6 +25,6 @@ cat <<EOF
 
 Done. The taski daemon will no longer autostart.
 
-The binaries (~/.local/bin/taski-*) and config (~/.config/taski/) were left in place.
-Remove them manually for a full uninstall.
+The binaries (~/.local/bin/taski, taski-daemon, taski-tui) and config (~/.config/taski/)
+were left in place. Remove them manually for a full uninstall.
 EOF
