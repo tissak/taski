@@ -195,7 +195,7 @@ proptest! {
         std::fs::write(&note_abs, &original).unwrap();
 
         let conn = db::open(&tmp.path().join("p.db").to_string_lossy()).unwrap();
-        scan_vault(&conn, root).unwrap();
+        scan_vault(&conn, root, &[]).unwrap();
 
         // Locate the anchor task by its (always-constant) body text.
         let tasks = db::all_tasks(&conn).unwrap();

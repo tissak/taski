@@ -29,7 +29,7 @@ use clap::Parser;
 use notify::RecursiveMode;
 use notify_debouncer_mini::{DebounceEventResult, new_debouncer};
 use rusqlite::Connection;
-use taski_core::{RewriteResult, parse_tasks, rewrite_scheduled};
+use taski_core::{RewriteResult, parse_tasks, rewrite_scheduled, toggle_bullet};
 use taski_db as db;
 use taski_db::PendingAction;
 use walkdir::WalkDir;
@@ -179,9 +179,21 @@ pub fn run_daemon(
     let conn = db::open(&db_path.to_string_lossy())
         .with_context(|| format!("opening taski database {:?}", db_path))?;
 
+    // User-configured directory excludes (relative to vault root).
+    let exclude_dirs = &cfg.exclude_dirs;
+
+    // Purge any previously-indexed tasks that now fall under an excluded directory,
+    // so the index stays consistent when the user adds or changes exclude_dirs.
+    if !exclude_dirs.is_empty() {
+        match db::delete_tasks_for_excluded_dirs(&conn, exclude_dirs) {
+            Ok(()) => tracing::info!("purged indexed tasks inside excluded directories"),
+            Err(e) => tracing::warn!(err = %e, "purging excluded-dir tasks failed; continuing"),
+        }
+    }
+
     // Sweep any temp files left behind by a crash mid-write-back (ADR-0003). Do this
     // BEFORE the scan so the freshly-written scan reflects a clean vault state.
-    match sweep_tmp_files(&vault_root) {
+    match sweep_tmp_files(&vault_root, exclude_dirs) {
         Ok(n) if n > 0 => tracing::warn!(count = n, "swept stale *.taski.tmp files"),
         Ok(_) => {}
         Err(e) => tracing::warn!(err = %e, "temp-file sweep failed; continuing"),
@@ -197,14 +209,14 @@ pub fn run_daemon(
         Err(e) => tracing::warn!(err = %e, "action pruning failed; continuing"),
     }
 
-    let total = scan_vault(&conn, &vault_root)?;
+    let total = scan_vault(&conn, &vault_root, exclude_dirs)?;
     tracing::info!(count = total, ?vault_root, "initial scan complete");
 
     if opts.once {
         return Ok(());
     }
 
-    run_watch_loop(&conn, &vault_root, &shutdown)?;
+    run_watch_loop(&conn, &vault_root, &shutdown, exclude_dirs)?;
     Ok(())
 }
 
@@ -313,13 +325,14 @@ pub fn index_note(conn: &Connection, abs_path: &Path, vault_root: &Path) -> Resu
 
 /// Walk `vault_root` recursively and index every `.md` note. Directories whose name
 /// starts with `.` (e.g. `.obsidian`, `.trash`, `.git`) are pruned and never
-/// descended into; non-`.md` files are skipped. Returns the total number of tasks
+/// descended into; user-configured exclude directories (relative to vault root) are
+/// also skipped; non-`.md` files are skipped. Returns the total number of tasks
 /// indexed. A single bad note logs and is skipped; it does not abort the scan.
-pub fn scan_vault(conn: &Connection, vault_root: &Path) -> Result<usize> {
+pub fn scan_vault(conn: &Connection, vault_root: &Path, exclude_dirs: &[String]) -> Result<usize> {
     let mut total = 0usize;
     for entry in WalkDir::new(vault_root)
         .into_iter()
-        .filter_entry(|e| e.depth() == 0 || !is_hidden_dir_entry(e))
+        .filter_entry(|e| e.depth() == 0 || !should_exclude_entry(e, vault_root, exclude_dirs))
     {
         let entry = match entry {
             Ok(e) => e,
@@ -352,7 +365,12 @@ pub fn scan_vault(conn: &Connection, vault_root: &Path) -> Result<usize> {
 /// Note: `notify-debouncer-mini` deliberately does not preserve event kind (it only
 /// reports "something changed at this path"), so create/modify vs. remove is decided
 /// by checking file existence in [`handle_debounced_event`].
-fn run_watch_loop(conn: &Connection, vault_root: &Path, shutdown: &ShutdownHandle) -> Result<()> {
+fn run_watch_loop(
+    conn: &Connection,
+    vault_root: &Path,
+    shutdown: &ShutdownHandle,
+    exclude_dirs: &[String],
+) -> Result<()> {
     let (event_tx, event_rx) = mpsc::channel::<DebounceEventResult>();
     let mut debouncer =
         new_debouncer(Duration::from_millis(300), event_tx).context("creating file watcher")?;
@@ -366,7 +384,7 @@ fn run_watch_loop(conn: &Connection, vault_root: &Path, shutdown: &ShutdownHandl
         match event_rx.recv_timeout(Duration::from_millis(500)) {
             Ok(Ok(events)) => {
                 for event in events {
-                    handle_debounced_event(conn, &event.path, vault_root);
+                    handle_debounced_event(conn, &event.path, vault_root, exclude_dirs);
                 }
             }
             Ok(Err(e)) => tracing::error!(err = %e, "watcher error"),
@@ -405,11 +423,19 @@ fn run_watch_loop(conn: &Connection, vault_root: &Path, shutdown: &ShutdownHandl
 /// Dispatch one debounced vault event. `.md` files only; paths whose relative path
 /// traverses a hidden directory are ignored. Existence decides the action:
 /// present → re-index (covers Create + Modify); absent → delete its rows (Remove).
-fn handle_debounced_event(conn: &Connection, abs_path: &Path, vault_root: &Path) {
+fn handle_debounced_event(
+    conn: &Connection,
+    abs_path: &Path,
+    vault_root: &Path,
+    exclude_dirs: &[String],
+) {
     if !is_markdown(abs_path) {
         return;
     }
     if traverses_hidden_dir(abs_path, vault_root) {
+        return;
+    }
+    if !exclude_dirs.is_empty() && path_matches_exclude(abs_path, vault_root, exclude_dirs) {
         return;
     }
     if abs_path.exists() {
@@ -448,9 +474,46 @@ fn relative_to_vault(abs_path: &Path, vault_root: &Path) -> Result<String> {
         .replace(std::path::MAIN_SEPARATOR, "/"))
 }
 
-/// True for a directory whose name starts with `.` (hidden / VCS / Obsidian-internal).
-fn is_hidden_dir_entry(e: &walkdir::DirEntry) -> bool {
-    e.file_type().is_dir() && e.file_name().to_string_lossy().starts_with('.')
+/// True if a directory entry should be excluded from vault walking: either it is a
+/// hidden directory (name starts with `.`), or it is one of the user-configured
+/// exclude directories (matched as a relative path from the vault root).
+///
+/// For user-configured exclusions, both the exact path and any path *inside* it are
+/// excluded. An `exclude_dirs` entry like `"templates"` matches the `templates/`
+/// directory itself, `templates/daily/`, etc. A leading slash is not required.
+fn should_exclude_entry(e: &walkdir::DirEntry, vault_root: &Path, exclude_dirs: &[String]) -> bool {
+    // Always prune hidden directories (unchanged behavior).
+    if e.file_type().is_dir() && e.file_name().to_string_lossy().starts_with('.') {
+        return true;
+    }
+    // Check user-configured exclusions.
+    if !exclude_dirs.is_empty()
+        && let Ok(rel) = e.path().strip_prefix(vault_root)
+    {
+        let rel_str = rel.to_string_lossy();
+        if exclude_dirs.iter().any(|excl| {
+            let excl = excl.trim_end_matches('/');
+            rel_str == excl || rel_str.starts_with(&format!("{}/", excl))
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+/// True if `abs_path` (an absolute path, e.g. from a filesystem event) is inside (or
+/// matches) one of the user-configured exclude directories. The path is relativised to
+/// `vault_root` first, so exclusions like `"templates"` match `templates/daily.md` as
+/// well as `templates/`.
+fn path_matches_exclude(abs_path: &Path, vault_root: &Path, exclude_dirs: &[String]) -> bool {
+    let Ok(rel) = abs_path.strip_prefix(vault_root) else {
+        return false;
+    };
+    let rel_str = rel.to_string_lossy();
+    exclude_dirs.iter().any(|excl| {
+        let excl = excl.trim_end_matches('/');
+        rel_str == excl || rel_str.starts_with(&format!("{}/", excl))
+    })
 }
 
 /// True if `path` ends with `.md` (case-insensitive).
@@ -498,6 +561,9 @@ pub enum ApplyOutcome {
     /// NBSP, stray variation selectors, more than one `⏳`), so
     /// `rewrite_scheduled` refused to guess — the action is not applied.
     MetadataUnparseable,
+    /// ADR-0011: `taski_core::toggle_bullet` returned `Unparseable` — the line
+    /// is not a valid checkbox or bullet format.
+    BulletUnparseable,
 }
 
 /// Process every currently-pending action to completion, resolving each (`done` on
@@ -520,6 +586,7 @@ pub fn process_pending_actions(conn: &Connection, vault_root: &Path) -> Result<(
             let outcome: Result<ApplyOutcome> = match action.action_type.as_str() {
                 "checkbox" => process_action(conn, vault_root, action),
                 "set_scheduled" => process_metadata_action(conn, vault_root, action),
+                "toggle_bullet" => process_bullet_action(conn, vault_root, action),
                 // Unknown action_type: refuse with a distinct, accurate message.
                 // (NOT the checkbox `new_char` phrasing — there is no `new_char`
                 // here; this is an unrecognized write gesture.)
@@ -576,6 +643,9 @@ pub fn process_pending_actions(conn: &Connection, vault_root: &Path) -> Result<(
                         ApplyOutcome::InvalidAction => "invalid new_char; action not applied",
                         ApplyOutcome::MetadataUnparseable => {
                             "scheduled date is malformed or unparseable; action not applied"
+                        }
+                        ApplyOutcome::BulletUnparseable => {
+                            "line could not be converted to a bullet; action not applied"
                         }
                         ApplyOutcome::Applied => unreachable!(),
                     };
@@ -807,6 +877,73 @@ pub fn process_metadata_action(
     }
 }
 
+/// Execute one pending `toggle_bullet` write (ADR-0011) — converts a task line
+/// between checkbox and bullet format. Structurally parallel to
+/// [`process_metadata_action`], reusing the same helpers and [`atomic_write`].
+///
+/// Sequence is identical to `process_metadata_action` except steps 5/6 call the
+/// pure [`taski_core::toggle_bullet`] oracle instead of `rewrite_scheduled`:
+///
+/// 1. Look up the current task row (surrogate rowid, ADR-0005).
+/// 2. Read the note fresh; authoritative conflict check.
+/// 3. Resolve the row's CURRENT `line_number`.
+/// 4. Byte-verify the line still holds a valid checkbox or bullet format.
+/// 5. Call `toggle_bullet(line)`.
+///    - `Rewritten(new_line)` → splice the new line into the full note buffer
+///    - `Unparseable` → `BulletUnparseable` (refuse; never guess)
+/// 6. `atomic_write` (same function, same TOCTOU).
+pub fn process_bullet_action(
+    conn: &Connection,
+    vault_root: &Path,
+    action: &PendingAction,
+) -> Result<ApplyOutcome> {
+    // 1. Current task row.
+    let Some(row) = lookup_task_for_action(conn, action.task_id)? else {
+        return Ok(ApplyOutcome::TaskNotFound);
+    };
+
+    // 2. Read the note fresh from the vault.
+    let note_abs = vault_root.join(&row.note_path);
+    let bytes = match fs::read(&note_abs) {
+        Ok(b) => b,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(ApplyOutcome::TaskNotFound),
+        Err(e) => return Err(e).with_context(|| format!("reading note {:?}", note_abs)),
+    };
+
+    // 3. Authoritative conflict check via content hash.
+    let snapshot_hash = content_hash(&bytes);
+    if Some(&snapshot_hash) != row.note_hash.as_ref() {
+        return Ok(ApplyOutcome::ConflictNoteChanged);
+    }
+
+    // 4. Target the task's CURRENT line_number.
+    let Some(line_range) = line_byte_range(&bytes, row.line_number) else {
+        return Ok(ApplyOutcome::TaskLineMismatch);
+    };
+
+    // 5. Decode the line as UTF-8 and call the pure oracle.
+    let line_str = std::str::from_utf8(&bytes[line_range.clone()])
+        .map_err(|_| anyhow::anyhow!("target line is not valid UTF-8"))?;
+    match toggle_bullet(line_str) {
+        RewriteResult::Unchanged => Ok(ApplyOutcome::Applied),
+        RewriteResult::Unparseable => Ok(ApplyOutcome::BulletUnparseable),
+        RewriteResult::Rewritten(new_line) => {
+            // Splice the new line bytes into the full note buffer, replacing ONLY
+            // the target line range. Every byte outside this range is preserved.
+            let mut new_bytes = Vec::with_capacity(bytes.len() - line_range.len() + new_line.len());
+            new_bytes.extend_from_slice(&bytes[..line_range.start]);
+            new_bytes.extend_from_slice(new_line.as_bytes());
+            new_bytes.extend_from_slice(&bytes[line_range.end..]);
+
+            // 6. Atomic write with TOCTOU guard.
+            match atomic_write(&note_abs, &new_bytes, &snapshot_hash)? {
+                WriteResult::Written => Ok(ApplyOutcome::Applied),
+                WriteResult::Conflict => Ok(ApplyOutcome::ConflictNoteChanged),
+            }
+        }
+    }
+}
+
 /// If `s` holds exactly one Unicode scalar value, return it; otherwise `None`.
 fn single_char(s: &str) -> Option<char> {
     let mut chars = s.chars();
@@ -1005,14 +1142,15 @@ fn unix_now() -> i64 {
 }
 
 /// Remove any leftover `<name>.taski.tmp` files under `vault_root` left behind by a
-/// crash mid-write-back (ADR-0003). Walks the vault with the same hidden-directory
-/// pruning as [`scan_vault`]. Returns the count of files removed. A failure to remove
-/// one file is logged and skipped — it never aborts the sweep.
-pub fn sweep_tmp_files(vault_root: &Path) -> Result<usize> {
+/// crash mid-write-back (ADR-0003). Walks the vault with the same directory exclusion
+/// as [`scan_vault`] (hidden dirs + user-configured excludes). Returns the count of
+/// files removed. A failure to remove one file is logged and skipped — it never aborts
+/// the sweep.
+pub fn sweep_tmp_files(vault_root: &Path, exclude_dirs: &[String]) -> Result<usize> {
     let mut removed = 0usize;
     for entry in WalkDir::new(vault_root)
         .into_iter()
-        .filter_entry(|e| e.depth() == 0 || !is_hidden_dir_entry(e))
+        .filter_entry(|e| e.depth() == 0 || !should_exclude_entry(e, vault_root, exclude_dirs))
     {
         let entry = match entry {
             Ok(e) => e,
@@ -1130,5 +1268,143 @@ mod tests {
             fs::read_to_string(&target).unwrap(),
             "vault = \"/existing\"\n"
         );
+    }
+
+    /// `should_exclude_entry` matches user-configured exclude directories by exact
+    /// path and prefix. This validates the matching logic in isolation from WalkDir.
+    #[test]
+    fn should_exclude_entry_matches_exclude_dirs_by_prefix() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let vault = tmp.path();
+        let excludes = vec!["_System/Templates".to_string()];
+
+        // Create the excluded directory hierarchy (mimicking the user's vault layout)
+        // so that WalkDir entries exist for `should_exclude_entry` to inspect.
+        fs::create_dir_all(vault.join("_System/Templates")).unwrap();
+        fs::write(vault.join("_System/Templates/note.md"), "- [ ] excluded\n").unwrap();
+        fs::write(vault.join("_System/other.md"), "- [ ] not excluded\n").unwrap();
+        fs::write(vault.join("normal.md"), "- [ ] normal\n").unwrap();
+
+        // Walk with exclude filter — the excluded dir and any files inside it
+        // must NOT appear in the yielded entries.
+        let yielded: Vec<_> = WalkDir::new(vault)
+            .into_iter()
+            .filter_entry(|e| e.depth() == 0 || !should_exclude_entry(e, vault, &excludes))
+            .filter_map(|e| e.ok())
+            .filter(|e| !e.file_type().is_dir())
+            .map(|e| {
+                e.path()
+                    .strip_prefix(vault)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+
+        assert!(
+            !yielded.iter().any(|p| p.contains("_System/Templates")),
+            "_System/Templates must be excluded, got: {:?}",
+            yielded
+        );
+
+        // Non-excluded paths in the same parent directory are unaffected.
+        assert!(
+            yielded.contains(&"_System/other.md".to_string()),
+            "_System/other.md should not be excluded: {:?}",
+            yielded
+        );
+        assert!(
+            yielded.contains(&"normal.md".to_string()),
+            "normal.md should not be excluded: {:?}",
+            yielded
+        );
+    }
+
+    /// `path_matches_exclude` correctly identifies files inside an excluded directory
+    /// by their relative path from the vault root.
+    #[test]
+    fn path_matches_exclude_works_for_files_in_excluded_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let vault = tmp.path();
+        let excludes = vec!["_System/Templates".to_string()];
+
+        let inside = vault.join("_System/Templates/note.md");
+        // Create the path structure so the file "exists" (the function only does
+        // string matching, but we create it for realism).
+        fs::create_dir_all(inside.parent().unwrap()).unwrap();
+        fs::write(&inside, "- [ ] test\n").unwrap();
+
+        assert!(path_matches_exclude(&inside, vault, &excludes));
+
+        let outside = vault.join("normal.md");
+        fs::write(&outside, "- [ ] test\n").unwrap();
+        assert!(!path_matches_exclude(&outside, vault, &excludes));
+    }
+
+    /// `path_matches_exclude` is false when `exclude_dirs` is empty.
+    #[test]
+    fn path_matches_exclude_noop_when_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let vault = tmp.path();
+        let f = vault.join("any.md");
+        fs::write(&f, "").unwrap();
+        assert!(!path_matches_exclude(&f, vault, &[]));
+    }
+
+    /// End-to-end: `scan_vault` with an `exclude_dirs` entry must NOT index any tasks
+    /// from files inside that directory. This mirrors the user's scenario with
+    /// `_System/Templates`.
+    #[test]
+    fn scan_vault_with_exclude_dirs_skips_matching_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let vault = tmp.path();
+        let db_path = vault.join("test.db");
+        let conn = db::open(&db_path.to_string_lossy()).expect("open db");
+
+        let excludes = vec!["_System/Templates".to_string()];
+
+        // Normal tasks.
+        fs::write(vault.join("alpha.md"), "- [ ] normal\n").unwrap();
+        fs::write(vault.join("beta.md"), "- [x] done\n").unwrap();
+
+        // Tasks INSIDE _System/Templates — must NOT be indexed.
+        fs::create_dir_all(vault.join("_System/Templates/Old - Templater")).unwrap();
+        fs::write(
+            vault.join("_System/Templates/Old - Templater/Old - New Task.md"),
+            "- [ ] excluded template task\n",
+        )
+        .unwrap();
+        fs::write(
+            vault.join("_System/Templates/_Template - Project.md"),
+            "- [ ] project template\n",
+        )
+        .unwrap();
+
+        // Normal tasks inside _System but not under _System/Templates — MUST be indexed.
+        fs::write(vault.join("_System/other.md"), "- [ ] other system\n").unwrap();
+
+        let total = scan_vault(&conn, vault, &excludes).expect("scan_vault");
+
+        let tasks = db::all_tasks(&conn).expect("all_tasks");
+        let note_paths: Vec<&str> = tasks.iter().map(|t| t.note_path.as_str()).collect();
+
+        // Only 3 tasks should be indexed: alpha.md, beta.md, _System/other.md.
+        assert_eq!(total, 3, "expected 3 tasks, got {total}: {note_paths:?}");
+        assert_eq!(
+            tasks.len(),
+            3,
+            "expected 3 task rows, got {}: {note_paths:?}",
+            tasks.len()
+        );
+
+        assert!(
+            !note_paths.iter().any(|p| p.contains("_System/Templates")),
+            "no tasks from _System/Templates: {:?}",
+            note_paths
+        );
+
+        assert!(note_paths.contains(&"alpha.md"), "{:?}", note_paths);
+        assert!(note_paths.contains(&"beta.md"), "{:?}", note_paths);
+        assert!(note_paths.contains(&"_System/other.md"), "{:?}", note_paths);
     }
 }

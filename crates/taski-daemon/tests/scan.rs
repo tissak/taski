@@ -32,7 +32,7 @@ fn scan_indexes_md_notes_and_skips_hidden_dirs_and_non_md() {
     // root/README.MD — uppercase extension is still markdown.
     fs::write(root.join("README.MD"), "- [ ] uppercase ext\n").unwrap();
 
-    let total = scan_vault(&conn, root).expect("scan_vault");
+    let total = scan_vault(&conn, root, &[]).expect("scan_vault");
     // note1(2) + sub/note2(1) + README.MD(1) = 4
     assert_eq!(total, 4, "hidden-dir and non-md files must be skipped");
 

@@ -157,6 +157,30 @@ pub fn delete_tasks_for_note(conn: &Connection, note_path: &str) -> rusqlite::Re
     Ok(())
 }
 
+/// Delete every task (and cached note content) whose `note_path` matches (or starts
+/// with) one of the given excluded directory prefixes. Called at daemon startup when
+/// `exclude_dirs` has changed so the index doesn't carry stale entries from directories
+/// the user no longer wants indexed. Each prefix is matched exactly (`note_path = ?`)
+/// and as a prefix (`note_path LIKE ?/`).
+pub fn delete_tasks_for_excluded_dirs(
+    conn: &Connection,
+    excluded: &[String],
+) -> rusqlite::Result<()> {
+    for excl in excluded {
+        let excl = excl.trim_end_matches('/');
+        let prefix = format!("{}/%", excl);
+        conn.execute(
+            "DELETE FROM tasks WHERE note_path = ?1 OR note_path LIKE ?2",
+            rusqlite::params![excl, prefix],
+        )?;
+        conn.execute(
+            "DELETE FROM note_contents WHERE note_path = ?1 OR note_path LIKE ?2",
+            rusqlite::params![excl, prefix],
+        )?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // note_contents: per-note full-text cache for the read-only TUI context pane
 // (ADR-0006). The daemon writes it in the same `index_note` pass that parses
@@ -457,6 +481,26 @@ pub fn enqueue_set_scheduled(
              created_at, action_type, payload)
          VALUES (?1, ?2, ?3, '', '', 'pending', ?4, 'set_scheduled', ?5)",
         rusqlite::params![task_id, note_path, line_number as i64, unix_now(), desired],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Enqueue a "toggle bullet" request (ADR-0011). Converts the task line between
+/// checkbox and bullet format. `expected_char` and `new_char` are unused (stored
+/// empty; the daemon dispatches on `action_type='toggle_bullet'`). Returns the
+/// new row id.
+pub fn enqueue_bullet_toggle(
+    conn: &Connection,
+    task_id: i64,
+    note_path: &str,
+    line_number: usize,
+) -> rusqlite::Result<i64> {
+    conn.execute(
+        "INSERT INTO pending_actions
+            (task_id, note_path, line_number, expected_char, new_char, state,
+             created_at, action_type, payload)
+         VALUES (?1, ?2, ?3, '', '', 'pending', ?4, 'toggle_bullet', NULL)",
+        rusqlite::params![task_id, note_path, line_number as i64, unix_now()],
     )?;
     Ok(conn.last_insert_rowid())
 }

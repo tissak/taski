@@ -200,7 +200,7 @@ proptest! {
         std::fs::write(&note_abs, &original).unwrap();
 
         let conn = db::open(&tmp.path().join("p.db").to_string_lossy()).unwrap();
-        taski_daemon::scan_vault(&conn, root).unwrap();
+        taski_daemon::scan_vault(&conn, root, &[]).unwrap();
 
         // Locate the anchor task by its (always-constant) body stem.
         let tasks = db::all_tasks(&conn).unwrap();

@@ -21,6 +21,12 @@ pub struct Config {
     pub vault: Option<String>,
     /// Path to the taski SQLite index database.
     pub db: Option<String>,
+    /// Directories (relative to vault root) to exclude from scanning and indexing.
+    /// Each entry is a path component or nested path, e.g. `["templates"]` or
+    /// `["templates", "archive/drafts"]`. Hidden directories (`.obsidian`, `.trash`,
+    /// `.git`) are always excluded and don't need to be listed here.
+    #[serde(default)]
+    pub exclude_dirs: Vec<String>,
 }
 
 /// Load config from the effective path: `$TASKI_CONFIG` if set and non-empty, else
@@ -120,7 +126,11 @@ pub fn template(vault: Option<&str>, db: &str) -> String {
          # See docs/setup.md.\n\
          \n\
          {vault_line}\
-         db = {db:?}\n",
+         db = {db:?}\n\
+         \n\
+         # Directories to exclude from scanning (relative to vault root).\n\
+         # Hidden directories (.obsidian, .trash, .git) are always excluded.\n\
+         # exclude_dirs = [\"templates\", \"archive/drafts\"]\n",
     )
 }
 
@@ -183,6 +193,7 @@ mod tests {
         let cfg = Config {
             vault: Some("/from/config".into()),
             db: None,
+            exclude_dirs: vec![],
         };
         let v = resolve_vault(Some("/from/cli"), &cfg).expect("ok");
         assert_eq!(v, PathBuf::from("/from/cli"));
@@ -193,6 +204,7 @@ mod tests {
         let cfg = Config {
             vault: Some("/from/config".into()),
             db: None,
+            exclude_dirs: vec![],
         };
         let v = resolve_vault(None, &cfg).expect("ok");
         assert_eq!(v, PathBuf::from("/from/config"));
@@ -212,6 +224,7 @@ mod tests {
         let cfg = Config {
             vault: None,
             db: Some("/from/config.db".into()),
+            exclude_dirs: vec![],
         };
         assert_eq!(
             resolve_db(Some("/from/cli.db"), &cfg),
@@ -224,6 +237,7 @@ mod tests {
         let cfg = Config {
             vault: None,
             db: Some("/from/config.db".into()),
+            exclude_dirs: vec![],
         };
         assert_eq!(resolve_db(None, &cfg), PathBuf::from("/from/config.db"));
     }

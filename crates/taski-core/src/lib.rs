@@ -477,6 +477,72 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Toggle a single task line between checkbox format and plain bullet format
+/// (ADR-0011). The inverse of itself: calling twice on any valid input returns
+/// the original line.
+///
+/// - `- [ ] text` or `- [x] text` → `- text` (strip checkbox, keep body)
+/// - `- text` → `- [ ] text` (add open checkbox)
+/// - Any other format (no bullet char, malformed, etc.) → `Unparseable`
+///
+/// Pure (no I/O), symmetric (self-inverse on all valid inputs), and never
+/// panics. The caller (the daemon) handles the actual vault write via
+/// [`atomic_write`]; this is only the line-rewrite oracle.
+///
+/// Leading whitespace and blockquote markers (`>`) are preserved exactly.
+pub fn toggle_bullet(line: &str) -> RewriteResult {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+
+    advance_past_leading_markers(bytes, &mut i);
+
+    // Must have a bullet char.
+    if i >= bytes.len() || !matches!(bytes[i], b'-' | b'*' | b'+') {
+        return RewriteResult::Unparseable;
+    }
+    i += 1;
+
+    // Must have at least one whitespace after the bullet.
+    let ws_start = i;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i == ws_start || i >= bytes.len() {
+        return RewriteResult::Unparseable;
+    }
+
+    if bytes[i] == b'[' {
+        // ── Checkbox → bullet ────────────────────────────────────────────
+        // Find the closing `]`.
+        let mut close = i + 1;
+        while close < bytes.len() && bytes[close] != b']' {
+            close += 1;
+        }
+        if close >= bytes.len() {
+            return RewriteResult::Unparseable;
+        }
+        // Find the body start after `]`.
+        let mut body = close + 1;
+        while body < bytes.len() && bytes[body].is_ascii_whitespace() {
+            body += 1;
+        }
+        // Reconstruct: everything up to (but not including) the checkbox `[`,
+        // then the body. This strips `[x] ` (or whatever the checkbox was).
+        let mut out = String::with_capacity(line.len() - (body - i));
+        out.push_str(&line[..i]);
+        out.push_str(&line[body..]);
+        RewriteResult::Rewritten(out)
+    } else {
+        // ── Bullet → checkbox ────────────────────────────────────────────
+        // Insert `[ ] ` between the bullet's trailing whitespace and the body.
+        let mut out = String::with_capacity(line.len() + 4);
+        out.push_str(&line[..i]);
+        out.push_str("[ ] ");
+        out.push_str(&line[i..]);
+        RewriteResult::Rewritten(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -946,6 +1012,127 @@ plain text
             ("- [ ] \0 binary ⏳ 2026-06-20", None),
         ] {
             let _ = rewrite_scheduled(line, desired);
+        }
+    }
+
+    // ── toggle_bullet unit tests (ADR-0011) ────────────────────────
+
+    #[test]
+    fn toggle_bullet_converts_open_checkbox_to_bullet() {
+        assert_eq!(
+            toggle_bullet("- [ ] First task"),
+            RewriteResult::Rewritten("- First task".to_string())
+        );
+    }
+
+    #[test]
+    fn toggle_bullet_converts_done_checkbox_to_bullet() {
+        assert_eq!(
+            toggle_bullet("- [x] Done task"),
+            RewriteResult::Rewritten("- Done task".to_string())
+        );
+    }
+
+    #[test]
+    fn toggle_bullet_converts_bullet_to_open_checkbox() {
+        assert_eq!(
+            toggle_bullet("- Just text"),
+            RewriteResult::Rewritten("- [ ] Just text".to_string())
+        );
+    }
+
+    #[test]
+    fn toggle_bullet_preserves_indentation() {
+        assert_eq!(
+            toggle_bullet("  - [ ] indented task"),
+            RewriteResult::Rewritten("  - indented task".to_string())
+        );
+        assert_eq!(
+            toggle_bullet("  - indented bullet"),
+            RewriteResult::Rewritten("  - [ ] indented bullet".to_string())
+        );
+    }
+
+    #[test]
+    fn toggle_bullet_preserves_blockquote() {
+        assert_eq!(
+            toggle_bullet("> - [ ] quoted task"),
+            RewriteResult::Rewritten("> - quoted task".to_string())
+        );
+    }
+
+    #[test]
+    fn toggle_bullet_is_self_inverse_for_open_checkboxes() {
+        // Only open checkboxes round-trip exactly (done/in-progress open as `[ ]`).
+        let cases = [
+            "- [ ] deploy the migration",
+            "  - [ ] indented task",
+            "> - [ ] quoted task",
+            "- [ ] has body text with multiple words",
+        ];
+        for original in &cases {
+            let first = toggle_bullet(original);
+            let RewriteResult::Rewritten(intermediate) = first else {
+                panic!("first toggle should be Rewritten, got {first:?} on {original:?}");
+            };
+            let second = toggle_bullet(&intermediate);
+            let RewriteResult::Rewritten(restored) = second else {
+                panic!("second toggle should be Rewritten, got {second:?} on {intermediate:?}");
+            };
+            assert_eq!(
+                &restored, original,
+                "toggle_bullet should be self-inverse on open checkbox"
+            );
+        }
+    }
+
+    #[test]
+    fn toggle_bullet_non_open_restores_as_open() {
+        // Done/in-progress tasks always become `[ ]` when toggled back from bullet.
+        let r1 = match toggle_bullet("- [x] done task") {
+            RewriteResult::Rewritten(s) => toggle_bullet(&s),
+            _ => panic!("first toggle should be Rewritten"),
+        };
+        assert_eq!(r1, RewriteResult::Rewritten("- [ ] done task".to_string()));
+        let r2 = match toggle_bullet("- [/] in-progress") {
+            RewriteResult::Rewritten(s) => toggle_bullet(&s),
+            _ => panic!("first toggle should be Rewritten"),
+        };
+        assert_eq!(
+            r2,
+            RewriteResult::Rewritten("- [ ] in-progress".to_string())
+        );
+    }
+
+    #[test]
+    fn toggle_bullet_unparseable_on_no_bullet_char() {
+        assert_eq!(toggle_bullet("plain text"), RewriteResult::Unparseable);
+        assert_eq!(toggle_bullet("[ ] not a task"), RewriteResult::Unparseable);
+    }
+
+    #[test]
+    fn toggle_bullet_unparseable_on_missing_whitespace_after_bullet() {
+        assert_eq!(toggle_bullet("-"), RewriteResult::Unparseable);
+        assert_eq!(toggle_bullet("-[ ] no space"), RewriteResult::Unparseable);
+    }
+
+    #[test]
+    fn toggle_bullet_never_panics_on_arbitrary_input() {
+        // A sampling of weird inputs must produce a result, not a panic.
+        for line in [
+            "",
+            "-",
+            "   ",
+            "-   ",
+            "- [] no checkbox space",
+            "- [",
+            "- [ ",
+            "- [ ]",
+            "\0",
+            "- [ ] 🇯🇵 emoji here",
+            "> just a quote",
+        ] {
+            let _ = toggle_bullet(line);
         }
     }
 }

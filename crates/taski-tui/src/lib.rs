@@ -244,9 +244,20 @@ fn build_view(
     expanded: &HashSet<String>,
     today_only: bool,
     today: &str,
+    search_query: &str,
+    file_query: &str,
 ) -> Vec<DisplayRow> {
     let scheduled_today =
         |t: &Task| -> bool { !today_only || t.scheduled_date.as_deref() == Some(today) };
+    let matches_search = |t: &Task| -> bool {
+        search_query.is_empty() || t.text.to_lowercase().contains(&search_query.to_lowercase())
+    };
+    let matches_file = |t: &Task| -> bool {
+        file_query.is_empty()
+            || t.note_path
+                .to_lowercase()
+                .contains(&file_query.to_lowercase())
+    };
     let mut rows = Vec::new();
     let mut i = 0;
     while i < tasks.len() {
@@ -260,7 +271,12 @@ fn build_view(
         let open_count = group.iter().filter(|t| t.status == Status::Open).count();
         let visible: Vec<&Task> = group
             .iter()
-            .filter(|t| filter.matches(&t.status) && scheduled_today(t))
+            .filter(|t| {
+                filter.matches(&t.status)
+                    && scheduled_today(t)
+                    && matches_search(t)
+                    && matches_file(t)
+            })
             .collect();
         if !visible.is_empty() {
             let is_expanded = expanded.contains(&note_path);
@@ -379,6 +395,38 @@ struct App {
     /// (pure, no date crate). Stored on the struct (not recomputed each render) so it
     /// stays stable across a single draw and is straightforward to pin in tests.
     today: String,
+    /// ADR-0010: search query for filtering tasks by text. Empty = inactive.
+    /// Populated while the user is typing at the `/` prompt and stays applied
+    /// after the prompt is dismissed (until cleared with `Esc`).
+    search_query: String,
+    /// Whether the `/` search prompt is active (capturing keystrokes).
+    /// When true, most key events build the query instead of performing
+    /// their normal action.
+    searching: bool,
+    /// ADR-0010: file/path search query. Empty = inactive. Populated while
+    /// typing at the `F` prompt and stays applied until dismissed with `Esc`.
+    file_query: String,
+    /// Whether the `F` file-search prompt is active.
+    file_searching: bool,
+    /// ADR-0011: the last enqueued write action, for undo (`u` key).
+    last_action: Option<LastAction>,
+}
+
+/// ADR-0011: information needed to reverse the last write action.
+#[derive(Clone, Debug)]
+enum LastAction {
+    CheckboxToggle {
+        task_id: i64,
+        note_path: String,
+        line_number: usize,
+        expected_char: String,
+        new_char: String,
+    },
+    BulletToggle {
+        task_id: i64,
+        note_path: String,
+        line_number: usize,
+    },
 }
 
 impl App {
@@ -400,6 +448,11 @@ impl App {
             ctx_scroll: 0,
             today_only: false,
             today: today_string(),
+            search_query: String::new(),
+            searching: false,
+            file_query: String::new(),
+            file_searching: false,
+            last_action: None,
         }
     }
 
@@ -415,7 +468,7 @@ impl App {
         (note, task_id, idx)
     }
 
-    /// Rebuild rows from the current tasks/filter/expanded and preserve selection.
+    /// Rebuild rows from the current tasks/filter/expanded/search and preserve selection.
     fn rebuild(&mut self) {
         let (note, task_id, idx) = self.snapshot();
         self.rows = build_view(
@@ -424,8 +477,81 @@ impl App {
             &self.expanded,
             self.today_only,
             &self.today,
+            &self.search_query,
+            &self.file_query,
         );
         reconcile_view_selection(&self.rows, note.as_deref(), task_id, idx, &mut self.state);
+    }
+
+    // --- ADR-0010: text search / `/` prompt ---------------------------------
+
+    /// Enter search mode. If a query already existed (e.g. from a prior search
+    /// that was dismissed with `Enter`), it stays at the prompt so the user can
+    /// edit or extend it.
+    fn start_search(&mut self) {
+        self.file_searching = false;
+        self.searching = true;
+    }
+
+    /// Append a character to the search query and re-filter live.
+    fn push_search_char(&mut self, c: char) {
+        self.search_query.push(c);
+        self.rebuild();
+    }
+
+    /// Pop the last character (Backspace) and re-filter live.
+    fn pop_search_char(&mut self) {
+        self.search_query.pop();
+        self.rebuild();
+    }
+
+    /// Exit search mode, keeping the current query applied as a filter.
+    fn finish_search(&mut self) {
+        self.searching = false;
+    }
+
+    /// Cancel search: clear the query, exit search mode, return to full list.
+    fn clear_search(&mut self) {
+        self.searching = false;
+        if !self.search_query.is_empty() {
+            self.search_query.clear();
+            self.rebuild();
+        }
+    }
+
+    // ── ADR-0010 file search (F key) ──────────────────────────────────
+
+    /// Activate the file-search prompt (`F` gesture). Finishes any text-search
+    /// prompt so only one prompt is active at a time.
+    fn start_file_search(&mut self) {
+        self.searching = false;
+        self.file_searching = true;
+    }
+
+    /// Append a character to the file query and re-filter live.
+    fn push_file_search_char(&mut self, c: char) {
+        self.file_query.push(c);
+        self.rebuild();
+    }
+
+    /// Pop the last character (Backspace) and re-filter live.
+    fn pop_file_search_char(&mut self) {
+        self.file_query.pop();
+        self.rebuild();
+    }
+
+    /// Exit file-search mode, keeping the current file query applied.
+    fn finish_file_search(&mut self) {
+        self.file_searching = false;
+    }
+
+    /// Cancel file search: clear the file query, exit file-search mode.
+    fn clear_file_search(&mut self) {
+        self.file_searching = false;
+        if !self.file_query.is_empty() {
+            self.file_query.clear();
+            self.rebuild();
+        }
     }
 
     /// Re-read the index from the DB, then rebuild the view and poll the resolution
@@ -637,15 +763,82 @@ impl App {
     /// is the natural "try again / move on" gesture). Enqueue errors are logged to
     /// stderr and never propagated.
     fn submit_toggle(&mut self, conn: &Connection) {
-        // Resolve + enqueue inside a block so the immutable borrow of `self` (via
-        // `selected_task`) is dropped before we mutate `self` below.
-        let result = {
+        let (result, last_action) = {
             let Some(task) = self.selected_task() else {
                 return;
             };
-            enqueue_toggle(conn, task)
+            let new_char = toggle_target_char(&task.raw_checkbox_char);
+            let action = LastAction::CheckboxToggle {
+                task_id: task.id,
+                note_path: task.note_path.clone(),
+                line_number: task.line_number,
+                expected_char: task.raw_checkbox_char.clone(),
+                new_char: new_char.to_string(),
+            };
+            (enqueue_toggle(conn, task), Some(action))
         };
+        self.last_action = last_action;
         self.track_enqueued(result, "toggle");
+    }
+
+    /// `b` (ADR-0011): toggle the selected task between checkbox and bullet format.
+    /// If the line has a checkbox (`- [ ] text` / `- [x] text`), it becomes a plain
+    /// bullet (`- text`). If it's already a bullet, it becomes an open checkbox
+    /// (`- [ ] text`). The actual vault write is the daemon's job via
+    /// [`db::enqueue_bullet_toggle`]; the TUI never touches files directly.
+    fn submit_bullet_toggle(&mut self, conn: &Connection) {
+        let (result, last_action) = {
+            let Some(task) = self.selected_task() else {
+                return;
+            };
+            let action = LastAction::BulletToggle {
+                task_id: task.id,
+                note_path: task.note_path.clone(),
+                line_number: task.line_number,
+            };
+            (enqueue_bullet_toggle(conn, task), Some(action))
+        };
+        self.last_action = last_action;
+        self.track_enqueued(result, "bullet toggle");
+    }
+
+    /// `u` (ADR-0011): undo the last write action. If the last action was a checkbox
+    /// toggle (`Space`), queue the reverse flip (swapped expected/new chars). If it was
+    /// a bullet toggle (`b`), queue another bullet toggle (it's self-inverse). If there
+    /// is no tracked action, this is a no-op.
+    fn submit_undo(&mut self, conn: &Connection) {
+        let action = match self.last_action.clone() {
+            Some(a) => a,
+            None => return,
+        };
+        let result = match action {
+            LastAction::CheckboxToggle {
+                task_id,
+                note_path,
+                line_number,
+                expected_char,
+                new_char,
+            } => enqueue_undo_checkbox(
+                conn,
+                task_id,
+                &note_path,
+                line_number,
+                // M1: swap expected/new so the undo enqueues the *reverse* flip —
+                // the undo's expected_char is the original toggle's new_char, and
+                // vice versa. (`enqueue_undo_checkbox` takes them in the same
+                // parameter order as `enqueue_action`; the swap happens here.)
+                &new_char,
+                &expected_char,
+            ),
+            LastAction::BulletToggle {
+                task_id,
+                note_path,
+                line_number,
+            } => db::enqueue_bullet_toggle(conn, task_id, &note_path, line_number)
+                .context("enqueuing undo bullet toggle"),
+        };
+        // Don't update last_action (undo doesn't get its own undo).
+        self.track_enqueued(result, "undo");
     }
 
     /// Record the outcome of an enqueue ([`submit_toggle`] /
@@ -729,43 +922,72 @@ fn run_loop(
         }
 
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => {
-                if let Some(hook) = quit_hook {
-                    hook();
-                }
-                return Ok(());
+
+        // ADR-0010: when a search prompt is active, keystrokes build/clear the
+        // query instead of performing their normal action. Only one prompt is
+        // active at a time.
+        if app.searching {
+            match key.code {
+                KeyCode::Esc => app.clear_search(),
+                KeyCode::Enter => app.finish_search(),
+                KeyCode::Backspace => app.pop_search_char(),
+                KeyCode::Char(c) => app.push_search_char(c),
+                _ => {}
             }
-            KeyCode::Char('c') if ctrl => {
-                if let Some(hook) = quit_hook {
-                    hook();
-                }
-                return Ok(());
+        } else if app.file_searching {
+            match key.code {
+                KeyCode::Esc => app.clear_file_search(),
+                KeyCode::Enter => app.finish_file_search(),
+                KeyCode::Backspace => app.pop_file_search_char(),
+                KeyCode::Char(c) => app.push_file_search_char(c),
+                _ => {}
             }
-            KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
-            KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
-            // Space toggles the selected task open<->done via the daemon's write-back
-            // queue (ADR-0002). The TUI never touches vault files directly.
-            KeyCode::Char(' ') => app.submit_toggle(conn),
-            KeyCode::Enter => app.toggle_at_cursor(ToggleMode::Toggle),
-            KeyCode::Right => app.toggle_at_cursor(ToggleMode::Expand),
-            KeyCode::Left => app.toggle_at_cursor(ToggleMode::Collapse),
-            KeyCode::Char('f') => app.cycle_filter(),
-            // ADR-0009 Phase 2: `t` marks the selected task for today (or clears it
-            // if already scheduled today) via the daemon's write-back queue — the
-            // first non-checkbox vault write. Uppercase `T` toggles the read-only
-            // Today view (below).
-            KeyCode::Char('t') => app.submit_set_scheduled(conn),
-            // ADR-0009 Phase 1: `T` toggles the Today view (read-only). Lowercase
-            // `t` is the Phase 2 mark-for-today write gesture (above).
-            KeyCode::Char('T') => app.toggle_today(),
-            KeyCode::Tab => app.expand_all(),
-            KeyCode::BackTab => app.collapse_all(),
-            // Uppercase J/K scroll the context pane (lowercase j/k move the task list).
-            KeyCode::Char('J') => app.scroll_context(1),
-            KeyCode::Char('K') => app.scroll_context(-1),
-            KeyCode::Char('p') => app.toggle_pane(),
-            _ => {}
+        } else {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    if let Some(hook) = quit_hook {
+                        hook();
+                    }
+                    return Ok(());
+                }
+                KeyCode::Char('c') if ctrl => {
+                    if let Some(hook) = quit_hook {
+                        hook();
+                    }
+                    return Ok(());
+                }
+                KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
+                KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
+                // Space toggles the selected task open<->done via the daemon's write-back
+                // queue (ADR-0002). The TUI never touches vault files directly.
+                KeyCode::Char(' ') => app.submit_toggle(conn),
+                KeyCode::Enter => app.toggle_at_cursor(ToggleMode::Toggle),
+                KeyCode::Right => app.toggle_at_cursor(ToggleMode::Expand),
+                KeyCode::Left => app.toggle_at_cursor(ToggleMode::Collapse),
+                KeyCode::Char('f') => app.cycle_filter(),
+                // ADR-0009 Phase 2: `t` marks the selected task for today (or clears it
+                // if already scheduled today) via the daemon's write-back queue — the
+                // first non-checkbox vault write. Uppercase `T` toggles the read-only
+                // Today view (below).
+                KeyCode::Char('t') => app.submit_set_scheduled(conn),
+                // ADR-0009 Phase 1: `T` toggles the Today view (read-only). Lowercase
+                // `t` is the Phase 2 mark-for-today write gesture (above).
+                KeyCode::Char('T') => app.toggle_today(),
+                // ADR-0011: `b` toggles checkbox ↔ bullet; `u` undoes last write.
+                KeyCode::Char('b') => app.submit_bullet_toggle(conn),
+                KeyCode::Char('u') => app.submit_undo(conn),
+                // ADR-0010 text search: `/` opens the search prompt.
+                KeyCode::Char('/') => app.start_search(),
+                // ADR-0010 file search: `F` opens the file/path search prompt.
+                KeyCode::Char('F') => app.start_file_search(),
+                KeyCode::Tab => app.expand_all(),
+                KeyCode::BackTab => app.collapse_all(),
+                // Uppercase J/K scroll the context pane (lowercase j/k move the task list).
+                KeyCode::Char('J') => app.scroll_context(1),
+                KeyCode::Char('K') => app.scroll_context(-1),
+                KeyCode::Char('p') => app.toggle_pane(),
+                _ => {}
+            }
         }
 
         // After any selection change, load the newly-selected note's content if the
@@ -813,6 +1035,36 @@ fn enqueue_set_scheduled(conn: &Connection, task: &Task, desired: Option<&str>) 
     Ok(id)
 }
 
+/// Enqueue a bullet-toggle request (ADR-0011): `- [ ] text` ↔ `- text`. Non-blocking;
+/// the daemon applies it. Returns the new row id so the caller can track resolution.
+fn enqueue_bullet_toggle(conn: &Connection, task: &Task) -> Result<i64> {
+    let id = db::enqueue_bullet_toggle(conn, task.id, &task.note_path, task.line_number)
+        .context("enqueuing bullet-toggle action")?;
+    Ok(id)
+}
+
+/// Enqueue an undo for a previous checkbox flip — same as `enqueue_toggle` but the
+/// `expected_char` and `new_char` are explicitly provided (swapped from the original).
+fn enqueue_undo_checkbox(
+    conn: &Connection,
+    task_id: i64,
+    note_path: &str,
+    line_number: usize,
+    expected_char: &str,
+    new_char: &str,
+) -> Result<i64> {
+    let id = db::enqueue_action(
+        conn,
+        task_id,
+        note_path,
+        line_number,
+        expected_char,
+        new_char,
+    )
+    .context("enqueuing undo checkbox action")?;
+    Ok(id)
+}
+
 /// Translate a daemon failure `error` string into short, plain wording the user can
 /// act on. Keys off the stable phrases produced by the daemon's `ApplyOutcome` arms;
 /// unknown errors fall back to a trimmed copy of the daemon message.
@@ -828,6 +1080,8 @@ fn friendly_failure_reason(error: &str) -> String {
         "the request was not valid".to_string()
     } else if e.contains("malformed or unparseable") {
         "the scheduled date on this line couldn't be parsed".to_string()
+    } else if e.contains("could not be converted to a bullet") {
+        "this line has no checkbox or bullet to toggle".to_string()
     } else if e.is_empty() {
         "it could not be applied".to_string()
     } else {
@@ -846,6 +1100,7 @@ fn render_failure_notice(action: &PendingAction) -> String {
         .unwrap_or_else(|| "it could not be applied".to_string());
     let (verb, retry_key) = match action.action_type.as_str() {
         "set_scheduled" => ("Mark", "t"),
+        "toggle_bullet" => ("Bullet", "b"),
         // The default/checkbox path.
         _ => ("Toggle", "Space"),
     };
@@ -920,6 +1175,26 @@ fn draw(frame: &mut Frame, app: &mut App) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
+    // ADR-0010: surface active search query in the title bar.
+    if !app.search_query.is_empty() {
+        title_spans.push(Span::raw("  ·  "));
+        title_spans.push(Span::styled(
+            format!("search: {}", app.search_query),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    // ADR-0010: surface active file/path search in the title bar.
+    if !app.file_query.is_empty() {
+        title_spans.push(Span::raw("  ·  "));
+        title_spans.push(Span::styled(
+            format!("file: {}", app.file_query),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     title_spans.push(Span::raw(format!(
         "   {open_total} open of {total} total   ·   {notes} notes "
     )));
@@ -927,14 +1202,19 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let block = Block::default().borders(Borders::ALL).title(title);
 
     if app.rows.is_empty() {
-        let msg = match (app.tasks.is_empty(), app.filter, app.today_only) {
-            (true, _, _) => {
-                "No tasks — run `cargo run -p taski-daemon` first to populate the index."
+        let msg = if app.tasks.is_empty() {
+            "No tasks — run `cargo run -p taski-daemon` first to populate the index."
+        } else if !app.search_query.is_empty() || !app.file_query.is_empty() {
+            // ADR-0010: search or file search yielded no matches.
+            "No tasks match the current search."
+        } else if app.today_only {
+            "No tasks scheduled for today. Press `T` to leave the Today view."
+        } else {
+            match app.filter {
+                StatusFilter::Open => "No open tasks. Press `f` to change the filter.",
+                StatusFilter::Done => "No done tasks. Press `f` to change the filter.",
+                StatusFilter::All => "No tasks match.",
             }
-            (false, _, true) => "No tasks scheduled for today. Press `T` to leave the Today view.",
-            (false, StatusFilter::Open, false) => "No open tasks. Press `f` to change the filter.",
-            (false, StatusFilter::Done, false) => "No done tasks. Press `f` to change the filter.",
-            (false, StatusFilter::All, false) => "No tasks match.",
         };
         frame.render_widget(Paragraph::new(msg).block(block), list_col);
     } else {
@@ -977,32 +1257,68 @@ fn draw(frame: &mut Frame, app: &mut App) {
         );
     }
 
-    let footer = Paragraph::new(Line::from(vec![
-        Span::raw(" "),
-        Span::styled("j/k", Style::default().fg(Color::Yellow)),
-        Span::raw(" move  ·  "),
-        Span::styled("Space", Style::default().fg(Color::Yellow)),
-        Span::raw(" toggle  ·  "),
-        Span::styled("Enter", Style::default().fg(Color::Yellow)),
-        Span::raw(" fold group  ·  "),
-        Span::styled("←/→", Style::default().fg(Color::Yellow)),
-        Span::raw(" collapse/expand  ·  "),
-        Span::styled("f", Style::default().fg(Color::Yellow)),
-        Span::raw(" filter  ·  "),
-        Span::styled("T", Style::default().fg(Color::Yellow)),
-        Span::raw(" today  ·  "),
-        Span::styled("t", Style::default().fg(Color::Yellow)),
-        Span::raw(" mark today  ·  "),
-        Span::styled("Tab/⇧Tab", Style::default().fg(Color::Yellow)),
-        Span::raw(" expand/collapse all  ·  "),
-        Span::styled("J/K", Style::default().fg(Color::Yellow)),
-        Span::raw(" scroll context  ·  "),
-        Span::styled("p", Style::default().fg(Color::Yellow)),
-        Span::raw(" toggle pane  ·  "),
-        Span::styled("q", Style::default().fg(Color::Yellow)),
-        Span::raw(" quit "),
-    ]))
-    .style(Style::new().add_modifier(Modifier::DIM));
+    // ADR-0010: when a search prompt is active, show it in the footer
+    // instead of the normal keybinding help.
+    let footer: Paragraph = if app.searching {
+        let cursor = if (app.search_query.len() as u16) < footer_area.width.saturating_sub(4) {
+            "█"
+        } else {
+            ""
+        };
+        Paragraph::new(Line::from(vec![
+            Span::raw(" /"),
+            Span::styled(app.search_query.clone(), Style::default().fg(Color::Green)),
+            Span::styled(cursor, Style::default().add_modifier(Modifier::SLOW_BLINK)),
+        ]))
+        .style(Style::new())
+    } else if app.file_searching {
+        let cursor = if (app.file_query.len() as u16) < footer_area.width.saturating_sub(8) {
+            "█"
+        } else {
+            ""
+        };
+        Paragraph::new(Line::from(vec![
+            Span::raw(" File: /"),
+            Span::styled(app.file_query.clone(), Style::default().fg(Color::Green)),
+            Span::styled(cursor, Style::default().add_modifier(Modifier::SLOW_BLINK)),
+        ]))
+        .style(Style::new())
+    } else {
+        Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled("j/k", Style::default().fg(Color::Yellow)),
+            Span::raw(" move  ·  "),
+            Span::styled("Space", Style::default().fg(Color::Yellow)),
+            Span::raw(" toggle  ·  "),
+            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::raw(" fold group  ·  "),
+            Span::styled("←/→", Style::default().fg(Color::Yellow)),
+            Span::raw(" collapse/expand  ·  "),
+            Span::styled("f", Style::default().fg(Color::Yellow)),
+            Span::raw(" filter  ·  "),
+            Span::styled("T", Style::default().fg(Color::Yellow)),
+            Span::raw(" today  ·  "),
+            Span::styled("t", Style::default().fg(Color::Yellow)),
+            Span::raw(" mark today  ·  "),
+            Span::styled("b", Style::default().fg(Color::Yellow)),
+            Span::raw(" bullet  ·  "),
+            Span::styled("u", Style::default().fg(Color::Yellow)),
+            Span::raw(" undo  ·  "),
+            Span::styled("/", Style::default().fg(Color::Yellow)),
+            Span::raw(" search  ·  "),
+            Span::styled("F", Style::default().fg(Color::Yellow)),
+            Span::raw(" file search  ·  "),
+            Span::styled("Tab/⇧Tab", Style::default().fg(Color::Yellow)),
+            Span::raw(" expand/collapse all  ·  "),
+            Span::styled("J/K", Style::default().fg(Color::Yellow)),
+            Span::raw(" scroll context  ·  "),
+            Span::styled("p", Style::default().fg(Color::Yellow)),
+            Span::raw(" toggle pane  ·  "),
+            Span::styled("q", Style::default().fg(Color::Yellow)),
+            Span::raw(" quit "),
+        ]))
+        .style(Style::new().add_modifier(Modifier::DIM))
+    };
     frame.render_widget(footer, footer_area);
 }
 
@@ -1341,7 +1657,7 @@ mod tests {
             task(3, " ", 1, "beta.md"),
         ];
         let expanded = HashSet::new();
-        let rows = build_view(&tasks, StatusFilter::All, &expanded, false, "");
+        let rows = build_view(&tasks, StatusFilter::All, &expanded, false, "", "", "");
         // Two collapsed groups -> two headers, no task rows.
         assert_eq!(rows.len(), 2);
         let (note, open, total, collapsed) = header(&rows[0]);
@@ -1360,7 +1676,7 @@ mod tests {
     fn build_view_expanded_emits_task_rows_in_line_order() {
         let tasks = vec![task(1, " ", 1, "alpha.md"), task(2, "x", 2, "alpha.md")];
         let expanded = HashSet::from(["alpha.md".to_string()]);
-        let rows = build_view(&tasks, StatusFilter::All, &expanded, false, "");
+        let rows = build_view(&tasks, StatusFilter::All, &expanded, false, "", "", "");
         assert_eq!(rows.len(), 3, "header + two tasks");
         assert!(matches!(rows[0], DisplayRow::Header { .. }));
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
@@ -1372,7 +1688,7 @@ mod tests {
     fn build_view_open_filter_hides_done_tasks() {
         let tasks = vec![task(1, " ", 1, "alpha.md"), task(2, "x", 2, "alpha.md")];
         let expanded = HashSet::from(["alpha.md".to_string()]);
-        let rows = build_view(&tasks, StatusFilter::Open, &expanded, false, "");
+        let rows = build_view(&tasks, StatusFilter::Open, &expanded, false, "", "", "");
         assert_eq!(rows.len(), 2, "header + only the open task");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
     }
@@ -1385,7 +1701,7 @@ mod tests {
             task(2, "x", 1, "beta.md"),  // done
         ];
         let expanded = HashSet::new();
-        let rows = build_view(&tasks, StatusFilter::Open, &expanded, false, "");
+        let rows = build_view(&tasks, StatusFilter::Open, &expanded, false, "", "", "");
         // Only alpha has an open task; beta is hidden under the Open filter.
         assert_eq!(rows.len(), 1);
         assert_eq!(header(&rows[0]).0, "alpha.md");
@@ -1396,7 +1712,7 @@ mod tests {
     fn build_view_preserves_due_date_on_task_row() {
         let tasks = vec![task_with_due(1, " ", 1, "alpha.md", "2026-07-01")];
         let expanded = HashSet::from(["alpha.md".to_string()]);
-        let rows = build_view(&tasks, StatusFilter::All, &expanded, false, "");
+        let rows = build_view(&tasks, StatusFilter::All, &expanded, false, "", "", "");
         match &rows[1] {
             DisplayRow::Task { task } => {
                 assert_eq!(task.due_date.as_deref(), Some("2026-07-01"));
@@ -1457,6 +1773,49 @@ mod tests {
         assert_eq!(pending[0].task_id, 2);
         assert_eq!(pending[0].expected_char, "x");
         assert_eq!(pending[0].new_char, " ");
+    }
+
+    /// M1 regression: `u` after `Space` must enqueue the *reversed* checkbox flip
+    /// (expected/new swapped from the original toggle). Before the fix, `submit_undo`
+    /// passed the chars through un-swapped, so the undo either silently no-op'd (the
+    /// daemon's idempotency check short-circuited the identical flip when the original
+    /// toggle succeeded) or actually re-applied the original flip (when it had failed)
+    /// — in both cases the opposite of "undo". End-to-end through the real DB queue.
+    #[test]
+    fn submit_undo_after_toggle_enqueues_reversed_flip() {
+        let conn = db::open(":memory:").unwrap();
+        db::upsert_task(&conn, &task(1, " ", 1, "alpha.md")).unwrap();
+
+        let mut app = App::new();
+        app.filter = StatusFilter::All;
+        app.refresh(&conn).unwrap();
+        app.expanded.insert("alpha.md".to_string());
+        app.rebuild();
+        // rows: [H alpha, T1(open)]; land on the open task.
+        app.state.select(Some(1));
+
+        // Space: enqueue the forward flip ([ ] -> [x]).
+        app.submit_toggle(&conn);
+        let forward = &db::pending_actions(&conn).unwrap()[0];
+        assert_eq!(forward.expected_char, " ");
+        assert_eq!(forward.new_char, "x");
+
+        // u: undo must enqueue the *reverse* flip ([x] -> [ ]). The undo's
+        // expected_char is the forward flip's new_char, and vice versa.
+        app.submit_undo(&conn);
+
+        let pending = db::pending_actions(&conn).unwrap();
+        assert_eq!(pending.len(), 2, "forward flip + undo flip both pending");
+        let undo = &pending[1];
+        assert_eq!(undo.task_id, 1);
+        assert_eq!(
+            undo.expected_char, "x",
+            "undo expected_char must be the forward flip's new_char (swapped)"
+        );
+        assert_eq!(
+            undo.new_char, " ",
+            "undo new_char must be the forward flip's expected_char (swapped)"
+        );
     }
 
     /// `t` (ADR-0009 Phase 2) marks the cursor task for today when it isn't
@@ -2320,7 +2679,15 @@ mod tests {
             task(3, " ", 1, "gamma.md"),                              // no scheduled date
         ];
         let expanded = HashSet::new();
-        let rows = build_view(&tasks, StatusFilter::All, &expanded, true, "2026-06-20");
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            true,
+            "2026-06-20",
+            "",
+            "",
+        );
         // Only alpha.md has a today-matching task; one collapsed header.
         assert_eq!(rows.len(), 1);
         assert_eq!(header(&rows[0]).0, "alpha.md");
@@ -2337,11 +2704,27 @@ mod tests {
         ];
         let expanded = HashSet::from(["alpha.md".to_string()]);
         // Open + today -> only the open today task.
-        let rows = build_view(&tasks, StatusFilter::Open, &expanded, true, "2026-06-20");
+        let rows = build_view(
+            &tasks,
+            StatusFilter::Open,
+            &expanded,
+            true,
+            "2026-06-20",
+            "",
+            "",
+        );
         assert_eq!(rows.len(), 2, "header + one task");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
         // All + today -> both today tasks.
-        let rows = build_view(&tasks, StatusFilter::All, &expanded, true, "2026-06-20");
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            true,
+            "2026-06-20",
+            "",
+            "",
+        );
         assert_eq!(rows.len(), 3, "header + two tasks");
     }
 
@@ -2389,7 +2772,15 @@ mod tests {
             task(2, " ", 1, "beta.md"),                               // no scheduled date
         ];
         let expanded = HashSet::new();
-        let rows = build_view(&tasks, StatusFilter::All, &expanded, true, "2026-06-20");
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            true,
+            "2026-06-20",
+            "",
+            "",
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(header(&rows[0]).0, "alpha.md");
     }
@@ -2431,5 +2822,338 @@ mod tests {
             rendered.contains("2026-06-21"),
             "the other scheduled date must render"
         );
+    }
+
+    // --- ADR-0010: text search tests --------------------------------------------
+
+    /// Search filters tasks whose text contains the query (case-insensitive,
+    /// substring). Non-matching tasks are hidden; matching tasks survive.
+    #[test]
+    fn build_view_search_filters_by_text_substring() {
+        // Give each task a distinct text (the test helper uses "task {id}").
+        let with_text = |id: i64, text: &str| -> Task {
+            let mut t = task(id, " ", id as usize, "alpha.md");
+            t.text = text.to_string();
+            t.text_hash = text.to_string();
+            t
+        };
+        let tasks = vec![
+            with_text(1, "deploy the database migration"),
+            with_text(2, "write documentation for the API"),
+            with_text(3, "review deployment checklist"),
+        ];
+        let expanded = HashSet::from(["alpha.md".to_string()]);
+
+        // Search "deploy" should match tasks 1 and 3 (case-insensitive substring).
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            false,
+            "",
+            "deploy",
+            "",
+        );
+        assert_eq!(rows.len(), 3, "header + two matching tasks");
+        let task_ids: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| match r {
+                DisplayRow::Task { task } => Some(task.id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(task_ids, vec![1, 3], "tasks 1 and 3 should match 'deploy'");
+    }
+
+    /// Search is case-insensitive: uppercase query matches lowercase text.
+    #[test]
+    fn build_view_search_case_insensitive() {
+        let with_text = |id: i64, text: &str| -> Task {
+            let mut t = task(id, " ", id as usize, "alpha.md");
+            t.text = text.to_string();
+            t.text_hash = text.to_string();
+            t
+        };
+        let tasks = vec![
+            with_text(1, "Deploy the database"),
+            with_text(2, "write documentation"),
+        ];
+        let expanded = HashSet::from(["alpha.md".to_string()]);
+
+        // Uppercase query "DEPLOY" should match lowercase "Deploy".
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            false,
+            "",
+            "DEPLOY",
+            "",
+        );
+        assert_eq!(rows.len(), 2, "header + one matching task");
+    }
+
+    /// File search (`F` key) matches `note_path`: a query matching a filename
+    /// shows all tasks from that file, even when the task text doesn't contain
+    /// the query.
+    #[test]
+    fn build_view_file_search_matches_note_path() {
+        let tasks = vec![
+            task(1, " ", 1, "deployment-notes.md"),
+            task(2, " ", 2, "daily.md"),
+        ];
+        let expanded = HashSet::new();
+        // File search "deploy" via file_query — should match all tasks in
+        // deployment-notes.md even though the task text is "task 1" / "task 2".
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            false,
+            "",
+            "",
+            "deploy",
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the deployment-notes.md group should match"
+        );
+        assert_eq!(
+            header(&rows[0]).0,
+            "deployment-notes.md",
+            "should match by note_path"
+        );
+    }
+
+    /// Empty search query shows all tasks (no filtering).
+    #[test]
+    fn build_view_empty_search_shows_all() {
+        let tasks = vec![task(1, " ", 1, "alpha.md"), task(2, " ", 2, "alpha.md")];
+        let expanded = HashSet::from(["alpha.md".to_string()]);
+        let rows = build_view(&tasks, StatusFilter::All, &expanded, false, "", "", "");
+        assert_eq!(rows.len(), 3, "header + two tasks — no filtering");
+    }
+
+    /// Search composes with the status filter: search + Open shows only open
+    /// tasks that match the query.
+    #[test]
+    fn build_view_search_composes_with_status_filter() {
+        let with_text = |id: i64, text: &str, raw: &str| -> Task {
+            let mut t = task(id, raw, id as usize, "alpha.md");
+            t.text = text.to_string();
+            t.text_hash = text.to_string();
+            t
+        };
+        let tasks = vec![
+            with_text(1, "deploy the migration", " "),     // open
+            with_text(2, "deploy the rollback plan", "x"), // done
+        ];
+        let expanded = HashSet::from(["alpha.md".to_string()]);
+
+        // Search "deploy" + Open filter: only task 1 (open) survives.
+        let rows = build_view(
+            &tasks,
+            StatusFilter::Open,
+            &expanded,
+            false,
+            "",
+            "deploy",
+            "",
+        );
+        assert_eq!(rows.len(), 2, "header + one task (open)");
+        assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
+    }
+
+    /// Search composes with the Today view: search + today_only shows only
+    /// today's tasks that match the query.
+    #[test]
+    fn build_view_search_composes_with_today_filter() {
+        let with_text = |id: i64, text: &str, sched: Option<&str>| -> Task {
+            let mut t = task(id, " ", id as usize, "alpha.md");
+            t.text = text.to_string();
+            t.text_hash = text.to_string();
+            t.scheduled_date = sched.map(|s| s.to_string());
+            t
+        };
+        let tasks = vec![
+            with_text(1, "deploy the migration", Some("2026-06-20")), // today, matches
+            with_text(2, "write documentation", Some("2026-06-20")),  // today, no match
+            with_text(3, "review deploy checklist", Some("2026-06-21")), // not today
+        ];
+        let expanded = HashSet::from(["alpha.md".to_string()]);
+
+        // Search "deploy" + today_only (2026-06-20): only task 1 survives.
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            true,
+            "2026-06-20",
+            "deploy",
+            "",
+        );
+        assert_eq!(rows.len(), 2, "header + one task (today + search)");
+        assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
+    }
+
+    /// `App::clear_search` clears the query and restores the full unfiltered list.
+    #[test]
+    fn clear_search_restores_full_list() {
+        let mut app = App::new();
+        // Populate with two notes, expanded.
+        let with_text = |id: i64, text: &str| -> Task {
+            let mut t = task(id, " ", id as usize, "alpha.md");
+            t.text = text.to_string();
+            t.text_hash = text.to_string();
+            t
+        };
+        app.tasks = vec![
+            with_text(1, "deploy the migration"),
+            with_text(2, "write documentation"),
+        ];
+        app.filter = StatusFilter::All;
+        app.expanded.insert("alpha.md".to_string());
+        app.rebuild();
+        assert_eq!(app.rows.len(), 3, "full list: header + two tasks");
+
+        // Search for "deploy".
+        app.search_query = "deploy".to_string();
+        app.rebuild();
+        assert_eq!(app.rows.len(), 2, "filtered: header + one task");
+
+        // Clear search.
+        app.clear_search();
+        assert!(!app.searching);
+        assert!(app.search_query.is_empty());
+        assert_eq!(app.rows.len(), 3, "full list restored after clear");
+    }
+
+    /// `App::clear_file_search` clears the file query and restores the full
+    /// unfiltered list without affecting the text search.
+    #[test]
+    fn clear_file_search_restores_full_list() {
+        let mut app = App::new();
+        let with_text = |id: i64, text: &str, path: &str| -> Task {
+            let mut t = task(id, " ", id as usize, path);
+            t.text = text.to_string();
+            t.text_hash = text.to_string();
+            t
+        };
+        app.tasks = vec![
+            with_text(1, "deploy the migration", "alpha.md"),
+            with_text(2, "write documentation", "beta.md"),
+        ];
+        app.filter = StatusFilter::All;
+        app.expanded.insert("alpha.md".to_string());
+        app.expanded.insert("beta.md".to_string());
+        app.rebuild();
+        assert_eq!(app.rows.len(), 4, "full list: two headers + two tasks");
+
+        // File search for "alpha".
+        app.file_query = "alpha".to_string();
+        app.rebuild();
+        assert_eq!(app.rows.len(), 2, "filtered: alpha header + its task");
+
+        // Clear file search.
+        app.clear_file_search();
+        assert!(!app.file_searching);
+        assert!(app.file_query.is_empty());
+        assert_eq!(app.rows.len(), 4, "full list restored after clear");
+    }
+
+    /// File search is case-insensitive: uppercase query matches lowercase path.
+    #[test]
+    fn build_view_file_search_case_insensitive() {
+        let tasks = vec![
+            task(1, " ", 1, "Deployment-Notes.md"),
+            task(2, " ", 2, "daily.md"),
+        ];
+        let expanded = HashSet::new();
+        // Uppercase file query "DEPLOYMENT" should match lowercase "deployment-notes".
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            false,
+            "",
+            "",
+            "DEPLOYMENT",
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the Deployment-Notes.md group should match"
+        );
+    }
+
+    /// File search narrows within a text search: both filters are AND-ed.
+    #[test]
+    fn build_view_file_search_narrows_within_text_search() {
+        let with_text = |id: i64, text: &str, path: &str| -> Task {
+            let mut t = task(id, " ", id as usize, path);
+            t.text = text.to_string();
+            t.text_hash = text.to_string();
+            t
+        };
+        let tasks = vec![
+            with_text(1, "common task", "alpha.md"),
+            with_text(2, "common task", "beta.md"),
+        ];
+        let expanded = HashSet::from(["alpha.md".to_string(), "beta.md".to_string()]);
+        // Text search "common" matches both; file search "alpha" narrows to one.
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            false,
+            "",
+            "common",
+            "alpha",
+        );
+        assert_eq!(rows.len(), 2, "alpha header + its task");
+    }
+
+    /// File search composes with the status filter.
+    #[test]
+    fn build_view_file_search_composes_with_status_filter() {
+        let tasks = vec![
+            task(1, " ", 1, "alpha.md"), // open
+            task(2, " ", 2, "beta.md"),  // open
+            task(3, "x", 3, "beta.md"),  // done
+        ];
+        let expanded = HashSet::from(["beta.md".to_string()]);
+        // File search "beta" + Open filter: beta header + only the open beta task.
+        let rows = build_view(&tasks, StatusFilter::Open, &expanded, false, "", "", "beta");
+        assert_eq!(rows.len(), 2, "beta header + one open task");
+        assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 2));
+    }
+
+    /// File search composes with text search and status filter (triple compose).
+    #[test]
+    fn build_view_triple_compose_file_text_status() {
+        let alpha_task = |id: i64, text: &str, raw: &str| -> Task {
+            let mut t = task(id, raw, id as usize, "alpha.md");
+            t.text = text.to_string();
+            t.text_hash = text.to_string();
+            t
+        };
+        let tasks = vec![
+            alpha_task(1, "deploy the migration", " "), // open
+            alpha_task(2, "deploy the rollback", "x"),  // done
+            alpha_task(3, "write documentation", " "),  // open
+        ];
+        // File "alpha" + text "deploy" + Open: only task 1 survives.
+        let rows = build_view(
+            &tasks,
+            StatusFilter::Open,
+            &HashSet::from(["alpha.md".to_string()]),
+            false,
+            "",
+            "deploy",
+            "alpha",
+        );
+        assert_eq!(rows.len(), 2, "header + one task");
+        assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
     }
 }

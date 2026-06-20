@@ -4,7 +4,9 @@
 
 use std::fs;
 
-use taski_daemon::{ApplyOutcome, process_action, process_pending_actions, scan_vault};
+use taski_daemon::{
+    ApplyOutcome, process_action, process_bullet_action, process_pending_actions, scan_vault,
+};
 use taski_db as db;
 
 #[test]
@@ -17,7 +19,7 @@ fn flip_open_to_done_applied_unchanged_elsewhere() {
     let original = "# Day\n\n- [ ] task one\n- [x] task two\nsome prose\n";
     fs::write(&note, original).unwrap();
 
-    scan_vault(&conn, root).expect("scan");
+    scan_vault(&conn, root, &[]).expect("scan");
     let tasks = db::all_tasks(&conn).expect("all_tasks");
     let t1 = tasks
         .iter()
@@ -59,7 +61,7 @@ fn flip_refused_on_concurrent_edit_leaves_file_unchanged() {
 
     let note = root.join("day.md");
     fs::write(&note, "# Day\n\n- [ ] task one\n- [x] task two\n").unwrap();
-    scan_vault(&conn, root).expect("scan");
+    scan_vault(&conn, root, &[]).expect("scan");
 
     // Snapshot the task after scan so the action carries the scanned hash's view.
     let tasks = db::all_tasks(&conn).expect("all_tasks");
@@ -109,7 +111,7 @@ fn flip_targets_row_line_number_not_stale_action_line_number() {
 
     let note = root.join("day.md");
     fs::write(&note, "- [ ] task one\n").unwrap();
-    scan_vault(&conn, root).expect("scan");
+    scan_vault(&conn, root, &[]).expect("scan");
     let t = db::all_tasks(&conn).expect("all_tasks")[0].clone();
 
     // Enqueue with a wildly stale line_number (ADR-0005: action.line_number is now
@@ -133,7 +135,7 @@ fn flip_refused_when_task_gone_from_index() {
     let root = tmp.path();
     let conn = db::open(&tmp.path().join("g.db").to_string_lossy()).expect("open db");
     fs::write(root.join("day.md"), "- [ ] task one\n").unwrap();
-    scan_vault(&conn, root).expect("scan");
+    scan_vault(&conn, root, &[]).expect("scan");
 
     // An action for a task id that isn't (or is no longer) indexed.
     db::enqueue_action(&conn, 99999, "day.md", 1, " ", "x").expect("enqueue");
@@ -157,7 +159,7 @@ fn malformed_new_char_refused_h1() {
     let conn = db::open(&tmp.path().join("h1.db").to_string_lossy()).expect("open db");
     let note = root.join("day.md");
     fs::write(&note, "- [ ] task one\n").unwrap();
-    scan_vault(&conn, root).expect("scan");
+    scan_vault(&conn, root, &[]).expect("scan");
     let t = db::all_tasks(&conn).expect("all_tasks")[0].clone();
 
     for bad in ["", "xy"] {
@@ -188,7 +190,7 @@ fn two_flips_same_note_both_applied_m1() {
     let conn = db::open(&tmp.path().join("m1.db").to_string_lossy()).expect("open db");
     let note = root.join("day.md");
     fs::write(&note, "- [ ] a\n- [ ] b\n").unwrap();
-    scan_vault(&conn, root).expect("scan");
+    scan_vault(&conn, root, &[]).expect("scan");
 
     let tasks = db::all_tasks(&conn).expect("all_tasks");
     let a = tasks.iter().find(|t| t.text == "a").expect("task a");
@@ -224,7 +226,7 @@ fn re_processing_after_apply_is_idempotent_m2() {
     let conn = db::open(&tmp.path().join("m2.db").to_string_lossy()).expect("open db");
     let note = root.join("day.md");
     fs::write(&note, "- [ ] task one\n").unwrap();
-    scan_vault(&conn, root).expect("scan");
+    scan_vault(&conn, root, &[]).expect("scan");
     let t = db::all_tasks(&conn).expect("all_tasks")[0].clone();
 
     // First apply: open -> done.
@@ -236,7 +238,7 @@ fn re_processing_after_apply_is_idempotent_m2() {
 
     // Simulate crash+restart: the re-scan refreshes the stored note_hash to the
     // post-flip content. The unresolved action is then re-processed.
-    scan_vault(&conn, root).expect("re-scan");
+    scan_vault(&conn, root, &[]).expect("re-scan");
 
     let mtime_before = fs::metadata(&note).unwrap().modified().unwrap();
     let outcome2 = process_action(&conn, root, &action).expect("re-process");
@@ -268,7 +270,7 @@ fn sweep_removes_stale_tmp_files_m4() {
     fs::create_dir(root.join(".obsidian")).unwrap();
     fs::write(root.join(".obsidian/note.md.taski.tmp"), "stale hidden").unwrap();
 
-    let removed = taski_daemon::sweep_tmp_files(root).expect("sweep");
+    let removed = taski_daemon::sweep_tmp_files(root, &[]).expect("sweep");
     assert_eq!(
         removed, 1,
         "only the non-hidden top-level temp should be swept"
@@ -298,7 +300,7 @@ fn flip_lands_on_current_line_after_line_shift_adr0005() {
 
     // Task starts at line 1.
     fs::write(&note, "- [ ] task one\n").unwrap();
-    scan_vault(&conn, root).expect("scan v1");
+    scan_vault(&conn, root, &[]).expect("scan v1");
     let t = db::all_tasks(&conn).expect("all_tasks")[0].clone();
     assert_eq!(t.line_number, 1);
 
@@ -318,7 +320,7 @@ fn flip_lands_on_current_line_after_line_shift_adr0005() {
     // reconciliation matches by text_hash, updates line_number to 2, and
     // refreshes note_hash to the new content.
     fs::write(&note, "# New heading\n- [ ] task one\n").unwrap();
-    scan_vault(&conn, root).expect("scan v2");
+    scan_vault(&conn, root, &[]).expect("scan v2");
 
     let task_after = db::all_tasks(&conn)
         .expect("all_tasks")
@@ -355,7 +357,7 @@ fn autoincrement_never_reuses_deleted_id() {
 
     // Two tasks.
     fs::write(&note, "- [ ] task a\n- [ ] task b\n").unwrap();
-    scan_vault(&conn, root).expect("scan v1");
+    scan_vault(&conn, root, &[]).expect("scan v1");
     let tasks = db::all_tasks(&conn).expect("all_tasks");
     let id_a = tasks.iter().find(|t| t.text == "task a").unwrap().id;
     let id_b = tasks.iter().find(|t| t.text == "task b").unwrap().id;
@@ -364,7 +366,7 @@ fn autoincrement_never_reuses_deleted_id() {
     // Delete task a (remove its line, re-scan). Reconciliation deletes id_a's row
     // and keeps id_b (matched by text_hash, line_number updated to 1).
     fs::write(&note, "- [ ] task b\n").unwrap();
-    scan_vault(&conn, root).expect("scan v2");
+    scan_vault(&conn, root, &[]).expect("scan v2");
     let after = db::all_tasks(&conn).expect("all_tasks");
     assert_eq!(after.len(), 1);
     assert_eq!(after[0].text, "task b");
@@ -375,7 +377,7 @@ fn autoincrement_never_reuses_deleted_id() {
 
     // Add a new task: AUTOINCREMENT must assign a HIGHER id than any prior one.
     fs::write(&note, "- [ ] task b\n- [ ] task c\n").unwrap();
-    scan_vault(&conn, root).expect("scan v3");
+    scan_vault(&conn, root, &[]).expect("scan v3");
     let after2 = db::all_tasks(&conn).expect("all_tasks");
     let id_c = after2.iter().find(|t| t.text == "task c").unwrap().id;
     assert!(id_c > id_a, "must not reuse the deleted id");
@@ -390,5 +392,87 @@ fn autoincrement_never_reuses_deleted_id() {
         outcome,
         ApplyOutcome::TaskNotFound,
         "deleted task id must never resolve to a different task"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0011: bullet toggle (the `b` key) converts `- [ ] task` <-> `- task`.
+// Two write-back integration tests mirror the checkbox-flip pair above:
+// applied (checkbox -> bullet, body preserved byte-for-byte) and refused on a
+// concurrent edit (vault untouched).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bullet_toggle_applied_converts_checkbox_to_bullet() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let conn = db::open(&tmp.path().join("bt.db").to_string_lossy()).expect("open db");
+
+    let note = root.join("day.md");
+    let original = "# Day\n\n- [ ] some task\n- [x] task two\nsome prose\n";
+    fs::write(&note, original).unwrap();
+
+    scan_vault(&conn, root, &[]).expect("scan");
+    let tasks = db::all_tasks(&conn).expect("all_tasks");
+    let t1 = tasks
+        .iter()
+        .find(|t| t.text == "some task")
+        .expect("task one indexed");
+
+    // Enqueue a bullet toggle for the open checkbox task, then apply.
+    db::enqueue_bullet_toggle(&conn, t1.id, &t1.note_path, t1.line_number).expect("enqueue");
+    let action = &db::pending_actions(&conn).expect("pending")[0];
+    let outcome = process_bullet_action(&conn, root, action).expect("process");
+    assert_eq!(outcome, ApplyOutcome::Applied);
+
+    // The checkbox on line 3 was stripped to a plain bullet; the body is preserved
+    // byte-for-byte. Task two and the prose are untouched.
+    let after = fs::read_to_string(&note).unwrap();
+    assert_eq!(after, "# Day\n\n- some task\n- [x] task two\nsome prose\n");
+
+    // Resolving marks the action done and drops it from the pending view.
+    db::resolve_action(&conn, action.id, "done", None).unwrap();
+    assert!(db::pending_actions(&conn).unwrap().is_empty());
+}
+
+#[test]
+fn bullet_toggle_refused_on_concurrent_edit_leaves_file_unchanged() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let conn = db::open(&tmp.path().join("btc.db").to_string_lossy()).expect("open db");
+
+    let note = root.join("day.md");
+    fs::write(&note, "# Day\n\n- [ ] some task\n- [x] task two\n").unwrap();
+    scan_vault(&conn, root, &[]).expect("scan");
+
+    // Snapshot the task after scan so the action carries the scanned hash's view.
+    let tasks = db::all_tasks(&conn).expect("all_tasks");
+    let t1 = tasks
+        .iter()
+        .find(|t| t.text == "some task")
+        .expect("task one indexed")
+        .clone();
+
+    db::enqueue_bullet_toggle(&conn, t1.id, &t1.note_path, t1.line_number).expect("enqueue");
+
+    // Simulate Obsidian editing the note AFTER the scan. The on-disk content now
+    // differs from the hash captured at scan.
+    let edited = "# Day\n\n- [ ] some task\n- [x] task two\nUSER EDITED ME\n";
+    fs::write(&note, edited).unwrap();
+    let before_process = fs::read(&note).unwrap();
+
+    let action = &db::pending_actions(&conn).expect("pending")[0];
+    let outcome = process_bullet_action(&conn, root, action).expect("process");
+    assert_eq!(
+        outcome,
+        ApplyOutcome::ConflictNoteChanged,
+        "a note changed since scan must be refused, not clobbered"
+    );
+
+    // Taski changed nothing: file is byte-identical to the post-edit version.
+    let after = fs::read(&note).unwrap();
+    assert_eq!(
+        after, before_process,
+        "on conflict the file must be untouched by Taski"
     );
 }
