@@ -142,10 +142,11 @@ guarantee (ADRs 0002/0003/0004).
 
 ---
 
-## Data Model (schema v2)
+## Data Model (schema v3)
 
-Defined in `taski-db::SCHEMA`. `PRAGMA user_version` tracks the version; `< v2` DBs are
-dropped and recreated (pre-MVP, no data to preserve).
+Defined in `taski-db::SCHEMA`. `PRAGMA user_version` tracks the version; older DBs are
+dropped and recreated (pre-MVP, no data to preserve). v3 added the `note_contents` cache
+that backs the read-only TUI context pane ([ADR-0006](./adr/0006-note-content-cached-in-index.md)).
 
 **`tasks`** — one row per checkbox task found in the vault:
 
@@ -164,6 +165,14 @@ dropped and recreated (pre-MVP, no data to preserve).
 **`pending_actions`** — the TUI→daemon command queue. Lifecycle `pending → done | failed`.
 Holds `task_id`, the `expected_char`/`new_char` for the flip, and on failure an `error`.
 Resolved rows older than 7 days are pruned on daemon startup (`ACTION_RETENTION_SECS`).
+
+**`note_contents`** *(v3)* — per-note full-text cache backing the read-only TUI context
+pane ([ADR-0006](./adr/0006-note-content-cached-in-index.md)). One row per indexed note:
+`note_path` (PK), `content` (full UTF-8 text), `note_hash` (mirrors the note's
+`tasks.note_hash`), `updated_at` (informational). The daemon writes it in the same
+`index_note` pass that parses tasks, so content, hash, and task `line_number` all derive
+from one byte snapshot. The TUI reads it via `db::note_content()` — it still never opens a
+vault file. Window sizing is a render concern and lives in the TUI, not the index.
 
 ---
 
@@ -196,6 +205,12 @@ understanding the failure mode it prevents.**
    Crucially: **Taski injects nothing into the vault** (unlike Logseq-style inline IDs);
    identity is reconciled from content each scan. This was validated against
    Obsidian-Tasks prior art.
+
+6. **Note content cached in the index for the TUI context pane** ([ADR-0006](./adr/0006-note-content-cached-in-index.md))
+   — the daemon caches each note's full text in `note_contents`; the TUI reads it like any
+   other index data. The TUI **still never opens a vault file** — this is a read path, not
+   a relaxation of ADR-0002. Chosen over "TUI reads the vault directly" so content and task
+   locations stay consistent (same scan) and the SQLite decoupling boundary stays intact.
 
 ---
 
@@ -296,7 +311,7 @@ These are the things that aren't obvious from reading the code and will cost you
 | `taski-daemon/tests/scan.rs` | End-to-end scan of a fake vault → correct task rows. |
 | `taski-daemon/tests/reconcile.rs` | Content-hash reconciliation: identity survives edits, deletes, reorders. |
 | `taski-daemon/tests/writeback.rs` + `writeback_proptest.rs` | The safety contract: atomic_write commits on match, refuses on conflict, never corrupts. |
-| `taski-tui` unit tests (in `main.rs`) | View model: grouping, collapse, filter, display-index↔Task mapping, selection reconciliation, failure-notice surfacing. |
+| `taski-tui` unit tests (in `main.rs`) | View model: grouping, collapse, filter, display-index↔Task mapping, selection reconciliation, failure-notice surfacing, context-pane render/scroll/toggle + `context_view` centering (headless `TestBackend` smoke). |
 
 Tests use `tempfile` fake vaults and `:memory:` or temp-file DBs. The real vault is
 exercised only at runtime (its `taski.db` is gitignored).
@@ -309,8 +324,10 @@ exercised only at runtime (its `taski.db` is gitignored).
 |---|---|
 | Change how tasks are parsed / add metadata extraction | `taski-core/src/lib.rs` (`parse_tasks`, `extract_due_date`) |
 | Change the DB schema | `taski-db::SCHEMA` + bump `SCHEMA_VERSION`; update `reconcile_note`/`upsert_task` |
+| Cache/read note content for the TUI context pane | `taski-db`: `note_contents` table + `upsert_note_content`/`note_content`/`delete_note_content`; daemon writes it in `index_note` ([ADR-0006](./adr/0006-note-content-cached-in-index.md)) |
 | Change write-back behavior | `taski-daemon`: `process_action`, `atomic_write` (mind ADR-0004 TOCTOU) |
-| Change how the TUI looks/behaves | `taski-tui/src/main.rs`: `App`, `build_view`, key handling |
+| Change how the TUI looks/behaves | `taski-tui/src/main.rs`: `App`, `build_view`, `context_view`/`draw_context_pane`, key handling |
+| Change context-pane keybindings/behavior | `taski-tui/src/main.rs` key match in `run()` (`J`/`K` scroll, `p` toggle) + `MIN_SPLIT_WIDTH` auto-hide; `sync_context` for the read path |
 | Add a CLI flag | `Cli` struct in the relevant binary's `lib.rs`/`main.rs` |
 | Change config format/precedence | `taski-config/src/lib.rs` |
 | Run a one-shot scan (no watcher) | `taski-daemon --once --vault …` |
