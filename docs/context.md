@@ -42,11 +42,11 @@ Cargo workspace, edition 2024, six crates. Dependencies point downward only (no 
 
 | Crate | Responsibility | Key file(s) |
 |---|---|---|
-| `taski-core` | **Pure** domain: `Task`/`Status` types, the Markdown parser (`parse_tasks`, fence-aware), emoji-date extraction (`extract_due_date` for 📅/📆/🗓, `extract_scheduled_date` for ⏳ — both via shared `extract_emoji_date`; ADR-0009), and pure `ymd_from_unix` (today's date, no date crate). No FS, no I/O, no deps on other taski crates. | `crates/taski-core/src/lib.rs` |
+| `taski-core` | **Pure** domain: `Task`/`Status`/`Priority` types, the Markdown parser (`parse_tasks`, fence-aware), emoji extraction (`extract_due_date` 📅/📆/🗓, `extract_scheduled_date` ⏳, `extract_start_date` 🛫, `extract_created_date` ➕, `extract_done_date` ✅, `extract_cancelled_date` ❌ — all via shared `extract_emoji_date`; plus `extract_priority` 🔺/⏫/🔼/🔽/⏬ and `extract_tags` `#tag`), the pure `rewrite_scheduled` line-rewrite oracle (ADR-0009 Phase 2), and pure `ymd_from_unix` (today's date, no date crate). No FS, no I/O, no deps on other taski crates. | `crates/taski-core/src/lib.rs` |
 | `taski-config` | TOML config loading (`~/.config/taski/config.toml`) + CLI→config→default precedence + the `template()` renderer for `--init-config`. Fields include `exclude_dirs` for skipping vault subdirectory trees. Keeps FS/TOML out of `taski-core`. | `crates/taski-config/src/lib.rs` |
 | `taski-db` | The canonical SQLite schema, `open()` (WAL + schema + dir creation), and all read/write APIs (`all_tasks`, `reconcile_note`, `enqueue_action` / `enqueue_set_scheduled` / `enqueue_bullet_toggle`, `pending_actions`, `prune_old_actions`, `delete_tasks_for_excluded_dirs`, …). Owns `tasks` + `pending_actions` + `note_contents`. | `crates/taski-db/src/lib.rs` |
 | `taski-daemon` | The watcher/scanner + **sole writer to the vault**: the reusable engine `run_daemon(opts, shutdown, lock)`, plus `scan_vault`, `index_note`, `process_action` (checkbox flips) / `process_metadata_action` (`⏳` writes) / `process_bullet_action` (checkbox↔bullet toggle) — all three reuse `atomic_write` (ADR-0009/0011), the watch loop; the `ShutdownSignal`/`ShutdownHandle` pair; and the `flock` single-writer lock (`DaemonLockGuard`/`acquire_daemon_lock`/`LockOutcome`). The drain loop dispatches on `pending_actions.action_type`. Also handles `exclude_dirs` purge + filtered scanning. **lib + bin** — a `taski-daemon` binary *and* the library the unified launcher depends on. | `crates/taski-daemon/src/{lib,main,shutdown,lock}.rs`, `tests/` |
-| `taski-tui` | The `ratatui` client: polls the index, groups by note, filters (status-cycle `f`, Today view `T`, text search `/`, file search `F`), renders, submits toggle (`Space`) / mark-for-today (`t`) / bullet toggle (`b`) / undo (`u`) actions, and shows the context pane via the cached `note_contents` table. Never touches vault files. **lib + bin** — public entry points `run()` / `run_with_db(db)` / `run_combined(db, quit_hook)`; `main.rs` is a thin shim. Key internal modules: `App` (state machine), `build_view` (filter pipeline), `draw` (render), `run_loop` (input). | `crates/taski-tui/src/{lib,main}.rs` |
+| `taski-tui` | The `ratatui` client: polls the index, groups by note/tag/priority/folder (`G` cycling), filters (status-cycle `f`, Today view `T`, Overdue `O`, text search `/`, file search `F`), renders, submits toggle (`Space`) / mark-for-today (`t`) / bullet toggle (`b`) / undo (`u`) actions, and shows the context pane via the cached `note_contents` table. Never touches vault files. **lib + bin** — public entry points `run()` / `run_with_db(db)` / `run_combined(db, quit_hook)`; `main.rs` is a thin shim. Key internal modules: `App` (state machine), `build_view` (filter pipeline + HashMap grouping), `draw` (render), `run_loop` (input). | `crates/taski-tui/src/{lib,main}.rs` |
 | `taski` | The **unified launcher** binary: runs the daemon (background thread) + TUI (main thread) together by default (`taski`), or either alone via `taski daemon` / `taski tui` subcommands. Attach-or-spawn + single-writer lock (ADRs 0007/0008). | `crates/taski/src/main.rs` |
 
 Supporting: `docs/` (PRD, tech, ADRs, setup, code reviews under `docs/cr/`, this file), `scripts/install-launchd.sh`
@@ -59,7 +59,7 @@ Supporting: `docs/` (PRD, tech, ADRs, setup, code reviews under `docs/cr/`, this
 ```sh
 cargo build --workspace                       # dev build
 cargo build --release --workspace             # optimized daily-driver binaries
-cargo test --workspace                        # all tests (~178 as of v0.4)
+cargo test --workspace                        # all tests (~259, post-v0.4)
 cargo test -p taski-daemon writeback          # run one suite / filter by name
 ```
 
@@ -123,7 +123,7 @@ Understanding these two flows is 90% of understanding the codebase.
 
 ```
 FS event (debounced 300ms) ─▶ scan_vault / index_note(note)
-                              └─▶ taski_core::parse_tasks(note_text)   // fence-aware, extracts 📅 due + ⏳ scheduled dates
+                              └─▶ taski_core::parse_tasks(note_text)   // fence-aware; extracts 8 Obsidian-Tasks tokens (📅/📆/🗓 due, ⏳ scheduled, 🛫 start, ➕ created, ✅ done, ❌ cancelled, #tags, priority 🔺/⏫/🔼/🔽/⏬)
                                   └─▶ taski_db::reconcile_note(...)    // ADR-0005 (see below)
 ```
 
@@ -264,14 +264,17 @@ filter), `Backspace` edits query, characters build query.
 
 ---
 
-## Data Model (schema v5)
+## Data Model (schema v6)
 
 Defined in `taski-db::SCHEMA`. `PRAGMA user_version` tracks the version; older DBs are
 dropped and recreated (pre-MVP, no data to preserve). v3 added the `note_contents` cache
 that backs the read-only TUI context pane ([ADR-0006](./adr/0006-note-content-cached-in-index.md));
 v4 added `tasks.scheduled_date` (`⏳`) backing the "Today" view
 ([ADR-0009](./adr/0009-scheduled-date-today.md), Phase 1); v5 added
-`pending_actions.action_type` + `payload` for the `⏳` write gesture (ADR-0009, Phase 2).
+`pending_actions.action_type` + `payload` for the `⏳` write gesture (ADR-0009, Phase 2);
+**v6 added six read-only metadata columns to `tasks`** (Tier 1: `tags`, `priority`,
+`start_date`, `created_date`, `done_date`, `cancelled_date`). The v6 bump is destructive —
+existing dev DBs are dropped+recreated and the index rebuilds from the vault.
 
 **`tasks`** — one row per checkbox task found in the vault:
 
@@ -286,6 +289,12 @@ v4 added `tasks.scheduled_date` (`⏳`) backing the "Today" view
 | `note_mtime` | Note mtime at last scan — **informational only**, not used by conflict detection. |
 | `due_date` | Parsed 📅/📆/🗓 date (Obsidian Tasks-plugin syntax). |
 | `scheduled_date` *(v4)* | Parsed `⏳` scheduled date (Obsidian Tasks-plugin syntax — "plan to work on this"). Backs the Today view (`T`) and is *written* by the `t` "mark for today" gesture ([ADR-0009](./adr/0009-scheduled-date-today.md)). |
+| `tags` *(v6)* | Parsed `#tag`s — multi-value, stored as a space-separated sentinel TEXT (`" foo bar "`) for cheap Tier 2 whole-tag SQL matching; `Vec<String>` on `Task`. The codebase's first multi-value field; no `serde_json` dep. |
+| `priority` *(v6)* | Parsed priority emoji → `Priority` enum (`Highest` `🔺` / `High` `⏫` / `Medium` `🔼` / `Low` `🔽` / `Lowest` `⏬` / `Other`). Stored as the canonical emoji char. Note `⏫` is **High**, not Highest (the common mix-up). |
+| `start_date` *(v6)* | Parsed `🛫` start date (Obsidian Tasks syntax). |
+| `created_date` *(v6)* | Parsed `➕` created date. |
+| `done_date` *(v6)* | Parsed `✅` done date. **Read-only** — Taski does NOT yet auto-stamp this on toggle (the "interop gap"; see Deferred + roadmap). |
+| `cancelled_date` *(v6)* | Parsed `❌` cancelled date. |
 | `updated_at` | Last-seen timestamp. |
 
 **`pending_actions`** — the TUI→daemon command queue. Lifecycle `pending → done | failed`.
@@ -532,15 +541,15 @@ These are the things that aren't obvious from reading the code and will cost you
 
 | Location | What it guards |
 |---|---|
-| `taski-core` unit tests + `proptest` + `rewrite_scheduled_proptest` | Parser correctness on a synthetic corpus; never-panics on arbitrary input; due-date + scheduled-date extraction; pure `rewrite_scheduled` oracle (256-case ADR-0009 Phase 2). |
+| `taski-core` unit tests + `proptest` + `rewrite_scheduled_proptest` + `tag_extraction_proptest` | Parser correctness on a synthetic corpus; never-panics on arbitrary input; due/scheduled/start/created/done/cancelled date extraction; `extract_priority` (incl. the `⏫`=High / `🔺`=Highest mapping); `extract_tags` grammar + dedup; pure `rewrite_scheduled` oracle (256-case ADR-0009 Phase 2); tag-extraction grammar + dedup proptest (256 cases). |
 | `taski-config` unit tests | TOML parsing, precedence (CLI→config→default), env override, `template()` round-trips. |
-| `taski-db` unit tests | Schema, `reconcile_note` identity retention, upsert/read round-trips, action pruning, `open()` creates missing dirs. |
+| `taski-db` unit tests | Schema, `reconcile_note` identity retention, upsert/read round-trips (incl. Tier 1 metadata + the tag sentinel storage format), action pruning, `open()` creates missing dirs. |
 | `taski-daemon/tests/scan.rs` | End-to-end scan of a fake vault → correct task rows. |
 | `taski-daemon/tests/reconcile.rs` | Content-hash reconciliation: identity survives edits, deletes, reorders. |
 | `taski-daemon/tests/writeback.rs` + `writeback_proptest.rs` + `metadata_writeback_proptest.rs` | The safety contract: atomic_write commits on match, refuses on conflict, never corrupts; `⏳` metadata write-back "never corrupts" (256-case ADR-0009 Phase 2, oracle = `rewrite_scheduled`, CRLF assertion, VS16 guards). Also covers `toggle_bullet` and `undo` action types (ADR-0011). |
 | `taski-daemon/src/lock.rs` unit tests | The `flock` single-writer lock: acquire/refuse outcome, lock-path derivation. |
 | `taski-daemon` unit tests in `lib.rs` | `should_exclude_entry`, `path_matches_exclude`, `scan_vault_with_exclude_dirs_skips_matching_directory` — exclude-dir filtering in WalkDir and watcher events. |
-| `taski-tui` unit tests (in `lib.rs`) | View model: grouping, collapse, four-axis filter composition (status + today + text search + file search), display-index↔Task mapping, selection reconciliation, failure-notice surfacing, context-pane render/scroll/toggle + `context_view` centering (headless `TestBackend` smoke). |
+| `taski-tui` unit tests (in `lib.rs`) | View model: grouping (note/tag/priority/folder via `G`, incl. tag fan-out + group ordering), collapse, five-axis filter composition (status + today + overdue + text search + file search), display-index↔Task mapping, selection reconciliation (incl. duplicate task_ids under tag grouping), failure-notice surfacing, context-pane render/scroll/toggle + `context_view` centering (headless `TestBackend` smoke). |
 | `taski-db` unit tests | `delete_tasks_for_excluded_dirs` — verifies exact-match and prefix-match SQL purges the right rows. |
 | `taski` (unified launcher) | No unit tests by design — it's thin dispatch over the two libraries. Correctness is runtime-verified (combined spawn, attach-when-held, refuse-when-held, quit-drain); see the smokes described in ADRs 0007/0008. |
 
@@ -553,12 +562,12 @@ exercised only at runtime (its `taski.db` is gitignored).
 
 | Task | Look at |
 |---|---|
-| Change how tasks are parsed / add metadata extraction | `taski-core/src/lib.rs` (`parse_tasks`, `extract_due_date`/`extract_scheduled_date` via shared `extract_emoji_date`, `ymd_from_unix`) |
+| Change how tasks are parsed / add metadata extraction | `taski-core/src/lib.rs` (`parse_tasks`, `extract_due_date`/`extract_scheduled_date`/`extract_start_date`/`extract_created_date`/`extract_done_date`/`extract_cancelled_date` via shared `extract_emoji_date`, `extract_priority`, `extract_tags`, `Priority` enum, `ymd_from_unix`) |
 | Change the DB schema | `taski-db::SCHEMA` + bump `SCHEMA_VERSION`; update `reconcile_note`/`upsert_task` |
 | Cache/read note content for the TUI context pane | `taski-db`: `note_contents` table + `upsert_note_content`/`note_content`/`delete_note_content`; daemon writes it in `index_note` ([ADR-0006](./adr/0006-note-content-cached-in-index.md)) |
 | Change write-back behavior | `taski-daemon`: `process_action` (checkbox flips) / `process_metadata_action` (`⏳` writes, ADR-0009), `atomic_write` (mind ADR-0004 TOCTOU); the drain loop dispatches on `pending_actions.action_type` |
 | Change how the TUI looks/behaves | `taski-tui/src/lib.rs`: `App`, `build_view` (filter pipeline), `context_view`/`draw_context_pane`, key handling in `run_loop` |
-| Change the TUI filter composition | `crates/taski-tui/src/lib.rs:build_view()` — ANDs status + today + text search + file search in one pass |
+| Change the TUI filter composition / grouping | `crates/taski-tui/src/lib.rs:build_view()` — ANDs five filter axes (status + today + overdue + text search + file search) and buckets survivors by the `G` grouping axis (note/tag/priority/folder; HashMap-based, tag fan-out). The 9-param function carries a documented `#[allow(clippy::too_many_arguments)]` (a parameter-struct refactor is deferred). |
 | Change keybindings (add/remove a key) | `crates/taski-tui/src/lib.rs:run_loop()` — handles three branches: `searching`, `file_searching`, and normal mode. `b` / `u` added in ADR-0011 |
 | Change context-pane keybindings/behavior | `taski-tui/src/lib.rs` key match in `run_loop` (`J`/`K` scroll, `p` toggle) + `MIN_SPLIT_WIDTH` auto-hide; `sync_context` for the read path |
 | Add/change vault directory exclusions | Add `exclude_dirs` to `~/.config/taski/config.toml`; restart daemon. Purge happens on startup — see `delete_tasks_for_excluded_dirs` in `taski-db`, `should_exclude_entry`/`path_matches_exclude` in `taski-daemon` |
@@ -594,15 +603,22 @@ A holistic review triaged these as low-value for a personal single-user tool. Th
   only when real edge cases (nested lists, callouts, inline code) actually bite.
 - **Structured write-back reason-codes** between daemon and TUI — string matching + fallback.
 - **Real DB migration path** — schema bumps drop+recreate (pre-MVP).
-- **Additional write-back token types** — only `⏳` (scheduled, ADR-0009 Phase 2) has been
-  admitted alongside checkbox flips per the ADR-0003 principled boundary. Other Obsidian
-  Tasks date-emoji tokens (priority `🔼`/`🔼`/`🔽`/`⏫`/`⏬`, recurrence `🔁`, due date `📅`)
-  remain unresearched. Each would need its own ADR, pure rewrite oracle, proptest, and
-  action-type dispatch branch — the ADR-0009 pattern is the template.
+- **Additional write-back token types** — `⏳` (scheduled, ADR-0009 Phase 2) is the only
+  metadata *write* admitted alongside checkbox flips per the ADR-0003 principled boundary.
+  Tier 1 added **read-only parsing** of six more tokens (`#tags`, priority, start/created/
+  done/cancelled dates — schema v6), but **writing** them from the TUI remains deferred.
+  Each write would need its own ADR, pure rewrite oracle, proptest, and action-type
+  dispatch branch — the ADR-0009 pattern is the template. The highest-value write is the
+  `✅`-on-toggle interop fix (Taski doesn't stamp the done date, so Tasks-plugin "done"
+  queries miss Taski-completed tasks) — see the roadmap's interop-gap section.
+- **Auto-stamp `✅`/`❌` on toggle** — the Tier 1 read path parses these dates, but the
+  toggle-done gesture does NOT yet write `✅ <today>` (see bullet above). Tier 3, needs ADR.
 - **Case-sensitive search toggle** — search is case-insensitive; a future config toggle
   could make it case-sensitive. Not needed for MVP (ADR-0010).
-- **Search by due-date / scheduled-date** — the `/` and `F` gestures cover text and file;
-  searching by date fields is a natural extension but deferred.
+- **Search by date fields beyond Overdue/Today** — `O` (overdue: `due_date < today`) and
+  `T` (today: `scheduled_date == today`) cover the common date-filter cases; arbitrary
+  date-range search (e.g. "due this week") is a natural extension but deferred. Text (`/`)
+  and file (`F`) search remain substring-only.
 - **Undo of `t` (mark-for-today)** — explicitly excluded from undo scope; `t` is already
   idempotent (ADR-0011).
 - **External change detection for undo** — undo only reverses the last TUI action, not
