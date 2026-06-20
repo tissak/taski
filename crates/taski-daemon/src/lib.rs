@@ -209,6 +209,12 @@ pub fn index_note(conn: &Connection, abs_path: &Path, vault_root: &Path) -> Resu
     let tasks = parse_tasks(markdown, &rel);
     let summary = db::reconcile_note(conn, &rel, &tasks, Some(&hash), mtime)
         .with_context(|| format!("reconciling tasks for {rel:?}"))?;
+    // ADR-0006: cache the note's full text in the same scan pass so the read-only TUI
+    // can render a task's surrounding context without ever opening the vault. Content,
+    // note_hash, and task line_numbers all derive from this same byte snapshot, so any
+    // single poll the TUI performs sees an internally consistent view.
+    db::upsert_note_content(conn, &rel, markdown, Some(&hash))
+        .with_context(|| format!("caching note content for {rel:?}"))?;
     tracing::debug!(
         ?rel,
         total = tasks.len(),
@@ -326,10 +332,17 @@ fn handle_debounced_event(conn: &Connection, abs_path: &Path, vault_root: &Path)
         }
     } else {
         match relative_to_vault(abs_path, vault_root) {
-            Ok(rel) => match db::delete_tasks_for_note(conn, &rel) {
-                Ok(()) => tracing::info!(?rel, "removed tasks for deleted note"),
-                Err(e) => tracing::error!(?rel, err = %e, "delete_tasks_for_note failed"),
-            },
+            Ok(rel) => {
+                match db::delete_tasks_for_note(conn, &rel) {
+                    Ok(()) => tracing::info!(?rel, "removed tasks for deleted note"),
+                    Err(e) => tracing::error!(?rel, err = %e, "delete_tasks_for_note failed"),
+                }
+                // ADR-0006: drop the cached content too, so the index never carries
+                // content for a deleted note.
+                if let Err(e) = db::delete_note_content(conn, &rel) {
+                    tracing::error!(?rel, err = %e, "delete_note_content failed");
+                }
+            }
             Err(e) => {
                 tracing::warn!(?abs_path, err = %e, "could not compute relative path on remove")
             }

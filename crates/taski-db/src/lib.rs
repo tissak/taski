@@ -15,8 +15,10 @@ use rusqlite::Connection;
 // and `Task` into scope within this module.
 pub use taski_core::{Status, Task};
 
-/// The canonical schema v2 (ADR-0005): surrogate rowid identity + content-hash
-/// reconciliation. Created with `IF NOT EXISTS` so [`ensure_schema`] is idempotent.
+/// The canonical schema v3. v2 added surrogate rowid identity + content-hash
+/// reconciliation (ADR-0005); v3 adds the `note_contents` cache that backs the read-only
+/// TUI context pane (ADR-0006). Created with `IF NOT EXISTS` so [`ensure_schema`] is
+/// idempotent.
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS tasks (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,15 +48,28 @@ CREATE TABLE IF NOT EXISTS pending_actions (
   resolved_at       INTEGER,
   error             TEXT
 );
+
+-- ADR-0006: full-text cache of each indexed note, so the read-only TUI can render a
+-- task's surrounding context without ever opening a vault file. One row per note
+-- (deduped across the note's tasks). The daemon writes it in the same `index_note`
+-- pass that parses tasks, so `content`/`note_hash`/task `line_number` all come from the
+-- same byte snapshot. The TUI picks the rendered window; windowing is not stored.
+CREATE TABLE IF NOT EXISTS note_contents (
+  note_path   TEXT PRIMARY KEY,
+  content     TEXT NOT NULL,
+  note_hash   TEXT,
+  updated_at  INTEGER NOT NULL
+);
 ";
 
 /// Schema version tag stored in `PRAGMA user_version`. Increment when the schema
 /// changes in a backward-incompatible way.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Ensure the database schema exists and is at the current version. If the DB predates
-/// v2, the old tables are dropped and recreated (pre-MVP: no data to preserve). A
-/// one-line note is logged via `eprintln` so it's visible even before tracing is set up.
+/// the current version, the old tables are dropped and recreated (pre-MVP: no data to
+/// preserve). A one-line note is logged via `eprintln` so it's visible even before
+/// tracing is set up.
 fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version < SCHEMA_VERSION {
@@ -63,9 +78,12 @@ fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
                 "taski-db: schema v{version} -> v{SCHEMA_VERSION}; recreating tables (any pending actions will be lost)"
             );
         }
-        // Drop both tables so the fresh CREATE is clean. Order matters: pending_actions
-        // has no FK but dropping tasks first is harmless.
-        conn.execute_batch("DROP TABLE IF EXISTS pending_actions; DROP TABLE IF EXISTS tasks;")?;
+        // Drop all tables so the fresh CREATE is clean. Order is harmless (no FKs).
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS pending_actions;
+             DROP TABLE IF EXISTS note_contents;
+             DROP TABLE IF EXISTS tasks;",
+        )?;
     }
     conn.execute_batch(SCHEMA)?;
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
@@ -122,6 +140,80 @@ pub fn upsert_task(conn: &Connection, task: &Task) -> rusqlite::Result<()> {
 pub fn delete_tasks_for_note(conn: &Connection, note_path: &str) -> rusqlite::Result<()> {
     conn.execute(
         "DELETE FROM tasks WHERE note_path = ?1",
+        rusqlite::params![note_path],
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// note_contents: per-note full-text cache for the read-only TUI context pane
+// (ADR-0006). The daemon writes it in the same `index_note` pass that parses
+// tasks; the TUI reads it like any other index data.
+// ---------------------------------------------------------------------------
+
+/// One indexed note's cached content (ADR-0006). The TUI reads this to render a task's
+/// surrounding context without ever opening a vault file. `note_hash` mirrors the hash
+/// stored on the note's task rows (same scan), so the TUI can cheaply tell when its
+/// cached content is stale and needs re-reading.
+#[derive(Debug, Clone)]
+pub struct NoteContent {
+    /// Note path relative to the vault root (the same key used by `tasks.note_path`).
+    pub note_path: String,
+    /// Full UTF-8 text of the note at last scan.
+    pub content: String,
+    /// Content hash captured at the same scan (mirrors the note's `tasks.note_hash`).
+    pub note_hash: Option<String>,
+    /// Unix seconds the row was last written. Informational.
+    pub updated_at: i64,
+}
+
+/// Insert or replace the cached content for one note (ADR-0006). Called by the daemon
+/// during `index_note`, in the same pass that reconciles the note's tasks, so the
+/// content and the task rows always reflect the same byte snapshot.
+pub fn upsert_note_content(
+    conn: &Connection,
+    note_path: &str,
+    content: &str,
+    note_hash: Option<&str>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO note_contents (note_path, content, note_hash, updated_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![note_path, content, note_hash, unix_now()],
+    )?;
+    Ok(())
+}
+
+/// Read the cached content for one note, or `None` if the note is not cached (e.g. a
+/// pre-v3 DB, a note that failed to scan, or a note path the TUI has no task for).
+pub fn note_content(conn: &Connection, note_path: &str) -> rusqlite::Result<Option<NoteContent>> {
+    let row = conn.query_row(
+        "SELECT note_path, content, note_hash, updated_at
+         FROM note_contents
+         WHERE note_path = ?1",
+        rusqlite::params![note_path],
+        |row| {
+            Ok(NoteContent {
+                note_path: row.get(0)?,
+                content: row.get(1)?,
+                note_hash: row.get(2)?,
+                updated_at: row.get(3)?,
+            })
+        },
+    );
+    match row {
+        Ok(nc) => Ok(Some(nc)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Delete the cached content for one note. Called by the daemon on note removal,
+/// alongside [`delete_tasks_for_note`], so the index never carries content for a
+/// deleted note.
+pub fn delete_note_content(conn: &Connection, note_path: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM note_contents WHERE note_path = ?1",
         rusqlite::params![note_path],
     )?;
     Ok(())
@@ -525,6 +617,60 @@ mod tests {
         // Deleting a note with no rows is a no-op (and not an error).
         delete_tasks_for_note(&conn, "nonexistent.md").unwrap();
         assert_eq!(all_tasks(&conn).unwrap().len(), 1);
+    }
+
+    /// ADR-0006: `note_contents` round-trips and `note_content` returns `None` for an
+    /// uncached note. A second upsert on the same `note_path` replaces in place.
+    #[test]
+    fn note_contents_upsert_read_round_trip() {
+        let conn = open(":memory:").unwrap();
+        // Absent note -> None (not an error).
+        assert!(note_content(&conn, "missing.md").unwrap().is_none());
+
+        upsert_note_content(&conn, "a.md", "# Heading\n- [ ] task\n", Some("hash-a")).unwrap();
+        let nc = note_content(&conn, "a.md")
+            .unwrap()
+            .expect("cached note should be present");
+        assert_eq!(nc.note_path, "a.md");
+        assert_eq!(nc.content, "# Heading\n- [ ] task\n");
+        assert_eq!(nc.note_hash.as_deref(), Some("hash-a"));
+        assert!(nc.updated_at > 0, "updated_at should be a real timestamp");
+
+        // Same note_path -> replace (no row growth, fields updated).
+        upsert_note_content(&conn, "a.md", "rewritten\n", Some("hash-a2")).unwrap();
+        let nc2 = note_content(&conn, "a.md").unwrap().unwrap();
+        assert_eq!(nc2.content, "rewritten\n");
+        assert_eq!(nc2.note_hash.as_deref(), Some("hash-a2"));
+
+        // Exactly one row for a.md.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM note_contents WHERE note_path = 'a.md'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "upsert should replace, not insert a second row");
+    }
+
+    /// ADR-0006: `delete_note_content` removes only the targeted note's cached content.
+    #[test]
+    fn delete_note_content_removes_only_target() {
+        let conn = open(":memory:").unwrap();
+        upsert_note_content(&conn, "a.md", "a", None).unwrap();
+        upsert_note_content(&conn, "b.md", "b", None).unwrap();
+        assert!(note_content(&conn, "a.md").unwrap().is_some());
+        assert!(note_content(&conn, "b.md").unwrap().is_some());
+
+        delete_note_content(&conn, "a.md").unwrap();
+        assert!(note_content(&conn, "a.md").unwrap().is_none());
+        assert!(
+            note_content(&conn, "b.md").unwrap().is_some(),
+            "b.md must survive deleting a.md"
+        );
+
+        // Deleting a never-cached note is a no-op (not an error).
+        delete_note_content(&conn, "never-existed.md").unwrap();
     }
 
     #[test]
