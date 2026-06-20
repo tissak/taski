@@ -9,7 +9,7 @@
 //! The TUI only ever reads via `db::all_tasks` and writes via `db::enqueue_action`
 //! (a row in `pending_actions` the daemon drains); it never touches vault files.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,7 +29,7 @@ use ratatui::{Frame, Terminal};
 use rusqlite::Connection;
 
 use taski_db as db;
-use taski_db::{NoteContent, PendingAction, Status, Task};
+use taski_db::{NoteContent, PendingAction, Priority, Status, Task};
 
 /// CLI configuration. `--db` is optional and overrides `db` in the config file
 /// (`~/.config/taski/config.toml`, overridable via `TASKI_CONFIG`); see
@@ -194,6 +194,96 @@ impl StatusFilter {
     }
 }
 
+/// Grouping axis cycled with `G`: Note → Tag → Priority → Folder → Note. The
+/// default is Note (the classic "one group per source file" view). Tag fans out
+/// a single task to multiple groups; Priority and Folder produce exactly one key
+/// per task.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GroupBy {
+    Note,
+    Tag,
+    Priority,
+    Folder,
+}
+
+impl GroupBy {
+    /// Cycle to the next axis: Note → Tag → Priority → Folder → Note.
+    fn next(self) -> Self {
+        match self {
+            GroupBy::Note => GroupBy::Tag,
+            GroupBy::Tag => GroupBy::Priority,
+            GroupBy::Priority => GroupBy::Folder,
+            GroupBy::Folder => GroupBy::Note,
+        }
+    }
+
+    /// Short label for the title-bar indicator.
+    fn label(self) -> &'static str {
+        match self {
+            GroupBy::Note => "note",
+            GroupBy::Tag => "tag",
+            GroupBy::Priority => "priority",
+            GroupBy::Folder => "folder",
+        }
+    }
+}
+
+/// Return the group key(s) for a task under the given axis. `Tag` can fan out to
+/// multiple keys (one per tag); the other axes always return exactly one.
+/// Untagged tasks go to `(untagged)`, no-priority/unknown to `(no priority)`,
+/// no-folder (top-level note) to `(root)`.
+fn group_keys(task: &Task, axis: GroupBy) -> Vec<String> {
+    match axis {
+        GroupBy::Note => vec![task.note_path.clone()],
+        GroupBy::Tag => {
+            if task.tags.is_empty() {
+                vec!["(untagged)".to_string()]
+            } else {
+                task.tags.to_vec()
+            }
+        }
+        GroupBy::Priority => vec![priority_group_label(task.priority.as_ref())],
+        GroupBy::Folder => vec![folder_of(&task.note_path)],
+    }
+}
+
+/// Human-readable label for a task's priority bucket. `Other` (unknown glyph)
+/// and `None` both collapse to `(no priority)` so the group list stays clean.
+fn priority_group_label(priority: Option<&Priority>) -> String {
+    match priority {
+        Some(Priority::Highest) => "Highest".to_string(),
+        Some(Priority::High) => "High".to_string(),
+        Some(Priority::Medium) => "Medium".to_string(),
+        Some(Priority::Low) => "Low".to_string(),
+        Some(Priority::Lowest) => "Lowest".to_string(),
+        Some(Priority::Other(_)) | None => "(no priority)".to_string(),
+    }
+}
+
+/// The parent directory of a note path, or `(root)` for top-level notes.
+fn folder_of(note_path: &str) -> String {
+    Path::new(note_path)
+        .parent()
+        .and_then(|p| p.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("(root)")
+        .to_string()
+}
+
+/// Sort rank for priority-group headers: 0 = Highest … 4 = Lowest, 5 = (no
+/// priority). Used to order Priority-axis groups by importance (alphabetical
+/// would wrongly put "Lowest" before "Medium").
+fn priority_sort_rank(label: &str) -> u8 {
+    match label {
+        "Highest" => 0,
+        "High" => 1,
+        "Medium" => 2,
+        "Low" => 3,
+        "Lowest" => 4,
+        _ => 5,
+    }
+}
+
 /// One renderable row in the grouped list. `Header` carries per-note counts computed
 /// from the full (unfiltered) task set so the triage overview stays accurate under any
 /// filter; `Task` carries the task the cursor can act on. The `Task` arm is boxed so
@@ -202,7 +292,7 @@ impl StatusFilter {
 #[derive(Debug, Clone)]
 enum DisplayRow {
     Header {
-        note_path: String,
+        group_key: String,
         open_count: usize,
         total_count: usize,
         collapsed: bool,
@@ -213,22 +303,32 @@ enum DisplayRow {
 }
 
 impl DisplayRow {
-    /// The note this row belongs to (the header's note, or the task's source note).
+    /// The group key this row belongs to (the header's key, or the task's source
+    /// note path). For non-Note axes the header's key is the group label (tag,
+    /// priority, folder) rather than a file path.
     fn note_path(&self) -> &str {
         match self {
-            DisplayRow::Header { note_path, .. } => note_path,
+            DisplayRow::Header { group_key, .. } => group_key,
             DisplayRow::Task { task } => &task.note_path,
         }
     }
 }
 
 /// Build the flat list of display rows from the raw task list, the active filter, and
-/// the set of expanded note paths. Tasks are assumed sorted by `(note_path,
-/// line_number)` — the order `db::all_tasks` returns — so each note's tasks form a
-/// contiguous run, naturally in line order within the group.
+/// the set of expanded group keys. Tasks are assumed sorted by `(note_path,
+/// line_number)` — the order `db::all_tasks` returns — so within each group the task
+/// order is preserved from the input (line order for the Note axis).
 ///
-/// Groups default to **collapsed**: a note not present in `expanded` is folded. This
-/// inverts the natural "track what's open" model so newly-appearing notes (added by
+/// `group_by` controls the grouping axis (cycled with `G`):
+/// - **Note** (default): one group per source note path.
+/// - **Tag**: one group per tag; an untagged task goes to `(untagged)`. A task with
+///   multiple tags appears in every matching group (fan-out).
+/// - **Priority**: one group per priority level (`Highest` … `Lowest`), ordered by
+///   importance; no-priority / unknown goes to `(no priority)`.
+/// - **Folder**: one group per parent directory; top-level notes go to `(root)`.
+///
+/// Groups default to **collapsed**: a key not present in `expanded` is folded. This
+/// inverts the natural "track what's open" model so newly-appearing groups (added by
 /// the daemon between refreshes) also start collapsed without special handling.
 ///
 /// Groups with no filter-matching task are hidden entirely (no empty headers).
@@ -249,8 +349,8 @@ impl DisplayRow {
 /// overdue review. String comparison `d < today` is valid for `YYYY-MM-DD`
 /// (lexicographic == chronological for zero-padded ISO dates).
 //
-// `too_many_arguments`: each parameter is an independent filter axis (status,
-// today, search, file, overdue) plus its required context (tasks, expanded,
+// `too_many_arguments`: each parameter is an independent filter/grouping axis (status,
+// today, search, file, overdue, group-by) plus its required context (tasks, expanded,
 // today-string). A parameter struct was considered but would churn every call
 // site for no clarity gain on an internal, heavily-tested function. The allow
 // is intentional.
@@ -264,6 +364,7 @@ fn build_view(
     search_query: &str,
     file_query: &str,
     overdue_only: bool,
+    group_by: GroupBy,
 ) -> Vec<DisplayRow> {
     let scheduled_today =
         |t: &Task| -> bool { !today_only || t.scheduled_date.as_deref() == Some(today) };
@@ -278,44 +379,68 @@ fn build_view(
     };
     let not_overdue =
         |t: &Task| -> bool { !overdue_only || t.due_date.as_deref().is_some_and(|d| d < today) };
-    let mut rows = Vec::new();
-    let mut i = 0;
-    while i < tasks.len() {
-        let note_path = tasks[i].note_path.clone();
-        let mut j = i;
-        while j < tasks.len() && tasks[j].note_path == note_path {
-            j += 1;
-        }
-        let group = &tasks[i..j];
-        let total_count = group.len();
-        let open_count = group.iter().filter(|t| t.status == Status::Open).count();
-        let visible: Vec<&Task> = group
-            .iter()
-            .filter(|t| {
-                filter.matches(&t.status)
-                    && scheduled_today(t)
-                    && matches_search(t)
-                    && matches_file(t)
-                    && not_overdue(t)
-            })
-            .collect();
-        if !visible.is_empty() {
-            let is_expanded = expanded.contains(&note_path);
-            rows.push(DisplayRow::Header {
-                note_path,
-                open_count,
-                total_count,
-                collapsed: !is_expanded,
-            });
-            if is_expanded {
-                for t in visible {
-                    rows.push(DisplayRow::Task {
-                        task: Box::new(t.clone()),
-                    });
-                }
+    let passes_filters = |t: &Task| -> bool {
+        filter.matches(&t.status)
+            && scheduled_today(t)
+            && matches_search(t)
+            && matches_file(t)
+            && not_overdue(t)
+    };
+
+    // Bucket tasks by group key.  `order` preserves first-seen ordering (so
+    // within a given sort the relative position of same-rank keys is stable);
+    // `index` maps key → position in `buckets`.  For the Tag axis a task may
+    // land in multiple buckets.
+    let mut order: Vec<String> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut buckets: Vec<Vec<&Task>> = Vec::new();
+
+    for t in tasks {
+        for key in group_keys(t, group_by) {
+            if let Some(&i) = index.get(&key) {
+                buckets[i].push(t);
+            } else {
+                index.insert(key.clone(), buckets.len());
+                order.push(key);
+                buckets.push(vec![t]);
             }
         }
-        i = j;
+    }
+
+    // Sort group order: Priority by importance, everything else alphabetical.
+    if group_by == GroupBy::Priority {
+        order.sort_by_key(|k| priority_sort_rank(k));
+    } else {
+        order.sort();
+    }
+
+    let mut rows = Vec::new();
+    for key in &order {
+        let bucket = &buckets[index[key]];
+        let total_count = bucket.len();
+        let open_count = bucket.iter().filter(|t| t.status == Status::Open).count();
+        let visible: Vec<&Task> = bucket
+            .iter()
+            .copied()
+            .filter(|t| passes_filters(t))
+            .collect();
+        if visible.is_empty() {
+            continue;
+        }
+        let is_expanded = expanded.contains(key.as_str());
+        rows.push(DisplayRow::Header {
+            group_key: key.clone(),
+            open_count,
+            total_count,
+            collapsed: !is_expanded,
+        });
+        if is_expanded {
+            for t in visible {
+                rows.push(DisplayRow::Task {
+                    task: Box::new(t.clone()),
+                });
+            }
+        }
     }
     rows
 }
@@ -438,6 +563,11 @@ struct App {
     overdue_only: bool,
     /// ADR-0011: the last enqueued write action, for undo (`u` key).
     last_action: Option<LastAction>,
+    /// Grouping axis cycled with `G` (Note → Tag → Priority → Folder). Defaults
+    /// to Note. The `expanded` set keys match the active axis's group labels, so
+    /// switching axes naturally starts every group collapsed (old keys won't
+    /// match the new axis's labels) without needing to clear the set.
+    group_by: GroupBy,
 }
 
 /// ADR-0011: information needed to reverse the last write action.
@@ -482,6 +612,7 @@ impl App {
             file_searching: false,
             overdue_only: false,
             last_action: None,
+            group_by: GroupBy::Note,
         }
     }
 
@@ -509,6 +640,7 @@ impl App {
             &self.search_query,
             &self.file_query,
             self.overdue_only,
+            self.group_by,
         );
         reconcile_view_selection(&self.rows, note.as_deref(), task_id, idx, &mut self.state);
     }
@@ -639,6 +771,15 @@ impl App {
         self.ctx_scroll = 0;
     }
 
+    /// `G`: cycle the grouping axis Note → Tag → Priority → Folder → Note.
+    /// Does not clear `expanded` — stale keys from the old axis naturally won't
+    /// match the new axis's group labels, so every group starts collapsed.
+    fn cycle_group_by(&mut self) {
+        self.group_by = self.group_by.next();
+        self.rebuild();
+        self.ctx_scroll = 0;
+    }
+
     /// `T`: toggle the ADR-0009 "Today" view — when on, `build_view` additionally
     /// restricts the list to tasks whose `scheduled_date == today`. Independent of
     /// the `f` status-cycle. Lowercase `t` is intentionally NOT bound (reserved for
@@ -665,6 +806,11 @@ impl App {
     /// header; `→` forces expand; `←` forces collapse and, when pressed on a task row,
     /// collapses that task's parent group (fold from inside). All other key/row
     /// combinations are no-ops.
+    ///
+    /// For the fold-from-task gesture (`←` on a task), the parent group key is
+    /// found by scanning backwards from the cursor for the nearest preceding
+    /// Header — under non-Note axes the group key is no longer the task's own
+    /// `note_path`.
     fn toggle_at_cursor(&mut self, mode: ToggleMode) {
         let action: Option<(String, bool)> = {
             let Some(idx) = self.state.selected() else {
@@ -674,32 +820,38 @@ impl App {
                 return;
             };
             match row {
-                DisplayRow::Header { note_path, .. } => {
-                    let is_expanded = self.expanded.contains(note_path.as_str());
+                DisplayRow::Header { group_key, .. } => {
+                    let is_expanded = self.expanded.contains(group_key.as_str());
                     let want_expanded = match mode {
                         ToggleMode::Toggle => !is_expanded,
                         ToggleMode::Expand => true,
                         ToggleMode::Collapse => false,
                     };
-                    Some((note_path.clone(), want_expanded))
+                    Some((group_key.clone(), want_expanded))
                 }
-                DisplayRow::Task { task } => {
-                    // Only `←` (Collapse) is meaningful on a task: fold its parent.
+                DisplayRow::Task { .. } => {
+                    // Only `←` (Collapse) is meaningful on a task: fold its
+                    // parent group. Scan backwards for the nearest preceding
+                    // Header to find the group key (works under any axis).
                     if matches!(mode, ToggleMode::Collapse) {
-                        Some((task.note_path.clone(), false))
+                        let key = self.rows[..idx].iter().rev().find_map(|r| match r {
+                            DisplayRow::Header { group_key, .. } => Some(group_key.clone()),
+                            _ => None,
+                        });
+                        key.map(|k| (k, false))
                     } else {
                         None
                     }
                 }
             }
         };
-        let Some((note, want_expanded)) = action else {
+        let Some((key, want_expanded)) = action else {
             return;
         };
         if want_expanded {
-            self.expanded.insert(note);
+            self.expanded.insert(key);
         } else {
-            self.expanded.remove(&note);
+            self.expanded.remove(&key);
         }
         self.rebuild();
         self.ctx_scroll = 0;
@@ -708,8 +860,8 @@ impl App {
     /// `Tab`: expand every group currently visible.
     fn expand_all(&mut self) {
         for row in &self.rows {
-            if let DisplayRow::Header { note_path, .. } = row {
-                self.expanded.insert(note_path.clone());
+            if let DisplayRow::Header { group_key, .. } = row {
+                self.expanded.insert(group_key.clone());
             }
         }
         self.rebuild();
@@ -1012,6 +1164,8 @@ fn run_loop(
                 KeyCode::Right => app.toggle_at_cursor(ToggleMode::Expand),
                 KeyCode::Left => app.toggle_at_cursor(ToggleMode::Collapse),
                 KeyCode::Char('f') => app.cycle_filter(),
+                // `G`: cycle the grouping axis (Note → Tag → Priority → Folder).
+                KeyCode::Char('G') => app.cycle_group_by(),
                 // ADR-0009 Phase 2: `t` marks the selected task for today (or clears it
                 // if already scheduled today) via the daemon's write-back queue — the
                 // first non-checkbox vault write. Uppercase `T` toggles the read-only
@@ -1215,6 +1369,13 @@ fn draw(frame: &mut Frame, app: &mut App) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::raw("  ·  "),
+        Span::styled(
+            format!("group: {}", app.group_by.label()),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
     ];
     // ADR-0009 Phase 1: surface the Today view state so the user can see it's on.
     if app.today_only {
@@ -1359,6 +1520,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Span::raw(" collapse/expand  ·  "),
             Span::styled("f", Style::default().fg(Color::Yellow)),
             Span::raw(" filter  ·  "),
+            Span::styled("G", Style::default().fg(Color::Yellow)),
+            Span::raw(" group by  ·  "),
             Span::styled("T", Style::default().fg(Color::Yellow)),
             Span::raw(" today  ·  "),
             Span::styled("O", Style::default().fg(Color::Yellow)),
@@ -1396,7 +1559,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
 fn row_to_item(row: &DisplayRow, today: &str) -> ListItem<'static> {
     match row {
         DisplayRow::Header {
-            note_path,
+            group_key,
             open_count,
             total_count,
             collapsed,
@@ -1410,7 +1573,7 @@ fn row_to_item(row: &DisplayRow, today: &str) -> ListItem<'static> {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    note_path.clone(),
+                    group_key.clone(),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("   "),
@@ -1640,15 +1803,29 @@ mod tests {
         t
     }
 
+    /// Build a task with the given tags (for Tag-axis tests).
+    fn task_with_tags(id: i64, raw: &str, line: usize, note: &str, tags: &[&str]) -> Task {
+        let mut t = task(id, raw, line, note);
+        t.tags = tags.iter().map(|s| s.to_string()).collect();
+        t
+    }
+
+    /// Build a task with the given priority (for Priority-axis tests).
+    fn task_with_priority(id: i64, raw: &str, line: usize, note: &str, p: Priority) -> Task {
+        let mut t = task(id, raw, line, note);
+        t.priority = Some(p);
+        t
+    }
+
     /// Unpack a header row for assertions.
     fn header(row: &DisplayRow) -> (&str, usize, usize, bool) {
         match row {
             DisplayRow::Header {
-                note_path,
+                group_key,
                 open_count,
                 total_count,
                 collapsed,
-            } => (note_path, *open_count, *total_count, *collapsed),
+            } => (group_key, *open_count, *total_count, *collapsed),
             _ => panic!("expected a header row"),
         }
     }
@@ -1737,6 +1914,7 @@ mod tests {
             "",
             "",
             false,
+            GroupBy::Note,
         );
         // Two collapsed groups -> two headers, no task rows.
         assert_eq!(rows.len(), 2);
@@ -1765,6 +1943,7 @@ mod tests {
             "",
             "",
             false,
+            GroupBy::Note,
         );
         assert_eq!(rows.len(), 3, "header + two tasks");
         assert!(matches!(rows[0], DisplayRow::Header { .. }));
@@ -1786,6 +1965,7 @@ mod tests {
             "",
             "",
             false,
+            GroupBy::Note,
         );
         assert_eq!(rows.len(), 2, "header + only the open task");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
@@ -1808,6 +1988,7 @@ mod tests {
             "",
             "",
             false,
+            GroupBy::Note,
         );
         // Only alpha has an open task; beta is hidden under the Open filter.
         assert_eq!(rows.len(), 1);
@@ -1828,6 +2009,7 @@ mod tests {
             "",
             "",
             false,
+            GroupBy::Note,
         );
         match &rows[1] {
             DisplayRow::Task { task } => {
@@ -2075,7 +2257,7 @@ mod tests {
     #[test]
     fn reconcile_view_selection_picks_first_when_was_none() {
         let rows = vec![DisplayRow::Header {
-            note_path: "a.md".to_string(),
+            group_key: "a.md".to_string(),
             open_count: 1,
             total_count: 1,
             collapsed: true,
@@ -2091,7 +2273,7 @@ mod tests {
     fn reconcile_view_selection_follows_visible_task() {
         let rows1 = vec![
             DisplayRow::Header {
-                note_path: "a.md".to_string(),
+                group_key: "a.md".to_string(),
                 open_count: 2,
                 total_count: 2,
                 collapsed: false,
@@ -2109,7 +2291,7 @@ mod tests {
         // A rebuild where task 11 moved up to index 1 (e.g. task 10 deleted).
         let rows2 = vec![
             DisplayRow::Header {
-                note_path: "a.md".to_string(),
+                group_key: "a.md".to_string(),
                 open_count: 1,
                 total_count: 1,
                 collapsed: false,
@@ -2804,6 +2986,7 @@ mod tests {
             "",
             "",
             false,
+            GroupBy::Note,
         );
         // Only alpha.md has a today-matching task; one collapsed header.
         assert_eq!(rows.len(), 1);
@@ -2830,6 +3013,7 @@ mod tests {
             "",
             "",
             false,
+            GroupBy::Note,
         );
         assert_eq!(rows.len(), 2, "header + one task");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
@@ -2843,6 +3027,7 @@ mod tests {
             "",
             "",
             false,
+            GroupBy::Note,
         );
         assert_eq!(rows.len(), 3, "header + two tasks");
     }
@@ -2900,6 +3085,7 @@ mod tests {
             "",
             "",
             false,
+            GroupBy::Note,
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(header(&rows[0]).0, "alpha.md");
@@ -2966,6 +3152,7 @@ mod tests {
             "",
             "",
             true,
+            GroupBy::Note,
         );
         // Only alpha.md (past-due) survives; one collapsed header.
         assert_eq!(rows.len(), 1);
@@ -2991,6 +3178,7 @@ mod tests {
             "",
             "",
             true,
+            GroupBy::Note,
         );
         assert!(rows.is_empty(), "none are past-due");
     }
@@ -3014,6 +3202,7 @@ mod tests {
             "",
             "",
             false,
+            GroupBy::Note,
         );
         assert_eq!(rows.len(), 3, "all three note headers visible");
     }
@@ -3039,6 +3228,7 @@ mod tests {
             "",
             "",
             true,
+            GroupBy::Note,
         );
         assert_eq!(rows.len(), 2, "header + one open past-due task");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
@@ -3053,6 +3243,7 @@ mod tests {
             "",
             "",
             true,
+            GroupBy::Note,
         );
         assert_eq!(rows.len(), 2, "header + one done past-due task");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 2));
@@ -3083,6 +3274,7 @@ mod tests {
             "",
             "",
             true,
+            GroupBy::Note,
         );
         assert_eq!(rows.len(), 2, "header + one task matching both filters");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
@@ -3154,6 +3346,7 @@ mod tests {
             "deploy",
             "",
             false,
+            GroupBy::Note,
         );
         assert_eq!(rows.len(), 3, "header + two matching tasks");
         let task_ids: Vec<i64> = rows
@@ -3191,6 +3384,7 @@ mod tests {
             "DEPLOY",
             "",
             false,
+            GroupBy::Note,
         );
         assert_eq!(rows.len(), 2, "header + one matching task");
     }
@@ -3216,6 +3410,7 @@ mod tests {
             "",
             "deploy",
             false,
+            GroupBy::Note,
         );
         assert_eq!(
             rows.len(),
@@ -3243,6 +3438,7 @@ mod tests {
             "",
             "",
             false,
+            GroupBy::Note,
         );
         assert_eq!(rows.len(), 3, "header + two tasks — no filtering");
     }
@@ -3273,6 +3469,7 @@ mod tests {
             "deploy",
             "",
             false,
+            GroupBy::Note,
         );
         assert_eq!(rows.len(), 2, "header + one task (open)");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
@@ -3306,6 +3503,7 @@ mod tests {
             "deploy",
             "",
             false,
+            GroupBy::Note,
         );
         assert_eq!(rows.len(), 2, "header + one task (today + search)");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
@@ -3394,6 +3592,7 @@ mod tests {
             "",
             "DEPLOYMENT",
             false,
+            GroupBy::Note,
         );
         assert_eq!(
             rows.len(),
@@ -3426,6 +3625,7 @@ mod tests {
             "common",
             "alpha",
             false,
+            GroupBy::Note,
         );
         assert_eq!(rows.len(), 2, "alpha header + its task");
     }
@@ -3449,6 +3649,7 @@ mod tests {
             "",
             "beta",
             false,
+            GroupBy::Note,
         );
         assert_eq!(rows.len(), 2, "beta header + one open task");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 2));
@@ -3478,8 +3679,615 @@ mod tests {
             "deploy",
             "alpha",
             false,
+            GroupBy::Note,
         );
         assert_eq!(rows.len(), 2, "header + one task");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
+    }
+
+    // ── Group-by axis (G key) tests ──────────────────────────────────
+
+    /// `group_keys` returns exactly one key for the Note axis.
+    #[test]
+    fn group_keys_note_axis_returns_note_path() {
+        let t = task(1, " ", 1, "dir/note.md");
+        let keys = group_keys(&t, GroupBy::Note);
+        assert_eq!(keys, vec!["dir/note.md"]);
+    }
+
+    /// `group_keys` returns one key per tag for the Tag axis.
+    #[test]
+    fn group_keys_tag_axis_fans_out() {
+        let t = task_with_tags(1, " ", 1, "n.md", &["work", "urgent"]);
+        let keys = group_keys(&t, GroupBy::Tag);
+        assert_eq!(keys, vec!["work", "urgent"]);
+    }
+
+    /// `group_keys` sends untagged tasks to `(untagged)`.
+    #[test]
+    fn group_keys_tag_axis_untagged_bucket() {
+        let t = task(1, " ", 1, "n.md");
+        let keys = group_keys(&t, GroupBy::Tag);
+        assert_eq!(keys, vec!["(untagged)"]);
+    }
+
+    /// `group_keys` returns the priority label for the Priority axis.
+    #[test]
+    fn group_keys_priority_axis() {
+        let t = task_with_priority(1, " ", 1, "n.md", Priority::High);
+        let keys = group_keys(&t, GroupBy::Priority);
+        assert_eq!(keys, vec!["High"]);
+    }
+
+    /// `group_keys` sends no-priority tasks to `(no priority)`.
+    #[test]
+    fn group_keys_priority_axis_no_priority() {
+        let t = task(1, " ", 1, "n.md");
+        let keys = group_keys(&t, GroupBy::Priority);
+        assert_eq!(keys, vec!["(no priority)"]);
+    }
+
+    /// `group_keys` returns the parent directory for the Folder axis.
+    #[test]
+    fn group_keys_folder_axis_nested() {
+        let t = task(1, " ", 1, "projects/work/note.md");
+        let keys = group_keys(&t, GroupBy::Folder);
+        assert_eq!(keys, vec!["projects/work"]);
+    }
+
+    /// `group_keys` sends top-level notes to `(root)` for the Folder axis.
+    #[test]
+    fn group_keys_folder_axis_root() {
+        let t = task(1, " ", 1, "note.md");
+        let keys = group_keys(&t, GroupBy::Folder);
+        assert_eq!(keys, vec!["(root)"]);
+    }
+
+    /// `folder_of` extracts parent dirs and returns `(root)` for top-level notes.
+    #[test]
+    fn folder_of_handles_various_paths() {
+        assert_eq!(folder_of("note.md"), "(root)");
+        assert_eq!(folder_of("dir/note.md"), "dir");
+        assert_eq!(folder_of("a/b/c/note.md"), "a/b/c");
+    }
+
+    /// `priority_group_label` maps each priority variant to its display label.
+    #[test]
+    fn priority_group_label_maps_all_variants() {
+        assert_eq!(priority_group_label(Some(&Priority::Highest)), "Highest");
+        assert_eq!(priority_group_label(Some(&Priority::High)), "High");
+        assert_eq!(priority_group_label(Some(&Priority::Medium)), "Medium");
+        assert_eq!(priority_group_label(Some(&Priority::Low)), "Low");
+        assert_eq!(priority_group_label(Some(&Priority::Lowest)), "Lowest");
+        assert_eq!(
+            priority_group_label(Some(&Priority::Other("??".to_string()))),
+            "(no priority)"
+        );
+        assert_eq!(priority_group_label(None), "(no priority)");
+    }
+
+    /// `priority_sort_rank` orders by importance (Highest first).
+    #[test]
+    fn priority_sort_rank_orders_by_importance() {
+        assert_eq!(priority_sort_rank("Highest"), 0);
+        assert_eq!(priority_sort_rank("High"), 1);
+        assert_eq!(priority_sort_rank("Medium"), 2);
+        assert_eq!(priority_sort_rank("Low"), 3);
+        assert_eq!(priority_sort_rank("Lowest"), 4);
+        assert_eq!(priority_sort_rank("(no priority)"), 5);
+    }
+
+    /// `GroupBy::next` cycles Note → Tag → Priority → Folder → Note.
+    #[test]
+    fn group_by_cycles_through_all_axes() {
+        assert_eq!(GroupBy::Note.next(), GroupBy::Tag);
+        assert_eq!(GroupBy::Tag.next(), GroupBy::Priority);
+        assert_eq!(GroupBy::Priority.next(), GroupBy::Folder);
+        assert_eq!(GroupBy::Folder.next(), GroupBy::Note);
+    }
+
+    /// `GroupBy::label` returns the short title-bar string.
+    #[test]
+    fn group_by_labels() {
+        assert_eq!(GroupBy::Note.label(), "note");
+        assert_eq!(GroupBy::Tag.label(), "tag");
+        assert_eq!(GroupBy::Priority.label(), "priority");
+        assert_eq!(GroupBy::Folder.label(), "folder");
+    }
+
+    /// Tag axis: tasks with tags produce one group per tag, alphabetically sorted.
+    #[test]
+    fn build_view_tag_axis_groups_by_tag() {
+        let tasks = vec![
+            task_with_tags(1, " ", 1, "a.md", &["zebra"]),
+            task_with_tags(2, " ", 1, "b.md", &["alpha"]),
+            task_with_tags(3, " ", 2, "a.md", &["zebra"]),
+        ];
+        let expanded = HashSet::new();
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            false,
+            "",
+            "",
+            "",
+            false,
+            GroupBy::Tag,
+        );
+        // Two groups: "alpha" (1 task), "zebra" (2 tasks) — alphabetical.
+        assert_eq!(rows.len(), 2, "two collapsed tag-headers");
+        let (key, _, _, _) = header(&rows[0]);
+        assert_eq!(key, "alpha");
+        let (key, _, total, _) = header(&rows[1]);
+        assert_eq!(key, "zebra");
+        assert_eq!(total, 2);
+    }
+
+    /// Tag axis: a task with multiple tags appears in every matching group (fan-out).
+    #[test]
+    fn build_view_tag_axis_fan_out_multiple_tags() {
+        let tasks = vec![task_with_tags(1, " ", 1, "a.md", &["work", "urgent"])];
+        let expanded = HashSet::from(["work".to_string(), "urgent".to_string()]);
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            false,
+            "",
+            "",
+            "",
+            false,
+            GroupBy::Tag,
+        );
+        // Two expanded groups, each with one task row (the same task, fanned out).
+        assert_eq!(rows.len(), 4, "2 headers + 2 task rows (same task in both)");
+        assert_eq!(header(&rows[0]).0, "urgent");
+        assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
+        assert_eq!(header(&rows[2]).0, "work");
+        assert!(matches!(&rows[3], DisplayRow::Task { task } if task.id == 1));
+    }
+
+    /// Tag axis: untagged tasks go to the `(untagged)` bucket.
+    #[test]
+    fn build_view_tag_axis_untagged_bucket() {
+        let tasks = vec![
+            task(1, " ", 1, "a.md"), // no tags
+        ];
+        let expanded = HashSet::new();
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            false,
+            "",
+            "",
+            "",
+            false,
+            GroupBy::Tag,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(header(&rows[0]).0, "(untagged)");
+    }
+
+    /// Priority axis: groups are ordered by importance (Highest first), not alphabetical.
+    #[test]
+    fn build_view_priority_axis_sorted_by_importance() {
+        let tasks = vec![
+            task_with_priority(3, " ", 1, "c.md", Priority::Low),
+            task_with_priority(1, " ", 1, "a.md", Priority::Highest),
+            task_with_priority(2, " ", 1, "b.md", Priority::Medium),
+        ];
+        let expanded = HashSet::new();
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            false,
+            "",
+            "",
+            "",
+            false,
+            GroupBy::Priority,
+        );
+        assert_eq!(rows.len(), 3);
+        assert_eq!(header(&rows[0]).0, "Highest");
+        assert_eq!(header(&rows[1]).0, "Medium");
+        assert_eq!(header(&rows[2]).0, "Low");
+    }
+
+    /// Priority axis: no-priority tasks go to `(no priority)` at the end.
+    #[test]
+    fn build_view_priority_axis_no_priority_at_end() {
+        let tasks = vec![
+            task(1, " ", 1, "a.md"), // no priority
+            task_with_priority(2, " ", 1, "b.md", Priority::High),
+        ];
+        let expanded = HashSet::new();
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            false,
+            "",
+            "",
+            "",
+            false,
+            GroupBy::Priority,
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(header(&rows[0]).0, "High");
+        assert_eq!(header(&rows[1]).0, "(no priority)");
+    }
+
+    /// Folder axis: groups by parent directory, top-level notes go to `(root)`.
+    #[test]
+    fn build_view_folder_axis_groups_by_directory() {
+        let tasks = vec![
+            task(1, " ", 1, "note.md"),       // (root)
+            task(2, " ", 1, "projects/a.md"), // projects
+            task(3, " ", 1, "projects/b.md"), // projects
+        ];
+        let expanded = HashSet::new();
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            false,
+            "",
+            "",
+            "",
+            false,
+            GroupBy::Folder,
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(header(&rows[0]).0, "(root)");
+        let (key, _, total, _) = header(&rows[1]);
+        assert_eq!(key, "projects");
+        assert_eq!(total, 2);
+    }
+
+    /// Folder axis: nested directories produce nested group keys.
+    #[test]
+    fn build_view_folder_axis_nested_dirs() {
+        let tasks = vec![task(1, " ", 1, "a/b/c.md"), task(2, " ", 1, "a/d.md")];
+        let expanded = HashSet::new();
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            false,
+            "",
+            "",
+            "",
+            false,
+            GroupBy::Folder,
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(header(&rows[0]).0, "a");
+        assert_eq!(header(&rows[1]).0, "a/b");
+    }
+
+    /// Tag axis: expanding a tag group shows its task rows.
+    #[test]
+    fn build_view_tag_axis_expanded_shows_tasks() {
+        let tasks = vec![
+            task_with_tags(1, " ", 1, "a.md", &["work"]),
+            task_with_tags(2, " ", 2, "b.md", &["work"]),
+        ];
+        let expanded = HashSet::from(["work".to_string()]);
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            false,
+            "",
+            "",
+            "",
+            false,
+            GroupBy::Tag,
+        );
+        assert_eq!(rows.len(), 3, "header + two tasks");
+        assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
+        assert!(matches!(&rows[2], DisplayRow::Task { task } if task.id == 2));
+    }
+
+    /// Tag axis: status filter hides done tasks within a tag group but keeps the header.
+    #[test]
+    fn build_view_tag_axis_status_filter() {
+        let tasks = vec![
+            task_with_tags(1, " ", 1, "a.md", &["work"]),
+            task_with_tags(2, "x", 2, "b.md", &["work"]),
+        ];
+        let expanded = HashSet::from(["work".to_string()]);
+        let rows = build_view(
+            &tasks,
+            StatusFilter::Open,
+            &expanded,
+            false,
+            "",
+            "",
+            "",
+            false,
+            GroupBy::Tag,
+        );
+        assert_eq!(rows.len(), 2, "header + only the open task");
+        assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
+    }
+
+    /// Tag axis: a tag group with no filter-matching task is hidden.
+    #[test]
+    fn build_view_tag_axis_hides_empty_group() {
+        let tasks = vec![
+            task_with_tags(1, " ", 1, "a.md", &["work"]),
+            task_with_tags(2, "x", 1, "b.md", &["done-only"]),
+        ];
+        let expanded = HashSet::new();
+        let rows = build_view(
+            &tasks,
+            StatusFilter::Open,
+            &expanded,
+            false,
+            "",
+            "",
+            "",
+            false,
+            GroupBy::Tag,
+        );
+        // Only "work" has an open task; "done-only" is hidden.
+        assert_eq!(rows.len(), 1);
+        assert_eq!(header(&rows[0]).0, "work");
+    }
+
+    /// Header open/total counts come from the full bucket (pre-filter).
+    #[test]
+    fn build_view_tag_axis_counts_from_full_bucket() {
+        let tasks = vec![
+            task_with_tags(1, " ", 1, "a.md", &["work"]), // open
+            task_with_tags(2, "x", 2, "b.md", &["work"]), // done
+        ];
+        let expanded = HashSet::new();
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            false,
+            "",
+            "",
+            "",
+            false,
+            GroupBy::Tag,
+        );
+        let (_, open, total, _) = header(&rows[0]);
+        assert_eq!(open, 1);
+        assert_eq!(total, 2);
+    }
+
+    /// `cycle_group_by` advances the axis and rebuilds the view.
+    #[test]
+    fn cycle_group_by_advances_axis() {
+        let mut app = App::new();
+        app.tasks = vec![task_with_tags(1, " ", 1, "a.md", &["work"])];
+        app.rebuild();
+        assert_eq!(app.group_by, GroupBy::Note);
+        assert_eq!(header(&app.rows[0]).0, "a.md");
+
+        app.cycle_group_by();
+        assert_eq!(app.group_by, GroupBy::Tag);
+        assert_eq!(header(&app.rows[0]).0, "work");
+    }
+
+    /// `cycle_group_by` wraps around from Folder back to Note.
+    #[test]
+    fn cycle_group_by_wraps_around() {
+        let mut app = App::new();
+        app.group_by = GroupBy::Folder;
+        app.tasks = vec![task(1, " ", 1, "a.md")];
+        app.rebuild();
+        app.cycle_group_by();
+        assert_eq!(app.group_by, GroupBy::Note);
+    }
+
+    /// Cycling the axis does NOT clear `expanded` — stale keys naturally don't match.
+    #[test]
+    fn cycle_group_by_does_not_clear_expanded() {
+        let mut app = App::new();
+        app.tasks = vec![task(1, " ", 1, "a.md")];
+        app.expanded.insert("a.md".to_string());
+        app.rebuild();
+        assert!(app.expanded.contains("a.md"));
+
+        app.cycle_group_by(); // Note → Tag
+        // expanded set still has the old key, but it doesn't match "(untagged)"
+        assert!(app.expanded.contains("a.md"));
+        assert!(matches!(app.rows[0], DisplayRow::Header { collapsed, .. } if collapsed));
+    }
+
+    /// Collapsing from a task row under the Tag axis scans backwards for the
+    /// nearest preceding Header's group_key.
+    #[test]
+    fn toggle_collapse_from_task_under_tag_axis() {
+        let mut app = App::new();
+        app.tasks = vec![task_with_tags(1, " ", 1, "a.md", &["work"])];
+        app.group_by = GroupBy::Tag;
+        app.rebuild();
+        app.expanded.insert("work".to_string());
+        app.rebuild();
+        // rows: [H "work", T1]
+        assert_eq!(app.rows.len(), 2);
+
+        // Cursor on task row, press ← to collapse parent.
+        app.state.select(Some(1));
+        app.toggle_at_cursor(ToggleMode::Collapse);
+        assert!(
+            !app.expanded.contains("work"),
+            "tag group should be collapsed"
+        );
+        assert_eq!(app.rows.len(), 1, "only header remains");
+    }
+
+    /// Collapsing from a task row under the Folder axis works the same way.
+    #[test]
+    fn toggle_collapse_from_task_under_folder_axis() {
+        let mut app = App::new();
+        app.tasks = vec![task(1, " ", 1, "projects/a.md")];
+        app.group_by = GroupBy::Folder;
+        app.rebuild();
+        app.expanded.insert("projects".to_string());
+        app.rebuild();
+        // rows: [H "projects", T1]
+        assert_eq!(app.rows.len(), 2);
+
+        app.state.select(Some(1));
+        app.toggle_at_cursor(ToggleMode::Collapse);
+        assert!(!app.expanded.contains("projects"));
+    }
+
+    /// Expanding a tag group under the Tag axis works via the group_key.
+    #[test]
+    fn toggle_expand_header_under_tag_axis() {
+        let mut app = App::new();
+        app.tasks = vec![task_with_tags(1, " ", 1, "a.md", &["work"])];
+        app.group_by = GroupBy::Tag;
+        app.rebuild();
+        // rows: [H "work" collapsed]
+        assert_eq!(app.rows.len(), 1);
+
+        app.state.select(Some(0));
+        app.toggle_at_cursor(ToggleMode::Expand);
+        assert!(app.expanded.contains("work"));
+        assert_eq!(app.rows.len(), 2, "header + task");
+    }
+
+    /// `expand_all` under the Tag axis adds all visible tag-group keys.
+    #[test]
+    fn expand_all_under_tag_axis() {
+        let mut app = App::new();
+        app.tasks = vec![
+            task_with_tags(1, " ", 1, "a.md", &["alpha"]),
+            task_with_tags(2, " ", 1, "b.md", &["beta"]),
+        ];
+        app.group_by = GroupBy::Tag;
+        app.rebuild();
+        assert_eq!(app.rows.len(), 2, "two collapsed tag-headers");
+
+        app.expand_all();
+        assert_eq!(app.rows.len(), 4, "two headers + two task rows");
+        assert!(app.expanded.contains("alpha"));
+        assert!(app.expanded.contains("beta"));
+    }
+
+    /// `collapse_all` clears all expanded keys under any axis.
+    #[test]
+    fn collapse_all_under_priority_axis() {
+        let mut app = App::new();
+        app.tasks = vec![
+            task_with_priority(1, " ", 1, "a.md", Priority::High),
+            task_with_priority(2, " ", 1, "b.md", Priority::Low),
+        ];
+        app.group_by = GroupBy::Priority;
+        app.rebuild();
+        app.expand_all();
+        assert_eq!(app.rows.len(), 4);
+
+        app.collapse_all();
+        assert_eq!(app.rows.len(), 2, "back to two headers");
+        assert!(app.expanded.is_empty());
+    }
+
+    /// Default `App` starts with `GroupBy::Note`.
+    #[test]
+    fn app_default_group_by_is_note() {
+        let app = App::new();
+        assert_eq!(app.group_by, GroupBy::Note);
+    }
+
+    /// Header counts are accurate under the Tag axis when a task fans out
+    /// to multiple tags — each group counts the task independently.
+    #[test]
+    fn build_view_tag_axis_fan_out_counts() {
+        let tasks = vec![
+            task_with_tags(1, " ", 1, "a.md", &["work", "urgent"]),
+            task_with_tags(2, "x", 2, "b.md", &["work"]),
+        ];
+        let expanded = HashSet::new();
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            false,
+            "",
+            "",
+            "",
+            false,
+            GroupBy::Tag,
+        );
+        // "urgent" group: 1 task (id 1), 1 open
+        // "work" group: 2 tasks (id 1 + 2), 1 open (id 2 is done)
+        assert_eq!(rows.len(), 2);
+        let (key, open, total, _) = header(&rows[0]);
+        assert_eq!(key, "urgent");
+        assert_eq!(open, 1);
+        assert_eq!(total, 1);
+        let (key, open, total, _) = header(&rows[1]);
+        assert_eq!(key, "work");
+        assert_eq!(open, 1);
+        assert_eq!(total, 2);
+    }
+
+    /// Folder axis composes with the status filter.
+    #[test]
+    fn build_view_folder_axis_with_status_filter() {
+        let tasks = vec![
+            task(1, " ", 1, "projects/a.md"), // open
+            task(2, "x", 2, "projects/b.md"), // done
+        ];
+        let expanded = HashSet::from(["projects".to_string()]);
+        let rows = build_view(
+            &tasks,
+            StatusFilter::Open,
+            &expanded,
+            false,
+            "",
+            "",
+            "",
+            false,
+            GroupBy::Folder,
+        );
+        assert_eq!(rows.len(), 2, "header + only the open task");
+        assert_eq!(header(&rows[0]).0, "projects");
+        assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
+    }
+
+    /// Priority axis composes with the search filter.
+    #[test]
+    fn build_view_priority_axis_with_search() {
+        let t1 = {
+            let mut t = task_with_priority(1, " ", 1, "a.md", Priority::High);
+            t.text = "deploy server".to_string();
+            t
+        };
+        let t2 = {
+            let mut t = task_with_priority(2, " ", 2, "b.md", Priority::Low);
+            t.text = "write docs".to_string();
+            t
+        };
+        let tasks = vec![t1, t2];
+
+        let expanded = HashSet::new();
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            false,
+            "",
+            "deploy",
+            "",
+            false,
+            GroupBy::Priority,
+        );
+        // Only "High" group matches the search.
+        assert_eq!(rows.len(), 1);
+        assert_eq!(header(&rows[0]).0, "High");
     }
 }
