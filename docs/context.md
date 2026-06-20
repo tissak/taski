@@ -1,6 +1,6 @@
 # Taski — Engineering Context & Onboarding
 
-*Onboarding guide for new engineers. Last updated: 2026-06-20 (v0.1).*
+*Onboarding guide for new engineers. Last updated: 2026-06-20 (v0.2 — unified `taski` launcher + single-writer lock).*
 
 This document is the "operating manual" for working on Taski: what it is, how it's
 built, the decisions that are load-bearing (and must not be casually undone), and the
@@ -45,8 +45,8 @@ Cargo workspace, edition 2024, six crates. Dependencies point downward only (no 
 | `taski-core` | **Pure** domain: `Task`/`Status` types, the Markdown parser (`parse_tasks`, fence-aware), due-date extraction (`extract_due_date`). No FS, no I/O, no deps on other taski crates. | `crates/taski-core/src/lib.rs` |
 | `taski-config` | TOML config loading (`~/.config/taski/config.toml`) + CLI→config→default precedence + the `template()` renderer for `--init-config`. Keeps FS/TOML out of `taski-core`. | `crates/taski-config/src/lib.rs` |
 | `taski-db` | The canonical SQLite schema, `open()` (WAL + schema + dir creation), and all read/write APIs (`all_tasks`, `reconcile_note`, `enqueue_action`, `pending_actions`, `prune_old_actions`, …). Owns `tasks` + `pending_actions`. | `crates/taski-db/src/lib.rs` |
-| `taski-daemon` | The watcher/scanner + **sole writer to the vault**: `run()`, `scan_vault`, `index_note`, `process_action`, `atomic_write` (TOCTOU-hardened), watch loop. Two binaries: `taski-daemon` (service) + tests. | `crates/taski-daemon/src/{lib,main}.rs`, `tests/` |
-| `taski-tui` | The `ratatui` client: polls the index, groups by note, filters, renders, submits toggle actions. Never touches vault files. | `crates/taski-tui/src/main.rs` |
+| `taski-daemon` | The watcher/scanner + **sole writer to the vault**: the reusable engine `run_daemon(opts, shutdown, lock)`, plus `scan_vault`, `index_note`, `process_action`, `atomic_write` (TOCTOU-hardened), the watch loop; the `ShutdownSignal`/`ShutdownHandle` pair; and the `flock` single-writer lock (`DaemonLockGuard`/`acquire_daemon_lock`/`LockOutcome`). **lib + bin** — a `taski-daemon` binary *and* the library the unified launcher depends on. | `crates/taski-daemon/src/{lib,main,shutdown,lock}.rs`, `tests/` |
+| `taski-tui` | The `ratatui` client: polls the index, groups by note, filters, renders, submits toggle actions, shows the context pane. Never touches vault files. **lib + bin** — public entry points `run()` / `run_with_db(db)` / `run_combined(db, quit_hook)`; `main.rs` is a thin shim. | `crates/taski-tui/src/{lib,main}.rs` |
 | `taski` | The **unified launcher** binary: runs the daemon (background thread) + TUI (main thread) together by default (`taski`), or either alone via `taski daemon` / `taski tui` subcommands. Attach-or-spawn + single-writer lock (ADRs 0007/0008). | `crates/taski/src/main.rs` |
 
 Supporting: `docs/` (PRD, tech, ADRs, setup, this file), `scripts/install-launchd.sh`
@@ -59,7 +59,7 @@ Supporting: `docs/` (PRD, tech, ADRs, setup, this file), `scripts/install-launch
 ```sh
 cargo build --workspace                       # dev build
 cargo build --release --workspace             # optimized daily-driver binaries
-cargo test --workspace                        # all tests (92 as of v0.1)
+cargo test --workspace                        # all tests (111 as of v0.2)
 cargo test -p taski-daemon writeback          # run one suite / filter by name
 ```
 
@@ -93,16 +93,22 @@ default (daemon requires it); `db` defaults to `./taski.db`. Config location is
 
 ### Debugging
 
-- **Logs:** the daemon logs to **stderr** via `tracing` at `info` by default. Set
-  `RUST_LOG=debug` (or `taski_daemon=trace`) to see reconciliation summaries, action
-  outcomes, and conflict reasons. Under launchd, logs stream to
-  `~/.local/share/taski/daemon.log`.
+- **Logs:** the daemon logs via `tracing` at `info` by default. Where they go depends on
+  the entry point: `taski daemon` and standalone `taski-daemon` log to **stderr** (so
+  under launchd they stream to `~/.local/share/taski/daemon.log`); `taski` in **combined
+  mode** routes the daemon thread's tracing to that log **file** directly (never stderr —
+  stderr would garble the TUI's alternate screen). Set `RUST_LOG=debug` (or
+  `taski_daemon=trace`) to see reconciliation summaries, action outcomes, and conflict
+  reasons.
 - **Inspect the index/queue directly:**
   `sqlite3 ~/.local/share/taski/taski.db "SELECT id,note_path,state,error FROM pending_actions ORDER BY id DESC LIMIT 10"`
   — the fastest way to answer "why didn't my toggle land?" (`state` is `pending`/`done`/`failed`).
-- **Shutdown:** the daemon installs a ctrlc handler — the **first** Ctrl-C initiates a
-  clean shutdown (up to ~500ms, the event-loop tick); a **second** Ctrl-C force-terminates.
-  A brief pause after the first is normal, not a hang.
+- **Shutdown:** `taski daemon` / standalone `taski-daemon` install a ctrlc handler — the
+  **first** Ctrl-C initiates a clean shutdown (up to ~500ms, the event-loop tick); a
+  **second** Ctrl-C force-terminates. In **combined mode** there is no ctrlc handler — the
+  TUI runs in raw mode (which swallows `SIGINT`) and `q`/`Esc`/Ctrl-C all drive the same
+  shutdown path; the daemon then drains and the process exits. A brief pause after quit is
+  the drain, not a hang.
 - **Latency expectations:** FS events are debounced **300ms**; the daemon event loop ticks
   every **500ms**; the TUI re-reads the index every **750ms**. So a toggle or an Obsidian
   edit typically reflects in 1–2s.
@@ -144,6 +150,21 @@ TUI: user hits Space on a task
 The TUI **never** opens a vault file. It only inserts `pending_actions` rows. Only the
 daemon mutates notes, and only after byte-re-verification. This is the core safety
 guarantee (ADRs 0002/0003/0004).
+
+### 3. Process topology — the unified `taski` binary (ADRs 0007/0008)
+
+By default `taski` runs **both roles in one process**: the daemon on a background thread,
+the TUI on the main thread, each with its own SQLite `Connection` (WAL's
+one-writer/many-readers is per-*database*, not per-process — so this is identical to the
+two-process case). They share a `ShutdownSignal` (`Arc<AtomicBool>`): on TUI quit
+(`q`/`Esc`/`Ctrl-C`) the TUI sets it, restores the terminal, and the launcher `join`s the
+daemon thread — which first **drains `pending_actions`**, then exits (so a toggle done
+right before `q` lands in this session). A `flock` on `<db_dir>/daemon.lock` guarantees a
+**sole writer**: if the lock is already held (e.g. launchd's daemon is running), `taski`
+**attaches** — runs the TUI-only against that daemon (a reader) instead of spawning a
+second daemon. `taski daemon` and `taski-tui` run either side standalone. The daemon
+thread is wrapped in `catch_unwind` so a panic/error sets the shutdown signal and logs
+rather than corrupting the TUI mid-session.
 
 ---
 
@@ -264,6 +285,31 @@ These are the things that aren't obvious from reading the code and will cost you
   not create/modify/delete. The daemon decides what to do by checking file existence.
   Don't assume you can branch on event type.
 
+- **The single-writer lock is load-bearing (ADR-0008).** The daemon acquires
+  `flock(LOCK_EX | LOCK_NB)` on `<db_dir>/daemon.lock` before scanning. Two daemons would
+  corrupt the vault — `atomic_write`'s fixed-name temp collision + `reconcile_note`'s
+  read-modify-write race, *neither* guarded by ADR-0004's TOCTOU check and *both* invisible
+  to WAL. `run_daemon` takes a `DaemonLockGuard` as a **capability token**: you cannot call
+  it without acquiring the lock, and the guard can't be forged (its constructor is private).
+  Don't add a daemon entry point that bypasses `acquire_daemon_lock`.
+
+- **Combined mode routes daemon tracing to the log file, never stderr.** In `taski`
+  (combined) the TUI owns the alternate screen; any `eprintln!` or `tracing`→stderr on the
+  daemon thread garbles it. Daemon-thread events go to `<db_dir>/daemon.log` via
+  `init_tracing_to_file`. If you add code that runs on the daemon thread, use `tracing`
+  (not `eprintln!`). (`taski daemon` / standalone `taski-daemon` still use stderr — fine,
+  no TUI.)
+
+- **`ctrlc::set_handler` is process-global and single-install.** Only `taski daemon` and
+  standalone `taski-daemon` install it. Combined mode must **not** — the TUI runs in
+  crossterm raw mode, which swallows `SIGINT` and delivers it as a key event the TUI
+  handles (driving the same shutdown path as `q`). Installing it from both paths errors.
+
+- **`--once` and `--init-config` live only on `taski-daemon`, not on `taski`.** The
+  unified `taski` binary exposes only the global `--vault`/`--db` flags plus the
+  `daemon`/`tui` subcommands. For a one-shot scan or config generation, use the standalone
+  `taski-daemon` binary.
+
 - **The TUI does surface refused toggles** as a one-line notice (via `recent_actions` →
   `friendly_failure_reason`), cleared on the next action. But the TUI↔daemon coupling is
   loose *by choice*: `friendly_failure_reason` string-matches the daemon's `ApplyOutcome`
@@ -318,7 +364,9 @@ These are the things that aren't obvious from reading the code and will cost you
 | `taski-daemon/tests/scan.rs` | End-to-end scan of a fake vault → correct task rows. |
 | `taski-daemon/tests/reconcile.rs` | Content-hash reconciliation: identity survives edits, deletes, reorders. |
 | `taski-daemon/tests/writeback.rs` + `writeback_proptest.rs` | The safety contract: atomic_write commits on match, refuses on conflict, never corrupts. |
-| `taski-tui` unit tests (in `main.rs`) | View model: grouping, collapse, filter, display-index↔Task mapping, selection reconciliation, failure-notice surfacing, context-pane render/scroll/toggle + `context_view` centering (headless `TestBackend` smoke). |
+| `taski-daemon/src/lock.rs` unit tests | The `flock` single-writer lock: acquire/refuse outcome, lock-path derivation. |
+| `taski-tui` unit tests (in `lib.rs`) | View model: grouping, collapse, filter, display-index↔Task mapping, selection reconciliation, failure-notice surfacing, context-pane render/scroll/toggle + `context_view` centering (headless `TestBackend` smoke). |
+| `taski` (unified launcher) | No unit tests by design — it's thin dispatch over the two libraries. Correctness is runtime-verified (combined spawn, attach-when-held, refuse-when-held, quit-drain); see the smokes described in ADRs 0007/0008. |
 
 Tests use `tempfile` fake vaults and `:memory:` or temp-file DBs. The real vault is
 exercised only at runtime (its `taski.db` is gitignored).
@@ -333,8 +381,10 @@ exercised only at runtime (its `taski.db` is gitignored).
 | Change the DB schema | `taski-db::SCHEMA` + bump `SCHEMA_VERSION`; update `reconcile_note`/`upsert_task` |
 | Cache/read note content for the TUI context pane | `taski-db`: `note_contents` table + `upsert_note_content`/`note_content`/`delete_note_content`; daemon writes it in `index_note` ([ADR-0006](./adr/0006-note-content-cached-in-index.md)) |
 | Change write-back behavior | `taski-daemon`: `process_action`, `atomic_write` (mind ADR-0004 TOCTOU) |
-| Change how the TUI looks/behaves | `taski-tui/src/main.rs`: `App`, `build_view`, `context_view`/`draw_context_pane`, key handling |
-| Change context-pane keybindings/behavior | `taski-tui/src/main.rs` key match in `run()` (`J`/`K` scroll, `p` toggle) + `MIN_SPLIT_WIDTH` auto-hide; `sync_context` for the read path |
+| Change how the TUI looks/behaves | `taski-tui/src/lib.rs`: `App`, `build_view`, `context_view`/`draw_context_pane`, key handling |
+| Change context-pane keybindings/behavior | `taski-tui/src/lib.rs` key match in `run_loop` (`J`/`K` scroll, `p` toggle) + `MIN_SPLIT_WIDTH` auto-hide; `sync_context` for the read path |
+| Change launcher behavior (combined/daemon/tui dispatch, attach-or-spawn, shutdown handshake) | `crates/taski/src/main.rs` (`run_combined`/`run_combined_spawn`/`run_daemon_only`); ADR-0007 |
+| Change the single-writer lock | `crates/taski-daemon/src/lock.rs` (ADR-0008) |
 | Add a CLI flag | `Cli` struct in the relevant binary's `lib.rs`/`main.rs` |
 | Change config format/precedence | `taski-config/src/lib.rs` |
 | Run the app (daemon + TUI combined) | `taski` (unified binary); see [setup.md](./setup.md) |
@@ -383,3 +433,14 @@ If you pick one up, record the decision and update this list.
 - **`pending_actions`** — the SQLite table that is the TUI→daemon command channel.
 - **WAL** — SQLite's Write-Ahead Logging mode; enables one writer + many readers across
   processes (daemon writes, TUI reads).
+- **Combined mode** — running the daemon (background thread) + TUI (main thread) in one
+  `taski` process, the daemon's lifetime scoped to the TUI session (ADR-0007).
+- **Attach-or-spawn** — `taski`'s lock-probe on startup: spawn the daemon if the
+  single-writer lock is free, else attach (run the TUI-only against the running daemon).
+  `taski daemon` refuses instead of attaching (ADR-0008).
+- **Single-writer lock** — `flock(LOCK_EX | LOCK_NB)` on `<db_dir>/daemon.lock`, held for
+  the daemon's lifetime and auto-released by the OS on crash; guarantees one daemon writes
+  the vault/index (ADR-0008).
+- **ShutdownSignal** — a shared `Arc<AtomicBool>` (`ShutdownSignal` to set, `ShutdownHandle`
+  to check) used to cooperatively stop the daemon; in combined mode the TUI's quit hook
+  sets it.
