@@ -1,6 +1,6 @@
 # Taski — Engineering Context & Onboarding
 
-*Onboarding guide for new engineers. Last updated: 2026-06-20 (v0.4 — adds `exclude_dirs` config + ADR-0011 bullet toggle and undo; CR1 code-review pass applied; 178 tests across 6 crates).*
+*Onboarding guide for new engineers. Last updated: 2026-06-20 (post-v0.4 — adds Tier 1 metadata parsing [tags, priority, start/created/done/cancelled dates, schema v6] + Tier 2 views [overdue `O`, group-by cycling `G`]; 259 tests across 6 crates).*
 
 This document is the "operating manual" for working on Taski: what it is, how it's
 built, the decisions that are load-bearing (and must not be casually undone), and the
@@ -186,17 +186,26 @@ second daemon. `taski daemon` and `taski-tui` run either side standalone. The da
 thread is wrapped in `catch_unwind` so a panic/error sets the shutdown signal and logs
 rather than corrupting the TUI mid-session.
 
-### 4. TUI Filter Composition (the four filter axes)
+### 4. TUI Filter Composition + Grouping (five filter axes, one grouping axis)
 
-The TUI's `build_view()` ANDs four independent filter axes in a single pass over the task
-list. This means filters narrow each other — adding a filter can only reduce the visible set:
+The TUI's `build_view()` ANDs five independent filter axes in a single pass over the task
+list, then buckets the survivors under group headers. Filters narrow each other — adding a
+filter can only reduce the visible set:
 
 | Axis | Gesture | Scope |
 |---|---|---|
 | Status cycle | `f` | `All` → `Open` → `Done` → `All` |
 | Today view | `T` | Tasks whose `scheduled_date == today` |
+| Overdue view | `O` | Tasks whose `due_date` is set and `< today` (purely date-based; composes with status — `O`+Open = open past-due, `O`+Done = completed-was-overdue) |
 | Text search | `/` | Case-insensitive substring of `task.text` |
 | File search | `F` | Case-insensitive substring of `task.note_path` |
+
+Separately, a **grouping axis** (`G`) reorganizes the list's group buckets: note (default)
+→ tag → priority → folder → note. Tag grouping **fans out** — a task with N tags appears
+under all N tag groups. Groups sort alphabetically (note/tag/folder) or by importance rank
+(priority, so Medium doesn't sort between Low and Lowest). The grouping axis is orthogonal
+to the filters: filters narrow *which* tasks show; grouping controls *how* the survivors
+are bucketed.
 
 Both search prompts are modal (Vim `/` style): keystrokes build the query until
 dismissed. `Enter` keeps the filter applied; `Esc` clears it. Only one search prompt is
@@ -205,18 +214,26 @@ independently — so you can `/deploy` for text, dismiss with `Enter`, then `F a
 file, and the view shows only tasks whose body contains "deploy" **and** whose note path
 contains "alpha".
 
-The `build_view` function signature captures all four axes:
+The `build_view` function signature captures all five filter axes plus the grouping axis
+(it carries a documented `#[allow(clippy::too_many_arguments)]` — a parameter-struct
+refactor is deferred):
 ```rust
 fn build_view(
     tasks: &[Task],
     filter: StatusFilter,        // All / Open / Done
-    expanded: &HashSet<String>,  // group collapse state
+    expanded: &HashSet<String>,  // group collapse state (keyed by group_key)
     today_only: bool,
     today: &str,                 // today's date string
     search_query: &str,          // text search
     file_query: &str,            // file/path search
+    overdue_only: bool,          // O — due_date < today
+    group_by: GroupBy,           // G — Note / Tag / Priority / Folder
 ) -> Vec<DisplayRow>
 ```
+
+Internally `build_view` no longer walks contiguous `note_path` runs — it HashMap-buckets
+tasks by the active axis (handling tag fan-out), orders the buckets, then applies the
+filter predicates within each bucket and emits `Header` + `Task` rows.
 
 ---
 
@@ -231,6 +248,8 @@ fn build_view(
 | `Tab` / `⇧Tab` | Expand all / collapse all groups |
 | `f` | Cycle status filter: All → Open → Done → All |
 | `T` | Toggle Today view (tasks scheduled for today) |
+| `O` | Toggle Overdue view (tasks whose `due_date < today`) |
+| `G` | Cycle grouping axis: note → tag → priority → folder → note |
 | `t` | Mark/unmark selected task for today (writes `⏳ <today>`) |
 | `b` | Toggle selected task between checkbox (`- [ ]`) and bullet (`-`) format |
 | `u` | Undo the last checkbox flip or bullet toggle action |

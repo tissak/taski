@@ -16,9 +16,9 @@
 
 - **Reads:** every checkbox task in the vault, `📅`/`📆`/`🗓` due date, `⏳` scheduled date, `🛫` start date, `➕`/`✅`/`❌` created/done/cancelled dates, `#tags` (multi-value), `🔺`/`⏫`/`🔼`/`🔽`/`⏬` priority.
 - **Writes:** checkbox toggle, `⏳` mark-for-today, checkbox↔bullet conversion, undo.
-- **Views:** status cycle (`f`), Today (`T`), text search (`/`), file search (`F`), note context pane (`p`).
+- **Views:** status cycle (`f`), Today (`T`), text search (`/`), file search (`F`), overdue (`O`), group-by cycling (`G`: note/tag/priority/folder), note context pane (`p`).
 
-Taski now parses **8 of ~15** Obsidian Tasks metadata tokens (up from 2). The remaining gaps are on the **view** side — the parsed metadata is indexed but not yet surfaced as filters, groupings, or sorts (Tier 2).
+Taski now parses **8 of ~15** Obsidian Tasks metadata tokens (up from 2). The metadata is now surfaced as filters and groupings; remaining view-side gaps are the "Happens" date union and urgency-score sort (Tier 2), plus the write-path items (Tier 3).
 
 ---
 
@@ -49,16 +49,18 @@ Each item extends the parser and the `tasks` schema only. No vault writes, no AD
 
 ---
 
-## Tier 2 — Views the metadata unlocks (medium effort)
+## Tier 2 — Views the metadata unlocks (medium effort) — partially shipped
 
-All read-path (TUI `build_view` extensions); land after their Tier 1 dependency exists.
+All read-path (TUI `build_view` extensions). Two of four views are shipped; the rest remain open.
 
-| View | Gesture (proposed) | What it shows | Depends on |
-|---|---|---|---|
-| **Overdue** | `O` | tasks with `due_date < today`, sorted by how overdue | due date (have it) |
-| **"Happens"** | (toggle) | start ∪ scheduled ∪ due — broader and more useful than Today | start date |
-| **Group-by cycling** | `G` | cycle group axis: note → tag → priority → folder → date | tags / priority |
-| **Urgency-score sort** | sort mode | composite (due proximity + priority) — the Tasks plugin's default ordering | priority |
+| View | Gesture | What it shows | Depends on | Status |
+|---|---|---|---|---|
+| **Overdue** | `O` | tasks with `due_date < today` (purely date-based; composes with status/today/search) | due date (have it) | ✅ shipped |
+| **Group-by cycling** | `G` | cycle group axis: note → tag → priority → folder → note (tag fans out; date axis deferred) | tags / priority | ✅ shipped |
+| **"Happens"** | (toggle) | start ∪ scheduled ∪ due — broader and more useful than Today | start date | open |
+| **Urgency-score sort** | sort mode | composite (due proximity + priority) — the Tasks plugin's default ordering | priority | open |
+
+> **Shipped notes:** Overdue is a 5th orthogonal filter axis (ANDs with all others). Group-by rewrote `build_view` from contiguous-note-run walking to HashMap bucketing (handles tag fan-out and arbitrary keys); a `Date` grouping axis is deferred (date-bucketing is fuzzy). Known minor limitations: under tag grouping, refresh restores the cursor to the first group instance of the selected task; the context pane blanks on non-Note headers (headers are dividers, not notes).
 
 ---
 
