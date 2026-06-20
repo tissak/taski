@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/taski-core",
+    "crates/taski-config",
     "crates/taski-db",
     "crates/taski-daemon",
     "crates/taski-tui",
@@ -15,6 +16,7 @@ rust-version = "1.93"
 [workspace.dependencies]
 # Internal crates
 taski-core = { path = "crates/taski-core" }
+taski-config = { path = "crates/taski-config" }
 taski-db = { path = "crates/taski-db" }
 
 # External crates
@@ -27,8 +29,10 @@ notify-debouncer-mini = "0.6"
 proptest = "1"
 ratatui = "0.30"
 rusqlite = { version = "0.39", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
 tempfile = "3"
 thiserror = "2.0"
+toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2"

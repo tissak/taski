@@ -34,7 +34,10 @@ use walkdir::WalkDir;
 /// unbounded growth.
 const ACTION_RETENTION_SECS: i64 = 7 * 86_400;
 
-/// CLI configuration (PRD §12, Slice 1).
+/// CLI configuration (PRD §12, Slice 1). `--vault` and `--db` are optional and
+/// override the values in the config file (`~/.config/taski/config.toml`, overridable
+/// via `TASKI_CONFIG`); see `taski_config`. If neither CLI nor config provides a
+/// `vault`, the daemon errors; `db` defaults to `./taski.db`.
 #[derive(Parser, Debug)]
 #[command(
     name = "taski-daemon",
@@ -42,12 +45,14 @@ const ACTION_RETENTION_SECS: i64 = 7 * 86_400;
     about = "Watch an Obsidian vault and index checkbox tasks into SQLite"
 )]
 pub struct Cli {
-    /// Path to the Obsidian vault root to scan and watch.
+    /// Path to the Obsidian vault root to scan and watch. Overrides `vault` in the
+    /// config file; required if absent there (the daemon has no default vault).
     #[arg(long)]
-    pub vault: PathBuf,
-    /// Path to the taski SQLite index database.
-    #[arg(long, default_value = "./taski.db")]
-    pub db: PathBuf,
+    pub vault: Option<PathBuf>,
+    /// Path to the taski SQLite index database. Overrides `db` in the config file;
+    /// defaults to `./taski.db` if absent everywhere.
+    #[arg(long)]
+    pub db: Option<PathBuf>,
     /// Run a single full scan and exit (do not start the watch loop).
     #[arg(long)]
     pub once: bool,
@@ -59,13 +64,21 @@ pub fn run() -> Result<()> {
     let cli = Cli::parse();
     init_tracing();
 
-    let vault_root = cli
-        .vault
-        .canonicalize()
-        .with_context(|| format!("canonicalizing vault path {:?}", cli.vault))?;
+    // Config is optional (a missing file yields defaults); a malformed file is a
+    // hard error.
+    let cfg = taski_config::load().context("loading taski config")?;
 
-    let conn = db::open(&cli.db.to_string_lossy())
-        .with_context(|| format!("opening taski database {:?}", cli.db))?;
+    // Resolve vault/db: CLI flag → config file → compiled default. The daemon
+    // requires a vault (no default); db defaults to ./taski.db.
+    let vault_root =
+        taski_config::resolve_vault(cli.vault.as_deref().and_then(Path::to_str), &cfg)?;
+    let vault_root = vault_root
+        .canonicalize()
+        .with_context(|| format!("canonicalizing vault path {:?}", vault_root))?;
+
+    let db_path = taski_config::resolve_db(cli.db.as_deref().and_then(Path::to_str), &cfg);
+    let conn = db::open(&db_path.to_string_lossy())
+        .with_context(|| format!("opening taski database {:?}", db_path))?;
 
     // Sweep any temp files left behind by a crash mid-write-back (ADR-0003). Do this
     // BEFORE the scan so the freshly-written scan reflects a clean vault state.

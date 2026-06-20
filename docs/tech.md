@@ -27,9 +27,9 @@ Authoritative record of technology choices for Taski. Each entry has a one-line 
 | **`clap`** (derive) | Daemon CLI args (`--vault`, `--db`, `--once`). | 2026-06-20 |
 | **`walkdir`** | Recursive vault scan with hidden-dir pruning (`.obsidian` / `.trash` / `.git`). | 2026-06-20 |
 | **`ctrlc`** | Graceful SIGINT shutdown of the watch loop. | 2026-06-20 |
-| **Line-based parser** (in `taski-core`) | Current Markdown checkbox parser — fence-aware, tolerates leading blockquote markers. Chosen over `pulldown-cmark` for now (YAGNI; checkboxes are line-oriented). | 2026-06-20 |
+| **Line-based parser** (in `taski-core`) | Current Markdown checkbox parser — fence-aware (backtick + tilde), tolerates leading blockquote markers, extracts Obsidian Tasks-plugin `📅`/`📆`/`🗓` due dates. Chosen over `pulldown-cmark` for now (YAGNI; checkboxes are line-oriented). | 2026-06-20 |
 
-> **Deferred (revisit when needed):** `pulldown-cmark` (adopt when real edge cases — tasks in nested lists / inline code / callouts — exceed the line parser), and Tasks-plugin due-date (`📅`) *extraction* (the line is already parsed as a task; only the metadata parse is deferred).
+> **Deferred (revisit when needed):** `pulldown-cmark` (adopt when real edge cases — tasks in nested lists / inline code / callouts — exceed the line parser).
 
 ## UI / TUI
 | Choice | Rationale | Decided |
@@ -39,8 +39,8 @@ Authoritative record of technology choices for Taski. Each entry has a one-line 
 ## Cross-cutting
 | Choice | Rationale | Decided |
 |---|---|---|
-| **`serde` + `toml`** | Config parsing (`~/.taski/config.toml`). | 2026-06-20 |
-| **`tracing` + `tracing-subscriber`** | Structured logs to stderr + rotating file (`~/.taski/logs/`); essential for post-incident write-back diagnosis. | 2026-06-20 |
+| **`taski-config` crate** + `serde` + `toml` | TOML config (`~/.config/taski/config.toml`, XDG-style; overridable via `TASKI_CONFIG`). Lives in its own crate so `taski-core` stays pure (no FS/TOML I/O). Precedence: CLI flag → config file → compiled default. | 2026-06-20 |
+| **`tracing` + `tracing-subscriber`** | Structured logs to stderr; essential for post-incident write-back diagnosis. | 2026-06-20 |
 
 ## Testing
 | Choice | Rationale | Decided |
@@ -58,6 +58,13 @@ Authoritative record of technology choices for Taski. Each entry has a one-line 
 ## Tooling / Foundations
 | Choice | Rationale | Decided |
 |---|---|---|
-| **Cargo workspace** (`taski-core` / `taski-db` / `taski-daemon` / `taski-tui`) | Shared schema/types prevent drift; one canonical schema definition in `taski-db`. | 2026-06-20 |
+| **Cargo workspace** (`taski-core` / `taski-config` / `taski-db` / `taski-daemon` / `taski-tui`) | Shared schema/types prevent drift; one canonical schema definition in `taski-db`; config loading isolated in `taski-config`. | 2026-06-20 |
 | **GitHub Actions on macOS** | Primary platform is darwin; fmt + clippy (-D warnings) + test + cargo-deny. | 2026-06-20 |
 | **`rust-toolchain.toml`** (pinned) | Reproducible builds across CI and local. | 2026-06-20 |
+
+## Packaging / Distribution
+| Choice | Rationale | Decided |
+|---|---|---|
+| **Release build** (`cargo build --release --workspace`) | Daily-driver binaries; verified clean under `--release`. | 2026-06-20 |
+| **macOS `launchd` autostart** (`scripts/install-launchd.sh`) | Daemon starts at login (`RunAtLoad`) and is restarted on crash (`KeepAlive`). The plist carries no args — the daemon reads vault/db from `~/.config/taski/config.toml`. Binaries installed to `~/.local/bin`; logs to `~/.local/share/taski/daemon.log`. | 2026-06-20 |
+| **No `dirs` crate** | Config path computed manually from `$HOME` (`~/.config/taski/`) because `dirs::config_dir()` returns `~/Library/Application Support` on macOS, not the project's XDG-style `~/.config`. One fewer dependency. | 2026-06-20 |

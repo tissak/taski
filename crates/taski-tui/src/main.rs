@@ -11,7 +11,7 @@
 
 use std::collections::HashSet;
 use std::io::{self, Stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -30,7 +30,9 @@ use rusqlite::Connection;
 use taski_db as db;
 use taski_db::{PendingAction, Status, Task};
 
-/// CLI configuration. `--db` mirrors the daemon's; the TUI reads, the daemon writes.
+/// CLI configuration. `--db` is optional and overrides `db` in the config file
+/// (`~/.config/taski/config.toml`, overridable via `TASKI_CONFIG`); see
+/// `taski_config`. The TUI reads the same DB the daemon writes.
 #[derive(Parser, Debug)]
 #[command(
     name = "taski-tui",
@@ -38,9 +40,10 @@ use taski_db::{PendingAction, Status, Task};
     about = "Live, browsable task list reader for the taski SQLite index"
 )]
 struct Cli {
-    /// Path to the taski SQLite index database.
-    #[arg(long, default_value = "./taski.db")]
-    db: PathBuf,
+    /// Path to the taski SQLite index database. Overrides `db` in the config file;
+    /// defaults to `./taski.db` if absent everywhere.
+    #[arg(long)]
+    db: Option<PathBuf>,
 }
 
 /// How long `event::poll` blocks waiting for input between redraws.
@@ -58,6 +61,11 @@ const TRACK_CAP: usize = 64;
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Config is optional (a missing file yields defaults); a malformed file is a
+    // hard error. Resolve db: CLI flag → config → ./taski.db.
+    let cfg = taski_config::load().context("loading taski config")?;
+    let db_path = taski_config::resolve_db(cli.db.as_deref().and_then(Path::to_str), &cfg);
+
     // Restore the terminal even if a panic occurs mid-render.
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -67,7 +75,7 @@ fn main() -> Result<()> {
 
     // One long-lived reader connection: WAL lets it coexist with the daemon's writer
     // (separate process) for the whole session.
-    let conn = db::open(&cli.db.to_string_lossy()).context("opening taski database")?;
+    let conn = db::open(&db_path.to_string_lossy()).context("opening taski database")?;
 
     let mut terminal = enter_terminal()?;
     let result = run(&mut terminal, &conn);

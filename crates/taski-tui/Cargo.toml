@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+taski-config.workspace = true
 taski-db.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
