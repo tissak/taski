@@ -12,7 +12,17 @@ Produces `target/release/taski-daemon` and `target/release/taski-tui`.
 
 ## 2. Configure
 
-Write `~/.config/taski/config.toml` (XDG-style location; both fields are optional):
+Easiest — let the daemon write one for you:
+
+```sh
+./target/release/taski-daemon --init-config --vault /Users/tissak/obsidian/Personal-PARA
+```
+
+This writes `~/.config/taski/config.toml` (refusing to overwrite an existing one) with
+your vault and the conventional db path baked in. Drop `--vault` to write a template
+with a placeholder to fill in.
+
+Or write it by hand (`~/.config/taski/config.toml`; both fields are optional):
 
 ```toml
 # Example ~/.config/taski/config.toml

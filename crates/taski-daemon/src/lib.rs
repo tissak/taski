@@ -56,6 +56,13 @@ pub struct Cli {
     /// Run a single full scan and exit (do not start the watch loop).
     #[arg(long)]
     pub once: bool,
+    /// Write a ready-to-use config to the effective config path
+    /// (`~/.config/taski/config.toml`, or `$TASKI_CONFIG`) and exit — do not run the
+    /// daemon. If `--vault` is also given it is baked into the file; otherwise a
+    /// commented placeholder is written for you to fill in. Refuses to overwrite an
+    /// existing config.
+    #[arg(long)]
+    pub init_config: bool,
 }
 
 /// Entry point invoked by the binary's `main`. Parses CLI args, sets up tracing,
@@ -63,6 +70,13 @@ pub struct Cli {
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     init_tracing();
+
+    // `--init-config` is a setup-only action: write a config file and exit before
+    // any vault/db resolution or scanning. Handled before `load()` so it works even
+    // with no (or malformed) existing config.
+    if cli.init_config {
+        return write_initial_config(cli.vault.as_deref());
+    }
 
     // Config is optional (a missing file yields defaults); a malformed file is a
     // hard error.
@@ -107,6 +121,55 @@ pub fn run() -> Result<()> {
 
     run_watch_loop(&conn, &vault_root)?;
     Ok(())
+}
+
+/// Implements `--init-config`: write a ready-to-use config to the effective config
+/// path and return without running the daemon. Refuses to clobber an existing file.
+fn write_initial_config(vault: Option<&Path>) -> Result<()> {
+    let target = taski_config::config_path();
+    let db = default_db_path();
+    write_config_to(&target, vault, &db)?;
+    println!("Wrote {}.", target.display());
+    match vault {
+        Some(_) => {
+            println!("Edit if needed, then start the daemon (or run scripts/install-launchd.sh).")
+        }
+        None => println!(
+            "Open it and set `vault` to your Obsidian vault path before starting the daemon."
+        ),
+    }
+    Ok(())
+}
+
+/// Write a config template to `target`, creating parent dirs and refusing to overwrite
+/// an existing file. Separated from [`write_initial_config`] so the write/exists logic
+/// can be tested against a temp path rather than the real, environment-derived path.
+fn write_config_to(target: &Path, vault: Option<&Path>, db: &str) -> Result<()> {
+    if target.exists() {
+        anyhow::bail!(
+            "config already exists at {}; remove or edit it instead of --init-config",
+            target.display()
+        );
+    }
+    let body = taski_config::template(vault.and_then(Path::to_str), db);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating config dir {}", parent.display()))?;
+    }
+    fs::write(target, body).with_context(|| format!("writing config {}", target.display()))
+}
+
+/// Conventional default DB path baked into a generated config:
+/// `$HOME/.local/share/taski/taski.db`, falling back to `./taski.db` if `$HOME` is
+/// unset.
+fn default_db_path() -> String {
+    match std::env::var_os("HOME") {
+        Some(home) => Path::new(&home)
+            .join(".local/share/taski/taski.db")
+            .to_string_lossy()
+            .into_owned(),
+        None => "./taski.db".to_string(),
+    }
 }
 
 /// Read one note, recompute its tasks, and reconcile them into the index via
@@ -779,5 +842,39 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"- [ ] a\n");
         // The temp was cleaned up.
         assert!(!dir.path().join("note.md.taski.tmp").exists());
+    }
+
+    /// `--init-config` writes a valid config that round-trips through taski-config,
+    /// baking in the `--vault` value and creating parent dirs.
+    #[test]
+    fn write_config_to_creates_round_trip_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Nested target to confirm parent dirs are created.
+        let target = dir.path().join("nested").join("config.toml");
+        let vault = Path::new("/tmp/some-vault");
+        write_config_to(&target, Some(vault), "/tmp/taski.db").expect("write");
+
+        assert!(target.exists(), "config file should exist");
+        // Round-trips through taski-config.
+        let cfg = taski_config::load_from(&target).expect("generated config should parse");
+        assert_eq!(cfg.vault.as_deref(), Some("/tmp/some-vault"));
+        assert_eq!(cfg.db.as_deref(), Some("/tmp/taski.db"));
+    }
+
+    /// `--init-config` refuses to overwrite an existing config and leaves it untouched.
+    #[test]
+    fn write_config_to_refuses_to_clobber() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("config.toml");
+        fs::write(&target, "vault = \"/existing\"\n").unwrap();
+
+        let err = write_config_to(&target, None, "/tmp/x.db").expect_err("should refuse");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("already exists"), "got: {msg}");
+        // The existing file is untouched.
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "vault = \"/existing\"\n"
+        );
     }
 }
