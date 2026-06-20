@@ -333,6 +333,37 @@ pub fn pending_actions(conn: &Connection) -> rusqlite::Result<Vec<PendingAction>
     rows.collect()
 }
 
+/// The most-recently resolved actions (`state` in `done`/`failed`), newest first, up
+/// to `limit`. Ordering is by `resolved_at` descending (tie-broken by `id` desc so a
+/// burst of resolutions within the same second stays enqueue-ordered). Pending
+/// actions are excluded — this is the read-back path the TUI uses to learn how the
+/// actions it enqueued this session were resolved (see ADR-0002).
+pub fn recent_actions(conn: &Connection, limit: i64) -> rusqlite::Result<Vec<PendingAction>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, task_id, note_path, line_number, expected_char, new_char,
+                state, created_at, resolved_at, error
+         FROM pending_actions
+         WHERE state IN ('done', 'failed')
+         ORDER BY resolved_at DESC NULLS LAST, id DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![limit], |row| {
+        Ok(PendingAction {
+            id: row.get(0)?,
+            task_id: row.get::<_, i64>(1)?,
+            note_path: row.get(2)?,
+            line_number: row.get::<_, i64>(3)? as usize,
+            expected_char: row.get(4)?,
+            new_char: row.get(5)?,
+            state: row.get(6)?,
+            created_at: row.get(7)?,
+            resolved_at: row.get(8)?,
+            error: row.get(9)?,
+        })
+    })?;
+    rows.collect()
+}
+
 /// Mark an action resolved: `state` becomes `done` or `failed`, `resolved_at` is
 /// stamped, and an optional explanation `error` is recorded.
 pub fn resolve_action(
@@ -514,6 +545,58 @@ mod tests {
         let id2 = enqueue_action(&conn, 99, "note2.md", 1, "x", " ").unwrap();
         resolve_action(&conn, id2, "failed", Some("note changed externally")).unwrap();
         assert!(pending_actions(&conn).unwrap().is_empty());
+    }
+
+    /// `recent_actions` returns resolved (`done`/`failed`) actions newest-first,
+    /// excludes pending ones, honours the limit, and carries the error text.
+    #[test]
+    fn recent_actions_returns_resolved_newest_first() {
+        let conn = open(":memory:").unwrap();
+
+        // Helper: enqueue an action, then resolve it with a backdated `resolved_at`
+        // (so ordering is deterministic regardless of wall-clock granularity).
+        let enqueue_resolved =
+            |task_id: i64, state: &str, resolved_at: i64, error: Option<&str>| {
+                let id = enqueue_action(&conn, task_id, "note.md", 1, " ", "x").unwrap();
+                conn.execute(
+                "UPDATE pending_actions SET state = ?1, resolved_at = ?2, error = ?3 WHERE id = ?4",
+                rusqlite::params![state, resolved_at, error, id],
+            )
+            .unwrap();
+                id
+            };
+
+        // id1: done @100 ; id2: failed @300 (newest) ; id3: failed @200.
+        let id1 = enqueue_resolved(1, "done", 100, None);
+        let id2 = enqueue_resolved(2, "failed", 300, Some("note changed externally"));
+        let id3 = enqueue_resolved(3, "failed", 200, Some("task no longer in index"));
+        // A still-pending action — must be excluded.
+        let pending_id = enqueue_action(&conn, 9, "note.md", 1, " ", "x").unwrap();
+
+        let got = recent_actions(&conn, 64).unwrap();
+        // Newest resolved_at first: id2 (300), id3 (200), id1 (100).
+        assert_eq!(
+            got.iter().map(|a| a.id).collect::<Vec<_>>(),
+            vec![id2, id3, id1],
+            "should be ordered newest-resolved first"
+        );
+        assert_eq!(got[0].state, "failed");
+        assert_eq!(got[0].error.as_deref(), Some("note changed externally"));
+        assert_eq!(got[2].state, "done");
+        assert!(
+            got.iter().all(|a| a.id != pending_id),
+            "pending actions must be excluded"
+        );
+
+        // LIMIT is honoured.
+        let limited = recent_actions(&conn, 2).unwrap();
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited[0].id, id2);
+        assert_eq!(limited[1].id, id3);
+
+        // An empty table yields an empty result (not an error).
+        let empty = recent_actions(&open(":memory:").unwrap(), 10).unwrap();
+        assert!(empty.is_empty());
     }
 
     /// M2 housekeeping: `prune_old_actions` deletes only resolved actions older than

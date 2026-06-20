@@ -28,7 +28,7 @@ use ratatui::{Frame, Terminal};
 use rusqlite::Connection;
 
 use taski_db as db;
-use taski_db::{Status, Task};
+use taski_db::{PendingAction, Status, Task};
 
 /// CLI configuration. `--db` mirrors the daemon's; the TUI reads, the daemon writes.
 #[derive(Parser, Debug)]
@@ -47,6 +47,13 @@ struct Cli {
 const POLL_TIMEOUT: Duration = Duration::from_millis(250);
 /// Re-read the index at least this often, independent of input.
 const REFRESH_INTERVAL: Duration = Duration::from_millis(750);
+/// How many of the most-recent action resolutions to read back each refresh, to learn
+/// whether actions the TUI enqueued this session were applied or refused.
+const RECENT_ACTION_LIMIT: i64 = 64;
+/// Upper bound on the number of unresolved session actions we track. The set is
+/// drained as the daemon resolves them, so this only bounds growth if the daemon
+/// stalls; oldest entries are dropped first.
+const TRACK_CAP: usize = 64;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -261,6 +268,14 @@ struct App {
     state: ListState,
     filter: StatusFilter,
     expanded: HashSet<String>,
+    /// Ids of actions enqueued this session that the daemon hasn't resolved yet. Each
+    /// refresh we read back their resolution: `done` drops them silently (the flip is
+    /// already visible), `failed` surfaces a notice, `pending` stays tracked.
+    pending_session_actions: Vec<i64>,
+    /// The current write-back failure notice to display, if any. `None` means nothing
+    /// to report. Set when a tracked action resolves `failed`; cleared the next time
+    /// the user enqueues an action (the natural "try again / move on" gesture).
+    notice: Option<String>,
 }
 
 impl App {
@@ -274,6 +289,8 @@ impl App {
             // Empty = every group starts collapsed. Stable across refreshes: notes the
             // daemon adds later also start collapsed.
             expanded: HashSet::new(),
+            pending_session_actions: Vec::new(),
+            notice: None,
         }
     }
 
@@ -296,10 +313,46 @@ impl App {
         reconcile_view_selection(&self.rows, note.as_deref(), task_id, idx, &mut self.state);
     }
 
-    /// Re-read the index from the DB, then rebuild the view.
+    /// Re-read the index from the DB, then rebuild the view and poll the resolution
+    /// of actions enqueued this session so a refused write-back gets surfaced.
     fn refresh(&mut self, conn: &Connection) -> Result<()> {
         self.tasks = db::all_tasks(conn).context("reading tasks from index")?;
         self.rebuild();
+        self.poll_action_resolutions(conn)?;
+        Ok(())
+    }
+
+    /// Read back the resolution of actions this session enqueued. For each tracked id
+    /// that has now resolved: drop it from tracking; successes are silent (the flip is
+    /// already visible on refresh), failures surface a notice. Still-pending actions
+    /// stay tracked. If several fail in one cycle, the newest is surfaced.
+    fn poll_action_resolutions(&mut self, conn: &Connection) -> Result<()> {
+        if self.pending_session_actions.is_empty() {
+            return Ok(());
+        }
+        let recent = db::recent_actions(conn, RECENT_ACTION_LIMIT)
+            .context("reading recent action resolutions")?;
+        let tracked: HashSet<i64> = self.pending_session_actions.iter().copied().collect();
+
+        // `recent` is newest-resolved first; the first failed tracked row is the newest
+        // failure to surface. Compute the notice before mutating self so the borrows
+        // don't overlap.
+        let notice = recent
+            .iter()
+            .find(|a| tracked.contains(&a.id) && a.state == "failed")
+            .map(render_failure_notice);
+        // Every tracked id present in `recent` has resolved (recent only holds
+        // done/failed rows) — drop those from tracking.
+        let resolved: HashSet<i64> = recent
+            .iter()
+            .map(|a| a.id)
+            .filter(|id| tracked.contains(id))
+            .collect();
+        self.pending_session_actions
+            .retain(|id| !resolved.contains(id));
+        if let Some(msg) = notice {
+            self.notice = Some(msg);
+        }
         Ok(())
     }
 
@@ -390,13 +443,30 @@ impl App {
 
     /// Enqueue a checkbox-flip for the task under the cursor. No-op on a header or an
     /// empty list — the flip must always resolve to the exact task the user sees, never
-    /// a header row. Enqueue errors are logged to stderr and never propagate.
-    fn submit_toggle(&self, conn: &Connection) {
-        let Some(task) = self.selected_task() else {
-            return;
+    /// a header row. On success the new action id is tracked so its resolution is
+    /// surfaced on a later refresh, and any prior notice is cleared (enqueueing again
+    /// is the natural "try again / move on" gesture). Enqueue errors are logged to
+    /// stderr and never propagated.
+    fn submit_toggle(&mut self, conn: &Connection) {
+        // Resolve + enqueue inside a block so the immutable borrow of `self` (via
+        // `selected_task`) is dropped before we mutate `self` below.
+        let result = {
+            let Some(task) = self.selected_task() else {
+                return;
+            };
+            enqueue_toggle(conn, task)
         };
-        if let Err(e) = enqueue_toggle(conn, task) {
-            eprintln!("taski: could not enqueue toggle: {e:#}");
+        match result {
+            Ok(id) => {
+                self.notice = None;
+                self.pending_session_actions.push(id);
+                // Bound growth if the daemon stalls: drop the oldest beyond the cap.
+                if self.pending_session_actions.len() > TRACK_CAP {
+                    let drop_count = self.pending_session_actions.len() - TRACK_CAP;
+                    self.pending_session_actions.drain(0..drop_count);
+                }
+            }
+            Err(e) => eprintln!("taski: could not enqueue toggle: {e:#}"),
         }
     }
 }
@@ -466,10 +536,11 @@ fn toggle_target_char(raw: &str) -> &'static str {
 }
 
 /// Enqueue a checkbox-flip request for `task` into the shared `pending_actions`
-/// table. Non-blocking: just inserts a row; the daemon applies it.
-fn enqueue_toggle(conn: &Connection, task: &Task) -> Result<()> {
+/// table. Non-blocking: just inserts a row; the daemon applies it. Returns the new
+/// row id so the caller can track its resolution across refreshes.
+fn enqueue_toggle(conn: &Connection, task: &Task) -> Result<i64> {
     let new_char = toggle_target_char(&task.raw_checkbox_char);
-    db::enqueue_action(
+    let id = db::enqueue_action(
         conn,
         task.id,
         &task.note_path,
@@ -478,14 +549,64 @@ fn enqueue_toggle(conn: &Connection, task: &Task) -> Result<()> {
         new_char,
     )
     .context("enqueuing toggle action")?;
-    Ok(())
+    Ok(id)
+}
+
+/// Translate a daemon failure `error` string into short, plain wording the user can
+/// act on. Keys off the stable phrases produced by the daemon's `ApplyOutcome` arms;
+/// unknown errors fall back to a trimmed copy of the daemon message.
+fn friendly_failure_reason(error: &str) -> String {
+    let e = error.trim();
+    if e.contains("note changed externally") {
+        "this note changed in Obsidian".to_string()
+    } else if e.contains("no longer in index") || e.contains("note gone") {
+        "this task is no longer in the note".to_string()
+    } else if e.contains("no longer matches expected bytes") {
+        "the checkbox line changed".to_string()
+    } else if e.contains("invalid new_char") {
+        "the request was not valid".to_string()
+    } else if e.is_empty() {
+        "it could not be applied".to_string()
+    } else {
+        e.to_string()
+    }
+}
+
+/// Compose the one-line failure notice for a refused action: the outcome, the plain
+/// reason, and the source note for context.
+fn render_failure_notice(action: &PendingAction) -> String {
+    let reason = action
+        .error
+        .as_deref()
+        .map(friendly_failure_reason)
+        .unwrap_or_else(|| "it could not be applied".to_string());
+    format!(
+        "Toggle not applied — {reason} ({}). Press Space to try again.",
+        action.note_path
+    )
 }
 
 /// Render the grouped task list (or the empty placeholder), a title bar reflecting
-/// the live counts and active filter, and a footer keybinding cheat-sheet.
+/// the live counts and active filter, an optional write-back failure notice, and a
+/// footer keybinding cheat-sheet. The notice row appears only when there's a failure
+/// to surface, so the list keeps its full height when there's nothing to report.
 fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
+    // The notice row is reserved only when a notice is present.
+    let notice_present = app.notice.is_some();
+    let constraints: Vec<Constraint> = if notice_present {
+        vec![
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ]
+    } else {
+        vec![Constraint::Min(1), Constraint::Length(1)]
+    };
+    let chunks = Layout::vertical(constraints).split(area);
+    let list_area = chunks[0];
+    let footer_area = chunks[chunks.len() - 1];
+    let notice_area = notice_present.then(|| chunks[1]);
 
     let open_total = app
         .tasks
@@ -513,9 +634,6 @@ fn draw(frame: &mut Frame, app: &mut App) {
     ]);
     let block = Block::default().borders(Borders::ALL).title(title);
 
-    let list_area = chunks[0];
-    let footer_area = chunks[1];
-
     if app.rows.is_empty() {
         let msg = match (app.tasks.is_empty(), app.filter) {
             (true, _) => "No tasks — run `cargo run -p taski-daemon` first to populate the index.",
@@ -530,6 +648,18 @@ fn draw(frame: &mut Frame, app: &mut App) {
             .block(block)
             .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
         frame.render_stateful_widget(list, list_area, &mut app.state);
+    }
+
+    // Write-back failure notice: red, between the list and the footer, only when set.
+    if let (Some(area), Some(msg)) = (notice_area, &app.notice) {
+        let line = Line::from(vec![
+            Span::styled(
+                " ⚠  ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(msg.clone(), Style::default().fg(Color::Red)),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
     }
 
     let footer = Paragraph::new(Line::from(vec![
@@ -1015,11 +1145,14 @@ mod tests {
         assert!(db::pending_actions(&conn).unwrap().is_empty());
 
         let t = task(1, " ", 3, "n.md");
-        enqueue_toggle(&conn, &t).unwrap();
+        let returned_id = enqueue_toggle(&conn, &t).unwrap();
 
         let pending = db::pending_actions(&conn).unwrap();
         assert_eq!(pending.len(), 1);
         let p = &pending[0];
+        // The returned id must be the row's id — the session-tracking feature relies
+        // on this contract to follow an action's resolution across refreshes.
+        assert_eq!(returned_id, p.id);
         assert_eq!(p.task_id, 1);
         assert_eq!(p.note_path, "n.md");
         assert_eq!(p.line_number, 3);
@@ -1031,9 +1164,236 @@ mod tests {
         // A done task enqueues a flip back to open.
         db::resolve_action(&conn, p.id, "done", None).unwrap(); // clear the queue
         let done_task = task(2, "x", 7, "n.md");
-        enqueue_toggle(&conn, &done_task).unwrap();
+        let returned_id2 = enqueue_toggle(&conn, &done_task).unwrap();
         let p2 = &db::pending_actions(&conn).unwrap()[0];
+        assert_eq!(returned_id2, p2.id);
         assert_eq!(p2.expected_char, "x");
         assert_eq!(p2.new_char, " ");
+    }
+
+    /// The failure-notice mapping translates each daemon `ApplyOutcome` phrase into
+    /// plain wording, and falls back to a trimmed copy of anything unknown.
+    #[test]
+    fn friendly_failure_reason_maps_each_category() {
+        assert_eq!(
+            friendly_failure_reason("note changed externally since scan; action not applied"),
+            "this note changed in Obsidian",
+        );
+        assert_eq!(
+            friendly_failure_reason("task no longer in index (or note gone); action not applied"),
+            "this task is no longer in the note",
+        );
+        assert_eq!(
+            friendly_failure_reason(
+                "checkbox line no longer matches expected bytes; action not applied"
+            ),
+            "the checkbox line changed",
+        );
+        assert_eq!(
+            friendly_failure_reason("invalid new_char; action not applied"),
+            "the request was not valid",
+        );
+        // Unknown -> trimmed copy.
+        assert_eq!(
+            friendly_failure_reason("  something unusual happened  "),
+            "something unusual happened"
+        );
+        // Empty -> generic.
+        assert_eq!(friendly_failure_reason(""), "it could not be applied");
+        assert_eq!(friendly_failure_reason("   "), "it could not be applied");
+    }
+
+    /// A refused action surfaces a notice naming the note and the plain reason.
+    #[test]
+    fn failed_action_surfaces_notice_on_refresh() {
+        let conn = db::open(":memory:").unwrap();
+        db::upsert_task(&conn, &task(1, " ", 1, "alpha.md")).unwrap();
+
+        let mut app = App::new();
+        app.filter = StatusFilter::All;
+        app.refresh(&conn).unwrap();
+        app.expanded.insert("alpha.md".to_string());
+        app.rebuild();
+        app.state.select(Some(1)); // on the task
+        app.submit_toggle(&conn);
+        // Sanity: exactly one action was enqueued and is tracked.
+        let pending = db::pending_actions(&conn).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(app.pending_session_actions, vec![pending[0].id]);
+        assert!(app.notice.is_none(), "no notice before resolution");
+
+        // Daemon refuses it: note changed externally.
+        db::resolve_action(
+            &conn,
+            pending[0].id,
+            "failed",
+            Some("note changed externally since scan; action not applied"),
+        )
+        .unwrap();
+        app.refresh(&conn).unwrap();
+
+        let notice = app
+            .notice
+            .as_deref()
+            .expect("failure should surface a notice");
+        assert!(notice.contains("alpha.md"), "notice should name the note");
+        assert!(
+            notice.contains("this note changed in Obsidian"),
+            "notice should carry the plain reason"
+        );
+        assert!(notice.contains("Space"), "notice should hint the retry key");
+        // The resolved id is no longer tracked.
+        assert!(
+            app.pending_session_actions.is_empty(),
+            "resolved id should drop from tracking"
+        );
+    }
+
+    /// A successfully-applied action surfaces NO notice (the flip is already visible
+    /// on the refresh); its id drops from tracking.
+    #[test]
+    fn done_action_surfaces_no_notice() {
+        let conn = db::open(":memory:").unwrap();
+        db::upsert_task(&conn, &task(1, " ", 1, "alpha.md")).unwrap();
+
+        let mut app = App::new();
+        app.filter = StatusFilter::All;
+        app.refresh(&conn).unwrap();
+        app.expanded.insert("alpha.md".to_string());
+        app.rebuild();
+        app.state.select(Some(1));
+        app.submit_toggle(&conn);
+        let id = db::pending_actions(&conn).unwrap()[0].id;
+
+        db::resolve_action(&conn, id, "done", None).unwrap();
+        app.refresh(&conn).unwrap();
+
+        assert!(
+            app.notice.is_none(),
+            "a successful flip must not show a notice"
+        );
+        assert!(
+            app.pending_session_actions.is_empty(),
+            "done id should drop from tracking"
+        );
+    }
+
+    /// A still-pending action surfaces nothing and stays tracked.
+    #[test]
+    fn pending_action_surfaces_no_notice_and_stays_tracked() {
+        let conn = db::open(":memory:").unwrap();
+        db::upsert_task(&conn, &task(1, " ", 1, "alpha.md")).unwrap();
+
+        let mut app = App::new();
+        app.filter = StatusFilter::All;
+        app.refresh(&conn).unwrap();
+        app.expanded.insert("alpha.md".to_string());
+        app.rebuild();
+        app.state.select(Some(1));
+        app.submit_toggle(&conn);
+        let id = db::pending_actions(&conn).unwrap()[0].id;
+
+        // No resolution yet.
+        app.refresh(&conn).unwrap();
+
+        assert!(
+            app.notice.is_none(),
+            "pending action must not show a notice"
+        );
+        assert_eq!(
+            app.pending_session_actions,
+            vec![id],
+            "pending id should stay tracked"
+        );
+    }
+
+    /// Enqueueing a new action clears any existing notice (the "try again / move on"
+    /// gesture) and tracks the new id.
+    #[test]
+    fn notice_clears_on_next_enqueue() {
+        let conn = db::open(":memory:").unwrap();
+        db::upsert_task(&conn, &task(1, " ", 1, "alpha.md")).unwrap();
+        db::upsert_task(&conn, &task(2, " ", 2, "alpha.md")).unwrap();
+
+        let mut app = App::new();
+        app.filter = StatusFilter::All;
+        app.refresh(&conn).unwrap();
+        app.expanded.insert("alpha.md".to_string());
+        app.rebuild();
+
+        // First toggle: refused -> notice shown.
+        app.state.select(Some(1));
+        app.submit_toggle(&conn);
+        let id1 = db::pending_actions(&conn).unwrap()[0].id;
+        db::resolve_action(
+            &conn,
+            id1,
+            "failed",
+            Some("note changed externally since scan"),
+        )
+        .unwrap();
+        app.refresh(&conn).unwrap();
+        assert!(app.notice.is_some(), "notice should be set after a refusal");
+
+        // Second toggle: clears the notice immediately, tracks the new id.
+        app.state.select(Some(2));
+        app.submit_toggle(&conn);
+        assert!(
+            app.notice.is_none(),
+            "new enqueue should clear the prior notice"
+        );
+        // id1 was resolved `failed` so only the new id2 is still pending.
+        let id2 = db::pending_actions(&conn).unwrap()[0].id;
+        assert_eq!(
+            app.pending_session_actions,
+            vec![id2],
+            "only the new id should be tracked (resolved id1 dropped on prior refresh)"
+        );
+    }
+
+    /// With no session actions, a refresh surfaces nothing.
+    #[test]
+    fn no_session_action_means_no_notice() {
+        let conn = db::open(":memory:").unwrap();
+        // A failed action exists in the DB but was NOT enqueued this session.
+        let id = db::enqueue_action(&conn, 5, "other.md", 1, " ", "x").unwrap();
+        db::resolve_action(
+            &conn,
+            id,
+            "failed",
+            Some("note changed externally since scan"),
+        )
+        .unwrap();
+
+        let mut app = App::new();
+        app.refresh(&conn).unwrap();
+        assert!(
+            app.notice.is_none(),
+            "failures from outside this session must not surface"
+        );
+        assert!(app.pending_session_actions.is_empty());
+    }
+
+    /// `render_failure_notice` produces a single-line message with reason + note.
+    #[test]
+    fn render_failure_notice_includes_reason_and_note() {
+        let conn = db::open(":memory:").unwrap();
+        let id = db::enqueue_action(&conn, 1, "Daily.md", 3, " ", "x").unwrap();
+        db::resolve_action(
+            &conn,
+            id,
+            "failed",
+            Some("note changed externally since scan; action not applied"),
+        )
+        .unwrap();
+        let action = db::recent_actions(&conn, 8)
+            .unwrap()
+            .into_iter()
+            .find(|a| a.id == id)
+            .unwrap();
+        let msg = render_failure_notice(&action);
+        assert!(msg.contains("Daily.md"));
+        assert!(msg.contains("this note changed in Obsidian"));
+        assert!(msg.contains("Space"));
     }
 }
