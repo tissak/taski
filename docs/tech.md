@@ -48,7 +48,7 @@ Authoritative record of technology choices for Taski. Each entry has a one-line 
 | **`tempfile`** | Integration tests against throwaway fake vaults — never the real vault. (Real vault is exercised at runtime via `taski.db`, which is gitignored.) | 2026-06-20 |
 | **`proptest`** | Property tests: parser never panics on arbitrary input; (Slice 3+) write-back "never corrupts" + stable identity. | 2026-06-20 |
 | **`cargo-fuzz`** | *Deferred* — needs nightly; `proptest` covers the "never panic" property on stable for now. Revisit when nightly is acceptable. | 2026-06-20 |
-| **`cargo-deny`** | CI advisory/license/supply-chain checks. | 2026-06-20 |
+| **`cargo-deny`** | Advisory/license/supply-chain checks. **Not** wired into CI (no `deny.toml`); run locally. | 2026-06-20 |
 
 ## Explicitly Rejected (for MVP)
 | Choice | Why rejected | Revisit when |
@@ -59,7 +59,7 @@ Authoritative record of technology choices for Taski. Each entry has a one-line 
 | Choice | Rationale | Decided |
 |---|---|---|
 | **Cargo workspace** (`taski-core` / `taski-config` / `taski-db` / `taski-daemon` / `taski-tui`) | Shared schema/types prevent drift; one canonical schema definition in `taski-db`; config loading isolated in `taski-config`. | 2026-06-20 |
-| **GitHub Actions on macOS** | Primary platform is darwin; fmt + clippy (-D warnings) + test + cargo-deny. | 2026-06-20 |
+| **GitHub Actions on macOS** | Primary platform is darwin; `fmt --check` + `clippy -D warnings` + `test` (no `cargo-deny` step yet). | 2026-06-20 |
 | **`rust-toolchain.toml`** (pinned) | Reproducible builds across CI and local. | 2026-06-20 |
 
 ## Packaging / Distribution
