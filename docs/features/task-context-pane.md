@@ -134,16 +134,20 @@ write-back notice + the checkbox visibly flipping on the next poll.
 **so that** I can recall its full intent and close it confidently without leaving the TUI.
 
 **Acceptance Criteria:**
-- [ ] The TUI renders a two-pane layout: task list on the left, note context on the right.
-- [ ] Selecting a task (move up/down) updates the right pane to show that task's note, with
+- [x] The TUI renders a two-pane layout: task list on the left, note context on the right.
+      *(Phase B — `2e0e201`)*
+- [x] Selecting a task (move up/down) updates the right pane to show that task's note, with
       the task's line highlighted and centered in a window of surrounding lines.
-- [ ] The right pane is **read-only**; toggling a task still flows through the existing
+      *(Phase B — `2e0e201`; `context_view` + `sync_context`)*
+- [x] The right pane is **read-only**; toggling a task still flows through the existing
       `pending_actions` → daemon write-back path (ADRs 0002/0003/0004 unchanged).
-- [ ] The TUI **never opens a vault file directly** — all note content is read from the
-      SQLite index, as today.
-- [ ] The pane degrades gracefully when context is unavailable (placeholder, no panic).
-- [ ] The pane reflects a toggle within the normal ~1–2s scan/poll latency (checkbox flips
-      visibly in both panes after write-back).
+      *(unchanged — pane is render-only)*
+- [x] The TUI **never opens a vault file directly** — all note content is read from the
+      SQLite index, as today. *(ADR-0006 — `028ab19`)*
+- [x] The pane degrades gracefully when context is unavailable (placeholder, no panic).
+      *(Phase B — `draw_context_pane` placeholder branch)*
+- [x] The pane reflects a toggle within the normal ~1–2s scan/poll latency (checkbox flips
+      visibly in both panes after write-back). *(`sync_context` force-reloads each 750ms)*
 
 ### Supporting Behaviors (Should Have)
 
@@ -151,13 +155,15 @@ write-back notice + the checkbox visibly flipping on the next poll.
 **I want to** scroll the context pane independently,
 **so that** I can read more of the note than the default window shows.
 
-- [ ] A dedicated key scrolls the context pane without moving task selection.
+- [x] A dedicated key scrolls the context pane without moving task selection.
+      *(Phase C — `J`/`K`; `8d7dc1b`)*
 
 **As a** user,
 **I want to** collapse the context pane to reclaim the full-width list,
 **so that** I can work in either mode.
 
-- [ ] A key toggles the pane between split and full-width-list.
+- [x] A key toggles the pane between split and full-width-list.
+      *(Phase C — `p`; auto-hides below `MIN_SPLIT_WIDTH=60`; `8d7dc1b`)*
 
 ### Future Considerations (Could Have)
 
@@ -257,10 +263,13 @@ loop. No new crates, no new third-party deps (rendering is plain `ratatui` text)
 
 - Confirm the context scroll keybinding (`J`/`K` vs `Ctrl-d`/`Ctrl-u`) and the pane-toggle
   key (`Tab`) don't collide with anything planned.
+  *(Resolved: `J`/`K` for scroll, `p` for toggle — `Tab`/`⇧Tab` stay expand/collapse-all.)*
 - Decide the default window size (e.g., ±12 lines) and whether it's hardcoded v1 or
   config-driven from day one.
+  *(Resolved: auto-center on the available pane height in `context_view`; hardcoded v1.)*
 - Do we store full note content, or only a bounded window, in `note_contents`? (Recommend
   full content per note — simplest, lets the TUI choose any window; revisit if storage bites.)
+  *(Resolved: full content per note, as recommended.)*
 
 ---
 
@@ -339,9 +348,14 @@ read-only context window; optional scroll + collapse.
 **Biggest Risk:** UX — the pane crowding narrow terminals / not being valuable enough to
 keep default-on. Mitigated by a toggle key and real-world use feedback.
 
-**Next Actions:**
-1. Record the architecture choice as **ADR-0006** (note content cached in the index; does
-   not relax ADR-0002).
-2. Implement **Phase A** (schema v3 + `note_contents` + daemon write + db read + tests).
-3. Implement **Phase B** (non-scrolling context window in the TUI) to prove the vertical.
-4. Polish in **Phase C** (scroll, toggle, edge cases, view-model tests).
+**Next Actions:** *(all complete)*
+1. ~~Record the architecture choice as **ADR-0006** (note content cached in the index; does
+   not relax ADR-0002).~~ ✅ `028ab19`
+2. ~~Implement **Phase A** (schema v3 + `note_contents` + daemon write + db read + tests).~~
+   ✅ `028ab19`
+3. ~~Implement **Phase B** (non-scrolling context window in the TUI) to prove the vertical.~~
+   ✅ `2e0e201`
+4. ~~Polish in **Phase C** (scroll, toggle, edge cases, view-model tests).~~ ✅ `8d7dc1b`
+
+**Status:** Feature complete; all gates green (fmt / clippy `-D warnings` / `test --all`,
+37 TUI tests). Live against the user's vault; qualitative adoption TBD (see Kill Switch).

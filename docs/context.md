@@ -311,7 +311,7 @@ These are the things that aren't obvious from reading the code and will cost you
 | `taski-daemon/tests/scan.rs` | End-to-end scan of a fake vault → correct task rows. |
 | `taski-daemon/tests/reconcile.rs` | Content-hash reconciliation: identity survives edits, deletes, reorders. |
 | `taski-daemon/tests/writeback.rs` + `writeback_proptest.rs` | The safety contract: atomic_write commits on match, refuses on conflict, never corrupts. |
-| `taski-tui` unit tests (in `main.rs`) | View model: grouping, collapse, filter, display-index↔Task mapping, selection reconciliation, failure-notice surfacing. |
+| `taski-tui` unit tests (in `main.rs`) | View model: grouping, collapse, filter, display-index↔Task mapping, selection reconciliation, failure-notice surfacing, context-pane render/scroll/toggle + `context_view` centering (headless `TestBackend` smoke). |
 
 Tests use `tempfile` fake vaults and `:memory:` or temp-file DBs. The real vault is
 exercised only at runtime (its `taski.db` is gitignored).
@@ -326,7 +326,8 @@ exercised only at runtime (its `taski.db` is gitignored).
 | Change the DB schema | `taski-db::SCHEMA` + bump `SCHEMA_VERSION`; update `reconcile_note`/`upsert_task` |
 | Cache/read note content for the TUI context pane | `taski-db`: `note_contents` table + `upsert_note_content`/`note_content`/`delete_note_content`; daemon writes it in `index_note` ([ADR-0006](./adr/0006-note-content-cached-in-index.md)) |
 | Change write-back behavior | `taski-daemon`: `process_action`, `atomic_write` (mind ADR-0004 TOCTOU) |
-| Change how the TUI looks/behaves | `taski-tui/src/main.rs`: `App`, `build_view`, key handling |
+| Change how the TUI looks/behaves | `taski-tui/src/main.rs`: `App`, `build_view`, `context_view`/`draw_context_pane`, key handling |
+| Change context-pane keybindings/behavior | `taski-tui/src/main.rs` key match in `run()` (`J`/`K` scroll, `p` toggle) + `MIN_SPLIT_WIDTH` auto-hide; `sync_context` for the read path |
 | Add a CLI flag | `Cli` struct in the relevant binary's `lib.rs`/`main.rs` |
 | Change config format/precedence | `taski-config/src/lib.rs` |
 | Run a one-shot scan (no watcher) | `taski-daemon --once --vault …` |
