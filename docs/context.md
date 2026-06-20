@@ -1,6 +1,6 @@
 # Taski — Engineering Context & Onboarding
 
-*Onboarding guide for new engineers. Last updated: 2026-06-20 (v0.4 — adds `exclude_dirs` config + ADR-0011 bullet toggle and undo; 165 tests across 6 crates).*
+*Onboarding guide for new engineers. Last updated: 2026-06-20 (v0.4 — adds `exclude_dirs` config + ADR-0011 bullet toggle and undo; CR1 code-review pass applied; 178 tests across 6 crates).*
 
 This document is the "operating manual" for working on Taski: what it is, how it's
 built, the decisions that are load-bearing (and must not be casually undone), and the
@@ -49,7 +49,7 @@ Cargo workspace, edition 2024, six crates. Dependencies point downward only (no 
 | `taski-tui` | The `ratatui` client: polls the index, groups by note, filters (status-cycle `f`, Today view `T`, text search `/`, file search `F`), renders, submits toggle (`Space`) / mark-for-today (`t`) / bullet toggle (`b`) / undo (`u`) actions, and shows the context pane via the cached `note_contents` table. Never touches vault files. **lib + bin** — public entry points `run()` / `run_with_db(db)` / `run_combined(db, quit_hook)`; `main.rs` is a thin shim. Key internal modules: `App` (state machine), `build_view` (filter pipeline), `draw` (render), `run_loop` (input). | `crates/taski-tui/src/{lib,main}.rs` |
 | `taski` | The **unified launcher** binary: runs the daemon (background thread) + TUI (main thread) together by default (`taski`), or either alone via `taski daemon` / `taski tui` subcommands. Attach-or-spawn + single-writer lock (ADRs 0007/0008). | `crates/taski/src/main.rs` |
 
-Supporting: `docs/` (PRD, tech, ADRs, setup, this file), `scripts/install-launchd.sh`
+Supporting: `docs/` (PRD, tech, ADRs, setup, code reviews under `docs/cr/`, this file), `scripts/install-launchd.sh`
 + `uninstall-launchd.sh`, `.github/workflows/ci.yml`, `rust-toolchain.toml`.
 
 ---
@@ -59,7 +59,7 @@ Supporting: `docs/` (PRD, tech, ADRs, setup, this file), `scripts/install-launch
 ```sh
 cargo build --workspace                       # dev build
 cargo build --release --workspace             # optimized daily-driver binaries
-cargo test --workspace                        # all tests (~165 as of v0.4)
+cargo test --workspace                        # all tests (~178 as of v0.4)
 cargo test -p taski-daemon writeback          # run one suite / filter by name
 ```
 
@@ -432,7 +432,9 @@ These are the things that aren't obvious from reading the code and will cost you
   daemon thread garbles it. Daemon-thread events go to `<db_dir>/daemon.log` via
   `init_tracing_to_file`. If you add code that runs on the daemon thread, use `tracing`
   (not `eprintln!`). (`taski daemon` / standalone `taski-daemon` still use stderr — fine,
-  no TUI.)
+  no TUI.) The same applies to the **TUI thread itself**: never `eprintln!` from TUI code —
+  the alternate screen is owned for the whole session, so errors are swallowed (see
+  `sync_context` / `track_enqueued`) rather than written to stderr.
 
 - **`ctrlc::set_handler` is process-global and single-install.** Only `taski daemon` and
   standalone `taski-daemon` install it. Combined mode must **not** — the TUI runs in
