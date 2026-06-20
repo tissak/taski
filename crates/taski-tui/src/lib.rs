@@ -726,8 +726,9 @@ impl App {
     /// Keep the context pane's cached note content in step with the selection (ADR-0006).
     /// Reads `db::note_content` only when the selection moved to a *different* note (or
     /// `force` is set, used on refresh to pick up re-indexed content). The TUI still
-    /// never opens a vault file — this is an index read. Read errors are logged to
-    /// stderr and never propagated (a stale/blank pane must not kill the session).
+    /// never opens a vault file — this is an index read. Read errors are swallowed
+    /// and never propagated (a stale/blank pane must not kill the session; S1: the
+    /// TUI owns the alternate screen, so it must not write to stderr).
     fn sync_context(&mut self, conn: &Connection, force: bool) {
         let target = self.selected_note_path();
         let changed = target.as_deref() != self.ctx_note_path.as_deref();
@@ -739,13 +740,10 @@ impl App {
             }
             Some(np) => {
                 if force || changed {
-                    self.ctx_content = match db::note_content(conn, &np) {
-                        Ok(nc) => nc,
-                        Err(e) => {
-                            eprintln!("taski: could not read note content for {np}: {e:#}");
-                            None
-                        }
-                    };
+                    // S1: never write to stderr from the TUI thread — it owns the
+                    // alternate screen, so any stderr output garbles the display.
+                    // A failed read just leaves the context pane empty.
+                    self.ctx_content = db::note_content(conn, &np).unwrap_or_default();
                     self.ctx_note_path = Some(np);
                     if changed {
                         // Selection moved to a different note: recenter the pane.
@@ -760,8 +758,9 @@ impl App {
     /// empty list — the flip must always resolve to the exact task the user sees, never
     /// a header row. On success the new action id is tracked so its resolution is
     /// surfaced on a later refresh, and any prior notice is cleared (enqueueing again
-    /// is the natural "try again / move on" gesture). Enqueue errors are logged to
-    /// stderr and never propagated.
+    /// is the natural "try again / move on" gesture). Enqueue errors are swallowed
+    /// and never propagated (the TUI owns the alternate screen; writing to stderr
+    /// would garble it).
     fn submit_toggle(&mut self, conn: &Connection) {
         let (result, last_action) = {
             let Some(task) = self.selected_task() else {
@@ -777,7 +776,11 @@ impl App {
             };
             (enqueue_toggle(conn, task), Some(action))
         };
-        self.last_action = last_action;
+        // S4: only record an undoable action if the enqueue actually succeeded —
+        // otherwise `u` would try to reverse a write that never landed.
+        if result.is_ok() {
+            self.last_action = last_action;
+        }
         self.track_enqueued(result, "toggle");
     }
 
@@ -798,7 +801,9 @@ impl App {
             };
             (enqueue_bullet_toggle(conn, task), Some(action))
         };
-        self.last_action = last_action;
+        if result.is_ok() {
+            self.last_action = last_action;
+        }
         self.track_enqueued(result, "bullet toggle");
     }
 
@@ -844,20 +849,20 @@ impl App {
     /// Record the outcome of an enqueue ([`submit_toggle`] /
     /// [`submit_set_scheduled`]): on success, track the new id so its resolution is
     /// surfaced on a later refresh, clear any prior notice, and bound growth if the
-    /// daemon stalls; on error, log to stderr and never propagate. Shared so both
-    /// write gestures stay consistent.
-    fn track_enqueued(&mut self, result: Result<i64>, label: &str) {
-        match result {
-            Ok(id) => {
-                self.notice = None;
-                self.pending_session_actions.push(id);
-                // Bound growth if the daemon stalls: drop the oldest beyond the cap.
-                if self.pending_session_actions.len() > TRACK_CAP {
-                    let drop_count = self.pending_session_actions.len() - TRACK_CAP;
-                    self.pending_session_actions.drain(0..drop_count);
-                }
+    /// daemon stalls; on error, swallowed and never propagated (S1: the TUI owns the
+    /// alternate screen, so writing to stderr would garble it; failures surface via
+    /// the pending_actions resolution on the next refresh). Shared so both write
+    /// gestures stay consistent.
+    fn track_enqueued(&mut self, result: Result<i64>, _label: &str) {
+        // S1: the Err arm is intentionally a no-op (see the doc comment above).
+        if let Ok(id) = result {
+            self.notice = None;
+            self.pending_session_actions.push(id);
+            // Bound growth if the daemon stalls: drop the oldest beyond the cap.
+            if self.pending_session_actions.len() > TRACK_CAP {
+                let drop_count = self.pending_session_actions.len() - TRACK_CAP;
+                self.pending_session_actions.drain(0..drop_count);
             }
-            Err(e) => eprintln!("taski: could not enqueue {label}: {e:#}"),
         }
     }
 

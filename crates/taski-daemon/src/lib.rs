@@ -1179,11 +1179,10 @@ pub fn sweep_tmp_files(vault_root: &Path, exclude_dirs: &[String]) -> Result<usi
     Ok(removed)
 }
 
-/// Initialise `tracing` stderr output. Honors `RUST_LOG`; defaults to `info`. Safe to
-/// call when a subscriber is already installed (e.g. when running under a test).
-/// Initialize `tracing` to stderr at `info` (overridable via `RUST_LOG`). Used by the
+/// Initialise `tracing` to stderr at `info` (overridable via `RUST_LOG`). Used by the
 /// standalone daemon entry points; the unified launcher reuses this for `taski daemon`
-/// and installs its own file-sink subscriber for combined mode.
+/// and installs its own file-sink subscriber for combined mode. Safe to call when a
+/// subscriber is already installed (e.g. when running under a test).
 pub fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
