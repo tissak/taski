@@ -240,6 +240,21 @@ impl DisplayRow {
 /// It is kept independent of `filter` (today-ness vs open/done) so the two compose —
 /// e.g. `today_only + Open` = today's open work. `today` is a `YYYY-MM-DD` string; it
 /// is only consulted when `today_only` is true.
+///
+/// `overdue_only` adds a fifth orthogonal predicate: when true, only tasks whose
+/// `due_date` is set and strictly before `today` are visible. A task with no
+/// `due_date` is never overdue. Purely date-based (does NOT additionally require
+/// `status == Open` — that's the status filter's job) so it composes predictably:
+/// `overdue_only + Open` = open past-due; `overdue_only + Done` = completed-was-
+/// overdue review. String comparison `d < today` is valid for `YYYY-MM-DD`
+/// (lexicographic == chronological for zero-padded ISO dates).
+//
+// `too_many_arguments`: each parameter is an independent filter axis (status,
+// today, search, file, overdue) plus its required context (tasks, expanded,
+// today-string). A parameter struct was considered but would churn every call
+// site for no clarity gain on an internal, heavily-tested function. The allow
+// is intentional.
+#[allow(clippy::too_many_arguments)]
 fn build_view(
     tasks: &[Task],
     filter: StatusFilter,
@@ -248,6 +263,7 @@ fn build_view(
     today: &str,
     search_query: &str,
     file_query: &str,
+    overdue_only: bool,
 ) -> Vec<DisplayRow> {
     let scheduled_today =
         |t: &Task| -> bool { !today_only || t.scheduled_date.as_deref() == Some(today) };
@@ -260,6 +276,8 @@ fn build_view(
                 .to_lowercase()
                 .contains(&file_query.to_lowercase())
     };
+    let not_overdue =
+        |t: &Task| -> bool { !overdue_only || t.due_date.as_deref().is_some_and(|d| d < today) };
     let mut rows = Vec::new();
     let mut i = 0;
     while i < tasks.len() {
@@ -278,6 +296,7 @@ fn build_view(
                     && scheduled_today(t)
                     && matches_search(t)
                     && matches_file(t)
+                    && not_overdue(t)
             })
             .collect();
         if !visible.is_empty() {
@@ -412,6 +431,11 @@ struct App {
     file_query: String,
     /// Whether the `F` file-search prompt is active.
     file_searching: bool,
+    /// Overdue filter (`O`): when true, `build_view` additionally restricts the
+    /// list to tasks whose `due_date` is set and strictly before `today`.
+    /// Independent of `filter`, `today_only`, and the search axes (orthogonal).
+    /// Purely date-based — does NOT additionally require `status == Open`.
+    overdue_only: bool,
     /// ADR-0011: the last enqueued write action, for undo (`u` key).
     last_action: Option<LastAction>,
 }
@@ -456,6 +480,7 @@ impl App {
             searching: false,
             file_query: String::new(),
             file_searching: false,
+            overdue_only: false,
             last_action: None,
         }
     }
@@ -483,6 +508,7 @@ impl App {
             &self.today,
             &self.search_query,
             &self.file_query,
+            self.overdue_only,
         );
         reconcile_view_selection(&self.rows, note.as_deref(), task_id, idx, &mut self.state);
     }
@@ -619,6 +645,18 @@ impl App {
     /// the Phase 2 mark gesture).
     fn toggle_today(&mut self) {
         self.today_only = !self.today_only;
+        self.rebuild();
+        self.ctx_scroll = 0;
+    }
+
+    /// `O`: toggle the overdue filter — when on, `build_view` additionally
+    /// restricts the list to tasks whose `due_date` is set and strictly before
+    /// `today`. Independent of `today_only` and the status filter (orthogonal
+    /// axes): `O + Open` = open past-due; `O + Done` = completed-was-overdue
+    /// review; `O + All` = all past-due. A task with no `due_date` is never
+    /// overdue.
+    fn toggle_overdue(&mut self) {
+        self.overdue_only = !self.overdue_only;
         self.rebuild();
         self.ctx_scroll = 0;
     }
@@ -982,6 +1020,10 @@ fn run_loop(
                 // ADR-0009 Phase 1: `T` toggles the Today view (read-only). Lowercase
                 // `t` is the Phase 2 mark-for-today write gesture (above).
                 KeyCode::Char('T') => app.toggle_today(),
+                // Overdue filter (`O`): toggle the "past-due only" view. A 5th
+                // orthogonal filter axis (date-based, like `T` but for `due_date <
+                // today` instead of `scheduled_date == today`).
+                KeyCode::Char('O') => app.toggle_overdue(),
                 // ADR-0011: `b` toggles checkbox ↔ bullet; `u` undoes last write.
                 KeyCode::Char('b') => app.submit_bullet_toggle(conn),
                 KeyCode::Char('u') => app.submit_undo(conn),
@@ -1204,6 +1246,16 @@ fn draw(frame: &mut Frame, app: &mut App) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
+    // Overdue filter indicator: red/bold to signal urgency.
+    if app.overdue_only {
+        title_spans.push(Span::raw("  ·  "));
+        title_spans.push(Span::styled(
+            "overdue",
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     title_spans.push(Span::raw(format!(
         "   {open_total} open of {total} total   ·   {notes} notes "
     )));
@@ -1218,6 +1270,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
             "No tasks match the current search."
         } else if app.today_only {
             "No tasks scheduled for today. Press `T` to leave the Today view."
+        } else if app.overdue_only {
+            "No overdue tasks — nothing past its due date. Press `O` to leave the overdue view."
         } else {
             match app.filter {
                 StatusFilter::Open => "No open tasks. Press `f` to change the filter.",
@@ -1307,6 +1361,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Span::raw(" filter  ·  "),
             Span::styled("T", Style::default().fg(Color::Yellow)),
             Span::raw(" today  ·  "),
+            Span::styled("O", Style::default().fg(Color::Yellow)),
+            Span::raw(" overdue  ·  "),
             Span::styled("t", Style::default().fg(Color::Yellow)),
             Span::raw(" mark today  ·  "),
             Span::styled("b", Style::default().fg(Color::Yellow)),
@@ -1672,7 +1728,16 @@ mod tests {
             task(3, " ", 1, "beta.md"),
         ];
         let expanded = HashSet::new();
-        let rows = build_view(&tasks, StatusFilter::All, &expanded, false, "", "", "");
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            false,
+            "",
+            "",
+            "",
+            false,
+        );
         // Two collapsed groups -> two headers, no task rows.
         assert_eq!(rows.len(), 2);
         let (note, open, total, collapsed) = header(&rows[0]);
@@ -1691,7 +1756,16 @@ mod tests {
     fn build_view_expanded_emits_task_rows_in_line_order() {
         let tasks = vec![task(1, " ", 1, "alpha.md"), task(2, "x", 2, "alpha.md")];
         let expanded = HashSet::from(["alpha.md".to_string()]);
-        let rows = build_view(&tasks, StatusFilter::All, &expanded, false, "", "", "");
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            false,
+            "",
+            "",
+            "",
+            false,
+        );
         assert_eq!(rows.len(), 3, "header + two tasks");
         assert!(matches!(rows[0], DisplayRow::Header { .. }));
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
@@ -1703,7 +1777,16 @@ mod tests {
     fn build_view_open_filter_hides_done_tasks() {
         let tasks = vec![task(1, " ", 1, "alpha.md"), task(2, "x", 2, "alpha.md")];
         let expanded = HashSet::from(["alpha.md".to_string()]);
-        let rows = build_view(&tasks, StatusFilter::Open, &expanded, false, "", "", "");
+        let rows = build_view(
+            &tasks,
+            StatusFilter::Open,
+            &expanded,
+            false,
+            "",
+            "",
+            "",
+            false,
+        );
         assert_eq!(rows.len(), 2, "header + only the open task");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
     }
@@ -1716,7 +1799,16 @@ mod tests {
             task(2, "x", 1, "beta.md"),  // done
         ];
         let expanded = HashSet::new();
-        let rows = build_view(&tasks, StatusFilter::Open, &expanded, false, "", "", "");
+        let rows = build_view(
+            &tasks,
+            StatusFilter::Open,
+            &expanded,
+            false,
+            "",
+            "",
+            "",
+            false,
+        );
         // Only alpha has an open task; beta is hidden under the Open filter.
         assert_eq!(rows.len(), 1);
         assert_eq!(header(&rows[0]).0, "alpha.md");
@@ -1727,7 +1819,16 @@ mod tests {
     fn build_view_preserves_due_date_on_task_row() {
         let tasks = vec![task_with_due(1, " ", 1, "alpha.md", "2026-07-01")];
         let expanded = HashSet::from(["alpha.md".to_string()]);
-        let rows = build_view(&tasks, StatusFilter::All, &expanded, false, "", "", "");
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            false,
+            "",
+            "",
+            "",
+            false,
+        );
         match &rows[1] {
             DisplayRow::Task { task } => {
                 assert_eq!(task.due_date.as_deref(), Some("2026-07-01"));
@@ -2702,6 +2803,7 @@ mod tests {
             "2026-06-20",
             "",
             "",
+            false,
         );
         // Only alpha.md has a today-matching task; one collapsed header.
         assert_eq!(rows.len(), 1);
@@ -2727,6 +2829,7 @@ mod tests {
             "2026-06-20",
             "",
             "",
+            false,
         );
         assert_eq!(rows.len(), 2, "header + one task");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
@@ -2739,6 +2842,7 @@ mod tests {
             "2026-06-20",
             "",
             "",
+            false,
         );
         assert_eq!(rows.len(), 3, "header + two tasks");
     }
@@ -2795,6 +2899,7 @@ mod tests {
             "2026-06-20",
             "",
             "",
+            false,
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(header(&rows[0]).0, "alpha.md");
@@ -2839,6 +2944,186 @@ mod tests {
         );
     }
 
+    // --- Overdue filter (`O`): due_date < today ---------------------------
+
+    /// With `overdue_only` on, `build_view` keeps only tasks whose `due_date`
+    /// is set and strictly before `today`. Tasks due today, due in the future,
+    /// or with no due date are excluded.
+    #[test]
+    fn overdue_only_keeps_past_due_tasks() {
+        let tasks = vec![
+            task_with_due(1, " ", 1, "alpha.md", "2026-06-18"), // past due
+            task_with_due(2, " ", 1, "beta.md", "2026-06-20"),  // today (not overdue)
+            task_with_due(3, " ", 1, "gamma.md", "2026-06-22"), // future
+        ];
+        let expanded = HashSet::new();
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            false,
+            "2026-06-20",
+            "",
+            "",
+            true,
+        );
+        // Only alpha.md (past-due) survives; one collapsed header.
+        assert_eq!(rows.len(), 1);
+        assert_eq!(header(&rows[0]).0, "alpha.md");
+    }
+
+    /// Tasks with no due date, due today, or due in the future are all excluded
+    /// when `overdue_only` is on.
+    #[test]
+    fn overdue_only_excludes_future_today_and_no_due() {
+        let tasks = vec![
+            task_with_due(1, " ", 1, "alpha.md", "2026-06-20"), // today
+            task_with_due(2, " ", 1, "beta.md", "2026-06-22"),  // future
+            task(3, " ", 1, "gamma.md"),                        // no due date
+        ];
+        let expanded = HashSet::new();
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            false,
+            "2026-06-20",
+            "",
+            "",
+            true,
+        );
+        assert!(rows.is_empty(), "none are past-due");
+    }
+
+    /// With `overdue_only` off, no date-based filtering happens (beyond the
+    /// existing axes) — all tasks are visible.
+    #[test]
+    fn overdue_only_off_shows_all() {
+        let tasks = vec![
+            task_with_due(1, " ", 1, "alpha.md", "2026-06-18"),
+            task_with_due(2, " ", 1, "beta.md", "2026-06-22"),
+            task(3, " ", 1, "gamma.md"),
+        ];
+        let expanded = HashSet::new();
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            false,
+            "2026-06-20",
+            "",
+            "",
+            false,
+        );
+        assert_eq!(rows.len(), 3, "all three note headers visible");
+    }
+
+    /// `overdue_only` composes with the status filter (orthogonal axes):
+    /// overdue + Open shows only open past-due; overdue + Done shows done
+    /// past-due (the "completed-was-overdue" review).
+    #[test]
+    fn overdue_only_composes_with_status_filter() {
+        let tasks = vec![
+            task_with_due(1, " ", 1, "alpha.md", "2026-06-18"), // past due, open
+            task_with_due(2, "x", 2, "alpha.md", "2026-06-18"), // past due, done
+        ];
+        let expanded = HashSet::from(["alpha.md".to_string()]);
+
+        // overdue + Open -> only the open past-due task.
+        let rows = build_view(
+            &tasks,
+            StatusFilter::Open,
+            &expanded,
+            false,
+            "2026-06-20",
+            "",
+            "",
+            true,
+        );
+        assert_eq!(rows.len(), 2, "header + one open past-due task");
+        assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
+
+        // overdue + Done -> only the done past-due task.
+        let rows = build_view(
+            &tasks,
+            StatusFilter::Done,
+            &expanded,
+            false,
+            "2026-06-20",
+            "",
+            "",
+            true,
+        );
+        assert_eq!(rows.len(), 2, "header + one done past-due task");
+        assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 2));
+    }
+
+    /// `overdue_only` is orthogonal to `today_only`: both on → tasks that are
+    /// BOTH due < today AND scheduled == today (the AND composes).
+    #[test]
+    fn overdue_only_orthogonal_to_today_filter() {
+        // A task that has BOTH a past due_date AND today's scheduled_date —
+        // it passes both filters.
+        let mut t = task_with_due(1, " ", 1, "alpha.md", "2026-06-18");
+        t.scheduled_date = Some("2026-06-20".to_string());
+        let tasks = vec![
+            t,                                                        // both
+            task_with_due(2, " ", 2, "alpha.md", "2026-06-18"), // past due, not scheduled today
+            task_with_scheduled(3, " ", 3, "alpha.md", "2026-06-20"), // scheduled today, no past due
+        ];
+        let expanded = HashSet::from(["alpha.md".to_string()]);
+
+        // Both filters on -> only task 1 (past due AND scheduled today).
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            true,
+            "2026-06-20",
+            "",
+            "",
+            true,
+        );
+        assert_eq!(rows.len(), 2, "header + one task matching both filters");
+        assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
+    }
+
+    /// `toggle_overdue` flips the flag and rebuilds the view.
+    #[test]
+    fn toggle_overdue_flips_state_and_rebuilds() {
+        let mut app = App::new();
+        app.today = "2026-06-20".to_string();
+        app.filter = StatusFilter::All;
+        app.tasks = vec![
+            task_with_due(1, " ", 1, "alpha.md", "2026-06-18"), // past due
+            task_with_due(2, " ", 1, "beta.md", "2026-06-22"),  // future
+        ];
+        app.expanded.insert("alpha.md".to_string());
+        app.expanded.insert("beta.md".to_string());
+        app.rebuild();
+        assert!(!app.overdue_only);
+        let off_count = app.rows.len();
+
+        // Turn it on -> only alpha (past-due).
+        app.toggle_overdue();
+        assert!(app.overdue_only);
+        let overdue_rows: Vec<_> = app
+            .rows
+            .iter()
+            .filter(|r| matches!(r, DisplayRow::Task { .. }))
+            .collect();
+        assert_eq!(overdue_rows.len(), 1);
+        assert!(matches!(
+            &overdue_rows[0],
+            DisplayRow::Task { task } if task.id == 1
+        ));
+
+        // Turn it back off -> full set restored.
+        app.toggle_overdue();
+        assert!(!app.overdue_only);
+        assert_eq!(app.rows.len(), off_count);
+    }
+
     // --- ADR-0010: text search tests --------------------------------------------
 
     /// Search filters tasks whose text contains the query (case-insensitive,
@@ -2868,6 +3153,7 @@ mod tests {
             "",
             "deploy",
             "",
+            false,
         );
         assert_eq!(rows.len(), 3, "header + two matching tasks");
         let task_ids: Vec<i64> = rows
@@ -2904,6 +3190,7 @@ mod tests {
             "",
             "DEPLOY",
             "",
+            false,
         );
         assert_eq!(rows.len(), 2, "header + one matching task");
     }
@@ -2928,6 +3215,7 @@ mod tests {
             "",
             "",
             "deploy",
+            false,
         );
         assert_eq!(
             rows.len(),
@@ -2946,7 +3234,16 @@ mod tests {
     fn build_view_empty_search_shows_all() {
         let tasks = vec![task(1, " ", 1, "alpha.md"), task(2, " ", 2, "alpha.md")];
         let expanded = HashSet::from(["alpha.md".to_string()]);
-        let rows = build_view(&tasks, StatusFilter::All, &expanded, false, "", "", "");
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            false,
+            "",
+            "",
+            "",
+            false,
+        );
         assert_eq!(rows.len(), 3, "header + two tasks — no filtering");
     }
 
@@ -2975,6 +3272,7 @@ mod tests {
             "",
             "deploy",
             "",
+            false,
         );
         assert_eq!(rows.len(), 2, "header + one task (open)");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
@@ -3007,6 +3305,7 @@ mod tests {
             "2026-06-20",
             "deploy",
             "",
+            false,
         );
         assert_eq!(rows.len(), 2, "header + one task (today + search)");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
@@ -3094,6 +3393,7 @@ mod tests {
             "",
             "",
             "DEPLOYMENT",
+            false,
         );
         assert_eq!(
             rows.len(),
@@ -3125,6 +3425,7 @@ mod tests {
             "",
             "common",
             "alpha",
+            false,
         );
         assert_eq!(rows.len(), 2, "alpha header + its task");
     }
@@ -3139,7 +3440,16 @@ mod tests {
         ];
         let expanded = HashSet::from(["beta.md".to_string()]);
         // File search "beta" + Open filter: beta header + only the open beta task.
-        let rows = build_view(&tasks, StatusFilter::Open, &expanded, false, "", "", "beta");
+        let rows = build_view(
+            &tasks,
+            StatusFilter::Open,
+            &expanded,
+            false,
+            "",
+            "",
+            "beta",
+            false,
+        );
         assert_eq!(rows.len(), 2, "beta header + one open task");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 2));
     }
@@ -3167,6 +3477,7 @@ mod tests {
             "",
             "deploy",
             "alpha",
+            false,
         );
         assert_eq!(rows.len(), 2, "header + one task");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
