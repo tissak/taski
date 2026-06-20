@@ -203,3 +203,66 @@ fn reconcile_duplicates_matched_in_order() {
         "both duplicates updated to done"
     );
 }
+
+/// ADR-0005 §3 + Phase B: when a task's `text_hash` is unchanged but its `due_date`
+/// field changes (e.g. the parser is upgraded to recognise a new emoji), the
+/// reconciliation UPDATE-in-place path must refresh `due_date` while preserving the
+/// surrogate rowid.
+///
+/// We can't simulate this purely via `parse_tasks` (adding/removing a `📅` marker
+/// changes the body text and thus `text_hash`, which would delete+insert). Instead we
+/// construct two `Task`s with identical `text_hash`/`text` but different `due_date`
+/// fields — exactly the situation the UPDATE branch exists to handle.
+#[test]
+fn reconcile_refreshes_due_date_via_update_preserving_rowid() {
+    let conn = db::open(":memory:").unwrap();
+
+    // v1: a task with no due date.
+    let mut tasks_v1 = parse_tasks("- [ ] task a\n", "note.md");
+    let id_before = {
+        reconcile_note(&conn, "note.md", &tasks_v1, Some("h1"), None).unwrap();
+        let row = &db::all_tasks(&conn).unwrap()[0];
+        assert_eq!(row.due_date, None, "v1 should have no due_date");
+        row.id
+    };
+
+    // v2: same text_hash + same text, but now the parser would attach a due_date.
+    // Mutate the in-memory task in place to keep text_hash identical.
+    tasks_v1[0].due_date = Some("2025-12-31".to_string());
+    let s = reconcile_note(&conn, "note.md", &tasks_v1, Some("h2"), None).unwrap();
+    assert_eq!(
+        s,
+        ReconcileSummary {
+            kept: 1,
+            inserted: 0,
+            deleted: 0
+        },
+        "matching text_hash should UPDATE-in-place, not delete+insert"
+    );
+
+    let after_v2 = db::all_tasks(&conn).unwrap();
+    assert_eq!(after_v2.len(), 1);
+    assert_eq!(
+        after_v2[0].id, id_before,
+        "rowid preserved when only due_date changed"
+    );
+    assert_eq!(
+        after_v2[0].due_date.as_deref(),
+        Some("2025-12-31"),
+        "due_date refreshed via UPDATE path"
+    );
+
+    // v3: clear the due_date again — still same text_hash, so another UPDATE.
+    let mut tasks_v3 = parse_tasks("- [ ] task a\n", "note.md");
+    tasks_v3[0].due_date = None;
+    // Force the same text_hash as v1/v2 (parse_tasks already matches since text is
+    // identical), and reconcile.
+    let _ = tasks_v3[0].text_hash.clone(); // no-op; kept for clarity.
+    reconcile_note(&conn, "note.md", &tasks_v3, Some("h3"), None).unwrap();
+    let after_v3 = db::all_tasks(&conn).unwrap();
+    assert_eq!(after_v3[0].id, id_before, "rowid still preserved");
+    assert_eq!(
+        after_v3[0].due_date, None,
+        "due_date cleared via UPDATE path"
+    );
+}

@@ -127,9 +127,89 @@ fn parse_task_line(raw_line: &str, note_path: &str, line_number: usize, now: i64
         raw_checkbox_char: checkbox_char.to_string(),
         note_hash: None,
         note_mtime: None,
-        due_date: None,
+        due_date: extract_due_date(body),
         updated_at: now,
     })
+}
+
+/// Variation selector 16 (U+FE0F), optionally present after an emoji to request
+/// emoji-style rendering.
+const VS16: char = '\u{FE0F}';
+
+/// Extract the first due date (`📅`/`📆`/`🗓` + optional VS16 + whitespace +
+/// `YYYY-MM-DD`) from a task body, per the Obsidian Tasks emoji convention. Returns
+/// the normalized `"YYYY-MM-DD"` string, or `None` if no valid due date is present.
+///
+/// Scans the body left-to-right for the first due-date emoji; at each, skips an
+/// optional VS16, requires at least one whitespace char, then attempts to read a
+/// strict `YYYY-MM-DD`. If the date is invalid (bad format or out-of-range month/day)
+/// the scan continues to the next emoji. Trailing text after the date is allowed.
+fn extract_due_date(body: &str) -> Option<String> {
+    let bytes = body.as_bytes();
+    for (emoji_off, ch) in body.char_indices() {
+        if !matches!(ch, '📅' | '📆' | '🗓') {
+            continue;
+        }
+        let mut pos = emoji_off + ch.len_utf8();
+
+        // Optional variation selector 16.
+        if let Some(rest) = body.get(pos..)
+            && let Some(next) = rest.chars().next()
+            && next == VS16
+        {
+            pos += VS16.len_utf8();
+        }
+
+        // Required whitespace (at least one).
+        let ws_start = pos;
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos == ws_start {
+            continue;
+        }
+
+        // Attempt YYYY-MM-DD at this position.
+        if let Some(date) = parse_date_at(bytes, pos) {
+            return Some(date);
+        }
+    }
+    None
+}
+
+/// Read and validate a `YYYY-MM-DD` starting at `bytes[pos]`. Returns the normalized
+/// date string if the format and ranges (month 1–12, day 1–31) are valid, else `None`.
+fn parse_date_at(bytes: &[u8], pos: usize) -> Option<String> {
+    if pos + 10 > bytes.len() {
+        return None;
+    }
+    let s = &bytes[pos..pos + 10];
+
+    // Format: dddd-dd-dd (ASCII digits and hyphens only).
+    let digit = |i: usize| s[i].is_ascii_digit();
+    if !(digit(0) && digit(1) && digit(2) && digit(3)) {
+        return None;
+    }
+    if s[4] != b'-' || s[7] != b'-' {
+        return None;
+    }
+    if !(digit(5) && digit(6) && digit(8) && digit(9)) {
+        return None;
+    }
+
+    // Range validation (no calendar/leap-year logic — MVP).
+    let month = (s[5] - b'0') * 10 + (s[6] - b'0');
+    let day = (s[8] - b'0') * 10 + (s[9] - b'0');
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+
+    // All valid — build from verified-ASCII bytes.
+    let mut date = String::with_capacity(10);
+    for &b in s {
+        date.push(b as char);
+    }
+    Some(date)
 }
 
 /// Match `^\s*[-*+]\s+\[(.)\]\s+(.+)$` for a single line, returning the two captured
@@ -334,5 +414,97 @@ plain text
         assert_eq!(tasks[2].text, "normal");
         assert_eq!(tasks[3].status, Status::InProgress);
         assert_eq!(tasks[3].text, "triple-quoted in progress");
+    }
+
+    // --- extract_due_date / parse_date_at unit tests (Phase B) ---------------
+
+    #[test]
+    fn extract_due_date_plain_calendar_emoji() {
+        assert_eq!(
+            extract_due_date("ship it 📅 2025-12-31"),
+            Some("2025-12-31".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_due_date_recognises_all_three_aliases() {
+        assert_eq!(
+            extract_due_date("📅 2025-01-01"),
+            Some("2025-01-01".to_string())
+        );
+        assert_eq!(
+            extract_due_date("📆 2025-01-02"),
+            Some("2025-01-02".to_string())
+        );
+        assert_eq!(
+            extract_due_date("🗓 2025-01-03"),
+            Some("2025-01-03".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_due_date_tolerates_variation_selector() {
+        // VS16 (U+FE0F) immediately after the emoji is optional but accepted.
+        assert_eq!(
+            extract_due_date("task \u{1F4C5}\u{FE0F} 2025-06-15"),
+            Some("2025-06-15".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_due_date_allows_multiple_spaces() {
+        assert_eq!(
+            extract_due_date("📅   2025-07-04"),
+            Some("2025-07-04".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_due_date_none_when_no_emoji() {
+        assert_eq!(extract_due_date("just a date 2025-01-01 here"), None);
+    }
+
+    #[test]
+    fn extract_due_date_none_when_bad_format() {
+        // Missing hyphens / wrong lengths are rejected; scan finds no valid date.
+        assert_eq!(extract_due_date("📅 20250101"), None);
+        assert_eq!(extract_due_date("📅 25-12-31"), None);
+        assert_eq!(extract_due_date("📅 2025/12/31"), None);
+    }
+
+    #[test]
+    fn extract_due_date_none_when_month_out_of_range() {
+        assert_eq!(extract_due_date("📅 2025-13-01"), None);
+        assert_eq!(extract_due_date("📅 2025-00-10"), None);
+    }
+
+    #[test]
+    fn extract_due_date_none_when_day_out_of_range() {
+        assert_eq!(extract_due_date("📅 2025-01-32"), None);
+        assert_eq!(extract_due_date("📅 2025-01-00"), None);
+    }
+
+    #[test]
+    fn extract_due_date_allows_trailing_text() {
+        assert_eq!(
+            extract_due_date("📅 2025-02-14 #high @home"),
+            Some("2025-02-14".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_due_date_takes_first_valid_emoji() {
+        // First emoji has an invalid date; scan continues to the next valid one.
+        assert_eq!(
+            extract_due_date("📅 nope 📅 2025-03-17"),
+            Some("2025-03-17".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_task_line_wires_due_date_into_task() {
+        let tasks = parse_tasks("- [ ] ship it 📅 2025-11-11\n", "d.md");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].due_date.as_deref(), Some("2025-11-11"));
     }
 }

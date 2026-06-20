@@ -11,10 +11,11 @@
 //!
 //! Status tokens: `open`, `done`, `inprogress`, or `other:<raw_checkbox_char>`.
 //!
-//! Additionally — since Slice 1 never extracts a due date — every corpus case
-//! asserts that *all* parsed tasks have `due_date == None`. This is what makes the
-//! `due_date.md` case (Tasks-plugin `📅` emoji in the body) meaningful: the line is
-//! still a task, but no due date is parsed.
+//! Each status token may optionally be followed by `| <due_date>` (or `| -` to
+//! assert explicitly that no due date is parsed). When the `|` suffix is absent the
+//! task's `due_date` must be `None`. This is what makes the `due_date.md` case
+//! (Tasks-plugin `📅` emoji in the body) meaningful: the date is parsed and compared
+//! against the expected value.
 
 use std::fs;
 use std::path::PathBuf;
@@ -63,7 +64,9 @@ fn corpus_parses_each_note_to_its_expected_tasks() {
             .trim()
             .parse()
             .unwrap_or_else(|e| panic!("{:?}: expected count is not an integer: {e}", md_path));
-        let status_tokens: Vec<&str> = expected_lines
+        // Each remaining non-empty line is `status_token` optionally followed by
+        // `| <due_date>` (or `| -` for an explicit None).
+        let spec_lines: Vec<&str> = expected_lines
             .map(str::trim)
             .filter(|l| !l.is_empty())
             .collect();
@@ -76,32 +79,56 @@ fn corpus_parses_each_note_to_its_expected_tasks() {
         );
         assert_eq!(
             tasks.len(),
-            status_tokens.len(),
-            "{:?}: expected file lists {} status tokens but {} tasks were found",
+            spec_lines.len(),
+            "{:?}: expected file lists {} spec lines but {} tasks were found",
             md_path,
-            status_tokens.len(),
+            spec_lines.len(),
             tasks.len()
         );
 
-        for (idx, (task, want)) in tasks.iter().zip(status_tokens.iter()).enumerate() {
+        for (idx, (task, spec)) in tasks.iter().zip(spec_lines.iter()).enumerate() {
+            let (want_status, want_due) = parse_spec(spec);
             let got = status_token(&task.status);
             assert_eq!(
-                got, *want,
+                got, want_status,
                 "{:?}: status mismatch at task index {} (line {}): got {:?}, want {:?}",
-                md_path, idx, task.line_number, got, want
+                md_path, idx, task.line_number, got, want_status
             );
             assert_eq!(
                 task.note_path, note_path,
                 "{:?}: note_path not propagated at index {}",
                 md_path, idx
             );
-            // Slice 1 invariant: due dates are never extracted.
-            assert!(
-                task.due_date.is_none(),
-                "{:?}: due_date should be None in Slice 1 at task index {}",
+            assert_eq!(
+                task.due_date.as_deref(),
+                want_due.as_deref(),
+                "{:?}: due_date mismatch at task index {} (line {}): got {:?}, want {:?}",
                 md_path,
-                idx
+                idx,
+                task.line_number,
+                task.due_date,
+                want_due
             );
         }
+    }
+}
+
+/// Parse a corpus spec line into `(status_token, Option<due_date>)`. A bare token
+/// (e.g. `open`) implies `due_date = None`. `open | 2025-12-31` asserts a due date.
+/// `open | -` is an explicit assertion of `None`.
+fn parse_spec(spec: &str) -> (String, Option<String>) {
+    let spec = spec.trim();
+    match spec.split_once('|') {
+        Some((status, due)) => {
+            let status = status.trim().to_string();
+            let due = due.trim();
+            let due = if due == "-" {
+                None
+            } else {
+                Some(due.to_string())
+            };
+            (status, due)
+        }
+        None => (spec.to_string(), None),
     }
 }

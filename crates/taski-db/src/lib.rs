@@ -184,7 +184,7 @@ pub fn reconcile_note(
                     "UPDATE tasks SET
                         line_number = ?2, text = ?3, status = ?4,
                         raw_checkbox_char = ?5, note_hash = ?6, note_mtime = ?7,
-                        updated_at = ?8
+                        due_date = ?8, updated_at = ?9
                      WHERE id = ?1",
                     rusqlite::params![
                         old_id,
@@ -194,6 +194,7 @@ pub fn reconcile_note(
                         task.raw_checkbox_char,
                         note_hash,
                         note_mtime,
+                        task.due_date,
                         now,
                     ],
                 )?;
