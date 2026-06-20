@@ -27,6 +27,7 @@ Authoritative record of technology choices for Taski. Each entry has a one-line 
 | **`clap`** (derive) | Daemon CLI args (`--vault`, `--db`, `--once`). | 2026-06-20 |
 | **`walkdir`** | Recursive vault scan with hidden-dir pruning (`.obsidian` / `.trash` / `.git`). | 2026-06-20 |
 | **`ctrlc`** | Graceful SIGINT shutdown of the watch loop. | 2026-06-20 |
+| **`fs2`** | `flock`-based single-writer lock (`daemon.lock`) preventing two daemons from racing on `atomic_write` / `reconcile_note`. Auto-released on crash. See ADR-0008. | 2026-06-20 |
 | **Line-based parser** (in `taski-core`) | Current Markdown checkbox parser — fence-aware (backtick + tilde), tolerates leading blockquote markers, extracts Obsidian Tasks-plugin `📅`/`📆`/`🗓` due dates. Chosen over `pulldown-cmark` for now (YAGNI; checkboxes are line-oriented). | 2026-06-20 |
 
 > **Deferred (revisit when needed):** `pulldown-cmark` (adopt when real edge cases — tasks in nested lists / inline code / callouts — exceed the line parser).

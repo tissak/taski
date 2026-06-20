@@ -9,6 +9,12 @@
 //! The testable scan + write-back logic lives here as free functions so the
 //! integration tests in `tests/` can exercise it without driving the live watcher.
 
+mod lock;
+mod shutdown;
+
+pub use lock::{DaemonLockGuard, LockOutcome, acquire_daemon_lock, daemon_lock_path};
+pub use shutdown::{ShutdownHandle, ShutdownSignal};
+
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::Hasher;
@@ -65,8 +71,39 @@ pub struct Cli {
     pub init_config: bool,
 }
 
-/// Entry point invoked by the binary's `main`. Parses CLI args, sets up tracing,
-/// opens the DB, scans the vault, and (unless `--once`) enters the watch loop.
+/// Resolved options for [`run_daemon`], decoupling the engine from the CLI parser so
+/// the future unified launcher can drive it without constructing a `Cli`. Built from
+/// a [`Cli`] via [`From`], or constructed directly by the launcher.
+#[derive(Clone, Debug)]
+pub struct DaemonOpts {
+    /// Path to the Obsidian vault root to scan and watch. Required if absent from the
+    /// config file (the daemon has no default vault).
+    pub vault: Option<PathBuf>,
+    /// Path to the taski SQLite index database. Defaults to `./taski.db` if absent
+    /// everywhere.
+    pub db: Option<PathBuf>,
+    /// Run a single full scan and exit (do not start the watch loop).
+    pub once: bool,
+}
+
+impl From<&Cli> for DaemonOpts {
+    fn from(cli: &Cli) -> Self {
+        DaemonOpts {
+            vault: cli.vault.clone(),
+            db: cli.db.clone(),
+            once: cli.once,
+        }
+    }
+}
+
+/// Standalone entry point invoked by the `taski-daemon` binary's `main`. Parses CLI
+/// args, sets up tracing, handles `--init-config`, installs the Ctrl-C handler, then
+/// delegates to [`run_daemon`] with a fresh [`ShutdownSignal`]/[`ShutdownHandle`] pair.
+///
+/// This is the only daemon entry point that installs a Ctrl-C handler: the future
+/// unified launcher drives shutdown itself (via the shared flag) and must not
+/// double-install. The standalone behavior (first Ctrl-C → clean shutdown) is
+/// preserved, now via the shared flag instead of an internal channel.
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     init_tracing();
@@ -78,6 +115,54 @@ pub fn run() -> Result<()> {
         return write_initial_config(cli.vault.as_deref());
     }
 
+    // Ctrl-C → set the shared shutdown flag. The first signal initiates a clean
+    // shutdown; a second falls back to the default (terminate). Installed here only
+    // (not inside `run_daemon` / `run_watch_loop`) so the launcher can own shutdown.
+    let (signal, handle) = ShutdownSignal::new();
+    ctrlc::set_handler(move || signal.set()).context("installing Ctrl-C handler")?;
+
+    // Single-writer enforcement (ADR-0008): acquire the daemon lock beside the resolved
+    // db before running. The guard is passed into `run_daemon` as a capability token and
+    // held for the engine's whole lifetime (released on exit). Refuse if another daemon
+    // already holds it.
+    let cfg = taski_config::load().context("loading taski config")?;
+    let db_path = taski_config::resolve_db(cli.db.as_deref().and_then(Path::to_str), &cfg);
+    let lock_path = daemon_lock_path(&db_path);
+    let guard = match acquire_daemon_lock(&lock_path).context("acquiring daemon lock")? {
+        LockOutcome::Acquired(g) => g,
+        LockOutcome::HeldByOther(pid) => {
+            eprintln!(
+                "taski-daemon: another daemon is already running{}. Refusing to start a \
+                 second writer (ADR-0008). Stop it first, or run a TUI against it.",
+                pid.map(|p| format!(" (PID {p})")).unwrap_or_default()
+            );
+            anyhow::bail!("daemon already running");
+        }
+    };
+
+    run_daemon(DaemonOpts::from(&cli), handle, guard)
+}
+
+/// Run the daemon engine against resolved options: load config, resolve vault/db,
+/// open the DB connection, sweep stale temps, prune old actions, perform the initial
+/// scan, and (unless `opts.once`) enter the watch loop. Shutdown is observed via the
+/// shared `shutdown` handle.
+///
+/// This is the function the future unified launcher will call on a background
+/// thread. It does NOT parse CLI args, call `init_tracing`, handle `--init-config`,
+/// or install a Ctrl-C handler — those are the caller's responsibilities (see
+/// [`run`]). `init_tracing` and `write_initial_config` stay in the standalone entry.
+///
+/// The `_lock` guard is the **single-writer capability** (ADR-0008): the caller MUST
+/// have acquired the daemon lock and pass it here. It is held for the engine's whole
+/// lifetime and dropped on return, releasing the lock exactly when the daemon stops —
+/// so every daemon entry point (standalone `run`, `taski daemon`, combined mode) is
+/// uniformly single-writer-protected at the type level.
+pub fn run_daemon(
+    opts: DaemonOpts,
+    shutdown: ShutdownHandle,
+    _lock: DaemonLockGuard,
+) -> Result<()> {
     // Config is optional (a missing file yields defaults); a malformed file is a
     // hard error.
     let cfg = taski_config::load().context("loading taski config")?;
@@ -85,12 +170,12 @@ pub fn run() -> Result<()> {
     // Resolve vault/db: CLI flag → config file → compiled default. The daemon
     // requires a vault (no default); db defaults to ./taski.db.
     let vault_root =
-        taski_config::resolve_vault(cli.vault.as_deref().and_then(Path::to_str), &cfg)?;
+        taski_config::resolve_vault(opts.vault.as_deref().and_then(Path::to_str), &cfg)?;
     let vault_root = vault_root
         .canonicalize()
         .with_context(|| format!("canonicalizing vault path {:?}", vault_root))?;
 
-    let db_path = taski_config::resolve_db(cli.db.as_deref().and_then(Path::to_str), &cfg);
+    let db_path = taski_config::resolve_db(opts.db.as_deref().and_then(Path::to_str), &cfg);
     let conn = db::open(&db_path.to_string_lossy())
         .with_context(|| format!("opening taski database {:?}", db_path))?;
 
@@ -115,11 +200,11 @@ pub fn run() -> Result<()> {
     let total = scan_vault(&conn, &vault_root)?;
     tracing::info!(count = total, ?vault_root, "initial scan complete");
 
-    if cli.once {
+    if opts.once {
         return Ok(());
     }
 
-    run_watch_loop(&conn, &vault_root)?;
+    run_watch_loop(&conn, &vault_root, &shutdown)?;
     Ok(())
 }
 
@@ -260,12 +345,14 @@ pub fn scan_vault(conn: &Connection, vault_root: &Path) -> Result<usize> {
 
 /// Event-driven watch loop. Sets up a recursive debounced watcher on `vault_root`
 /// and re-indexes `.md` notes on change, deleting their rows on removal. Runs until
-/// Ctrl-C / SIGINT, then returns cleanly so the DB connection drops gracefully.
+/// the shared `shutdown` handle is set (by the standalone Ctrl-C handler or, later,
+/// the unified launcher on TUI quit), then returns cleanly so the DB connection
+/// drops gracefully.
 ///
 /// Note: `notify-debouncer-mini` deliberately does not preserve event kind (it only
 /// reports "something changed at this path"), so create/modify vs. remove is decided
 /// by checking file existence in [`handle_debounced_event`].
-fn run_watch_loop(conn: &Connection, vault_root: &Path) -> Result<()> {
+fn run_watch_loop(conn: &Connection, vault_root: &Path, shutdown: &ShutdownHandle) -> Result<()> {
     let (event_tx, event_rx) = mpsc::channel::<DebounceEventResult>();
     let mut debouncer =
         new_debouncer(Duration::from_millis(300), event_tx).context("creating file watcher")?;
@@ -274,14 +361,6 @@ fn run_watch_loop(conn: &Connection, vault_root: &Path) -> Result<()> {
         .watch(vault_root, RecursiveMode::Recursive)
         .with_context(|| format!("watching vault {:?}", vault_root))?;
     tracing::info!(?vault_root, "watching vault for changes (Ctrl-C to stop)");
-
-    // Ctrl-C → shutdown channel. The first signal initiates a clean shutdown; a
-    // second falls back to the default (terminate).
-    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
-    ctrlc::set_handler(move || {
-        let _ = shutdown_tx.send(());
-    })
-    .context("installing Ctrl-C handler")?;
 
     loop {
         match event_rx.recv_timeout(Duration::from_millis(500)) {
@@ -297,8 +376,16 @@ fn run_watch_loop(conn: &Connection, vault_root: &Path) -> Result<()> {
                 break;
             }
         }
-        if shutdown_rx.try_recv().is_ok() {
-            tracing::info!("shutdown signal received; exiting watch loop");
+        if shutdown.is_set() {
+            // Final drain: apply any toggles the TUI queued this session before exiting
+            // (ADR-0007), so "quit" means "everything I did has landed". The flag can only
+            // be set after the TUI's main loop returns, so no further enqueues are possible.
+            // Pending rows are durable in SQLite regardless; this is about session UX
+            // completeness. Errors are logged, not fatal.
+            tracing::info!("shutdown signal received; draining pending actions then exiting");
+            if let Err(e) = process_pending_actions(conn, vault_root) {
+                tracing::error!(err = %e, "final pending-actions drain failed");
+            }
             break;
         }
 
@@ -805,7 +892,10 @@ pub fn sweep_tmp_files(vault_root: &Path) -> Result<usize> {
 
 /// Initialise `tracing` stderr output. Honors `RUST_LOG`; defaults to `info`. Safe to
 /// call when a subscriber is already installed (e.g. when running under a test).
-fn init_tracing() {
+/// Initialize `tracing` to stderr at `info` (overridable via `RUST_LOG`). Used by the
+/// standalone daemon entry points; the unified launcher reuses this for `taski daemon`
+/// and installs its own file-sink subscriber for combined mode.
+pub fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()

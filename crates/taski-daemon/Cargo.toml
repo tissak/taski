@@ -11,6 +11,7 @@ taski-db.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
+fs2.workspace = true
 notify.workspace = true
 notify-debouncer-mini.workspace = true
 rusqlite.workspace = true
