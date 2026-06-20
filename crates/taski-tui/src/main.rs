@@ -20,7 +20,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::{execute, terminal::EnterAlternateScreen, terminal::LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
@@ -28,7 +28,7 @@ use ratatui::{Frame, Terminal};
 use rusqlite::Connection;
 
 use taski_db as db;
-use taski_db::{PendingAction, Status, Task};
+use taski_db::{NoteContent, PendingAction, Status, Task};
 
 /// CLI configuration. `--db` is optional and overrides `db` in the config file
 /// (`~/.config/taski/config.toml`, overridable via `TASKI_CONFIG`); see
@@ -284,6 +284,14 @@ struct App {
     /// to report. Set when a tracked action resolves `failed`; cleared the next time
     /// the user enqueues an action (the natural "try again / move on" gesture).
     notice: Option<String>,
+    /// The note whose content is currently cached for the context pane (ADR-0006).
+    /// `None` when nothing is selected / the view is empty. The TUI reads note content
+    /// only through the index (`db::note_content`), never from the vault.
+    ctx_note_path: Option<String>,
+    /// Cached full text of `ctx_note_path` (or `None` if that note isn't cached in the
+    /// index). Re-fetched when the selection moves to a different note and force-read on
+    /// each refresh so toggles/edits land within ~1 poll.
+    ctx_content: Option<NoteContent>,
 }
 
 impl App {
@@ -299,6 +307,8 @@ impl App {
             expanded: HashSet::new(),
             pending_session_actions: Vec::new(),
             notice: None,
+            ctx_note_path: None,
+            ctx_content: None,
         }
     }
 
@@ -327,6 +337,9 @@ impl App {
         self.tasks = db::all_tasks(conn).context("reading tasks from index")?;
         self.rebuild();
         self.poll_action_resolutions(conn)?;
+        // Force a re-read of the selected note's cached content so the pane reflects
+        // toggles/edits the daemon re-indexed since the last refresh (ADR-0006).
+        self.sync_context(conn, true);
         Ok(())
     }
 
@@ -449,6 +462,41 @@ impl App {
         }
     }
 
+    /// The note under the cursor — the selected task's note, or the selected header's
+    /// note. Drives which note's content the context pane shows. `None` when the view
+    /// is empty.
+    fn selected_note_path(&self) -> Option<String> {
+        let idx = self.state.selected()?;
+        Some(self.rows.get(idx)?.note_path().to_string())
+    }
+
+    /// Keep the context pane's cached note content in step with the selection (ADR-0006).
+    /// Reads `db::note_content` only when the selection moved to a *different* note (or
+    /// `force` is set, used on refresh to pick up re-indexed content). The TUI still
+    /// never opens a vault file — this is an index read. Read errors are logged to
+    /// stderr and never propagated (a stale/blank pane must not kill the session).
+    fn sync_context(&mut self, conn: &Connection, force: bool) {
+        let target = self.selected_note_path();
+        let changed = target.as_deref() != self.ctx_note_path.as_deref();
+        match target {
+            None => {
+                self.ctx_note_path = None;
+                self.ctx_content = None;
+            }
+            Some(np) if force || changed => {
+                self.ctx_content = match db::note_content(conn, &np) {
+                    Ok(nc) => nc,
+                    Err(e) => {
+                        eprintln!("taski: could not read note content for {np}: {e:#}");
+                        None
+                    }
+                };
+                self.ctx_note_path = Some(np);
+            }
+            Some(_) => { /* same note as cached; keep it */ }
+        }
+    }
+
     /// Enqueue a checkbox-flip for the task under the cursor. No-op on a header or an
     /// empty list — the flip must always resolve to the exact task the user sees, never
     /// a header row. On success the new action id is tracked so its resolution is
@@ -529,6 +577,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, conn: &Connection) -> 
             KeyCode::BackTab => app.collapse_all(),
             _ => {}
         }
+
+        // After any selection change, load the newly-selected note's content if the
+        // selection moved to a different note (refreshes already force a re-read).
+        app.sync_context(conn, false);
     }
 }
 
@@ -616,6 +668,13 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let footer_area = chunks[chunks.len() - 1];
     let notice_area = notice_present.then(|| chunks[1]);
 
+    // Split the list region into [task list | context pane] (ADR-0006). The list keeps
+    // its title/counts block; the pane gets its own block titled with the note path.
+    let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(list_area);
+    let list_col = cols[0];
+    let ctx_col = cols[1];
+
     let open_total = app
         .tasks
         .iter()
@@ -649,13 +708,13 @@ fn draw(frame: &mut Frame, app: &mut App) {
             (false, StatusFilter::Done) => "No done tasks. Press `f` to change the filter.",
             (false, StatusFilter::All) => "No tasks match.",
         };
-        frame.render_widget(Paragraph::new(msg).block(block), list_area);
+        frame.render_widget(Paragraph::new(msg).block(block), list_col);
     } else {
         let items: Vec<ListItem> = app.rows.iter().map(row_to_item).collect();
         let list = List::new(items)
             .block(block)
             .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
-        frame.render_stateful_widget(list, list_area, &mut app.state);
+        frame.render_stateful_widget(list, list_col, &mut app.state);
     }
 
     // Write-back failure notice: red, between the list and the footer, only when set.
@@ -669,6 +728,18 @@ fn draw(frame: &mut Frame, app: &mut App) {
         ]);
         frame.render_widget(Paragraph::new(line), area);
     }
+
+    // Context pane (ADR-0006): show the selected task's note content in situ, with the
+    // task's line highlighted. Read-only — the TUI gets this from the index, never the
+    // vault. `target_line` is None when the cursor is on a group header.
+    let target_line = app.selected_task().map(|t| t.line_number);
+    draw_context_pane(
+        frame,
+        ctx_col,
+        app.ctx_note_path.as_deref(),
+        app.ctx_content.as_ref(),
+        target_line,
+    );
 
     let footer = Paragraph::new(Line::from(vec![
         Span::raw(" "),
@@ -755,6 +826,125 @@ fn checkbox_style(status: &Status) -> Style {
         Status::InProgress => Style::default().fg(Color::Cyan),
         Status::Other(_) => Style::default().fg(Color::DarkGray),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Context pane (ADR-0006): render the selected task's note content in situ.
+// ---------------------------------------------------------------------------
+
+/// Pure windowing: given a note's total line count, an optional target line (the
+/// selected task's 1-based line; `None` for a group header), and the available pane
+/// height in rows, decide which lines to show and where the highlight sits.
+///
+/// Returns `(start_line, count, highlight_offset)`:
+/// - `start_line` — 1-based index of the first line to show.
+/// - `count` — how many lines (from `start_line`) to show.
+/// - `highlight_offset` — 0-based offset within the shown window of the target line, or
+///   `None` when there is no target (header selected).
+///
+/// The target is centered within the window and clamped so the window never runs past
+/// the note bounds. Pure (no I/O, no ratatui types) so it is unit-testable.
+fn context_view(
+    note_line_count: usize,
+    target_line: Option<usize>,
+    pane_height: usize,
+) -> (usize, usize, Option<usize>) {
+    if note_line_count == 0 || pane_height == 0 {
+        return (1, 0, None);
+    }
+    // Never show more lines than the note has.
+    let height = pane_height.min(note_line_count);
+    let (start, highlight) = match target_line {
+        None => (1, None),
+        Some(t) => {
+            // Clamp the target into range first (a stale line_number could exceed bounds).
+            let t = t.clamp(1, note_line_count);
+            // Center on t, then clamp start so the window fits within the note.
+            let mut start = t.saturating_sub(height / 2);
+            let max_start = note_line_count.saturating_sub(height) + 1;
+            if start > max_start {
+                start = max_start;
+            }
+            if start < 1 {
+                start = 1;
+            }
+            (start, Some(t - start))
+        }
+    };
+    let count = height.min(note_line_count - start + 1);
+    (start, count, highlight)
+}
+
+/// Render the context pane into `area`: a bordered block titled with the note path,
+/// showing a window of the note's content centered on `target_line` (or the top of the
+/// note when the cursor is on a header), with a line-number gutter and the target line
+/// highlighted. Shows a graceful placeholder when content is unavailable.
+fn draw_context_pane(
+    frame: &mut Frame,
+    area: Rect,
+    note_path: Option<&str>,
+    content: Option<&NoteContent>,
+    target_line: Option<usize>,
+) {
+    let title = Line::from(vec![
+        Span::raw(" Context — "),
+        Span::styled(
+            note_path.unwrap_or("(no note selected)"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+    ]);
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+
+    let lines: Vec<Line> = match content {
+        None => vec![Line::from(Span::styled(
+            " Context not available for this note.",
+            Style::new().add_modifier(Modifier::DIM),
+        ))],
+        Some(nc) => {
+            let note_lines: Vec<&str> = nc.content.lines().collect();
+            let line_count = note_lines.len();
+            if line_count == 0 {
+                vec![Line::from(Span::styled(
+                    " (empty note)",
+                    Style::new().add_modifier(Modifier::DIM),
+                ))]
+            } else {
+                // Center on the target line within the available rows; clamped to the
+                // note bounds by `context_view`.
+                let (start, count, highlight) =
+                    context_view(line_count, target_line, inner.height as usize);
+                let num_width = line_count.to_string().len();
+                (0..count)
+                    .map(|i| {
+                        let lineno = start + i;
+                        let raw = note_lines[start - 1 + i];
+                        let is_target = highlight == Some(i);
+                        let style = if is_target {
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default()
+                        };
+                        Line::from(vec![
+                            Span::styled(
+                                format!("{:>width$} ", lineno, width = num_width),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                            Span::styled(if is_target { "▶ " } else { "  " }, style),
+                            Span::styled(raw.to_string(), style),
+                        ])
+                    })
+                    .collect()
+            }
+        }
+    };
+
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 #[cfg(test)]
@@ -1403,5 +1593,185 @@ mod tests {
         assert!(msg.contains("Daily.md"));
         assert!(msg.contains("this note changed in Obsidian"));
         assert!(msg.contains("Space"));
+    }
+
+    /// `context_view` centers the target within the window and clamps it to the note.
+    #[test]
+    fn context_view_centers_and_clamps() {
+        // Plenty of room both sides: target 10 in a 20-line note, 5 rows -> centered.
+        let (start, count, hl) = context_view(20, Some(10), 5);
+        assert_eq!(start, 8, "window = [8..12], target centered at offset 2");
+        assert_eq!(count, 5);
+        assert_eq!(hl, Some(2));
+
+        // Target near the top: clamp start to 1.
+        let (start, count, hl) = context_view(20, Some(2), 5);
+        assert_eq!(start, 1);
+        assert_eq!(count, 5);
+        assert_eq!(hl, Some(1));
+
+        // Target near the bottom: clamp so the window fits.
+        let (start, count, hl) = context_view(20, Some(19), 5);
+        assert_eq!(start, 16, "max_start = 20 - 5 + 1 = 16");
+        assert_eq!(count, 5);
+        assert_eq!(hl, Some(3));
+
+        // Note shorter than the pane: show the whole note, highlight preserved.
+        let (start, count, hl) = context_view(3, Some(2), 10);
+        assert_eq!(start, 1);
+        assert_eq!(count, 3);
+        assert_eq!(hl, Some(1));
+
+        // An out-of-range target (stale line_number) is clamped into range.
+        let (start, count, hl) = context_view(5, Some(99), 3);
+        assert_eq!(start, 3, "max_start = 5 - 3 + 1 = 3");
+        assert_eq!(count, 3);
+        assert_eq!(hl, Some(2), "clamped target 5 - start 3 = offset 2");
+    }
+
+    /// `context_view` with no target (a group header) starts at the top, no highlight.
+    #[test]
+    fn context_view_no_target_starts_at_top() {
+        let (start, count, hl) = context_view(20, None, 5);
+        assert_eq!(start, 1);
+        assert_eq!(count, 5);
+        assert_eq!(hl, None);
+    }
+
+    /// `context_view` degenerates safely on an empty note or zero-height pane.
+    #[test]
+    fn context_view_empty_degenerates() {
+        assert_eq!(context_view(0, Some(1), 5), (1, 0, None));
+        assert_eq!(context_view(5, Some(1), 0), (1, 0, None));
+    }
+
+    /// `sync_context` loads the selected note's cached content and `refresh` keeps it
+    /// live (force re-read). The TUI reads only from the index, never the vault.
+    #[test]
+    fn sync_context_loads_selected_note_content() {
+        let conn = db::open(":memory:").unwrap();
+        db::upsert_task(&conn, &task(1, " ", 3, "alpha.md")).unwrap();
+        db::upsert_note_content(
+            &conn,
+            "alpha.md",
+            "line1\nline2\n- [ ] task\nline4",
+            Some("h"),
+        )
+        .unwrap();
+
+        let mut app = App::new();
+        app.filter = StatusFilter::All;
+        app.refresh(&conn).unwrap();
+        // Default: group collapsed -> cursor on the alpha.md header (no target line).
+        assert_eq!(app.selected_note_path().as_deref(), Some("alpha.md"));
+        assert_eq!(app.ctx_note_path.as_deref(), Some("alpha.md"));
+        let nc = app
+            .ctx_content
+            .as_ref()
+            .expect("content should be cached for the selected note");
+        assert_eq!(nc.content, "line1\nline2\n- [ ] task\nline4");
+
+        // Expand the group and land on the task -> window centers on line 3.
+        app.expanded.insert("alpha.md".to_string());
+        app.rebuild();
+        app.state.select(Some(1)); // the task row
+        app.sync_context(&conn, false); // same note -> no refetch needed, still cached
+        assert_eq!(app.selected_task().map(|t| t.line_number), Some(3));
+        let (start, count, hl) = context_view(4, Some(3), 10);
+        assert_eq!((start, count, hl), (1, 4, Some(2)));
+
+        // An edit to the note's content lands on the next refresh (force re-read).
+        db::upsert_note_content(&conn, "alpha.md", "rewritten\n- [ ] task", Some("h2")).unwrap();
+        app.refresh(&conn).unwrap();
+        assert_eq!(
+            app.ctx_content.as_ref().unwrap().content,
+            "rewritten\n- [ ] task"
+        );
+    }
+
+    /// `sync_context` swaps content when the selection moves to a different note, and
+    /// clears the pane when the view empties.
+    #[test]
+    fn sync_context_swaps_and_clears_with_selection() {
+        let conn = db::open(":memory:").unwrap();
+        db::upsert_task(&conn, &task(1, " ", 1, "alpha.md")).unwrap();
+        db::upsert_task(&conn, &task(2, " ", 1, "beta.md")).unwrap();
+        db::upsert_note_content(&conn, "alpha.md", "alpha body", None).unwrap();
+        db::upsert_note_content(&conn, "beta.md", "beta body", None).unwrap();
+
+        let mut app = App::new();
+        app.refresh(&conn).unwrap();
+        // Cursor on the alpha header.
+        assert_eq!(app.ctx_note_path.as_deref(), Some("alpha.md"));
+        assert_eq!(app.ctx_content.as_ref().unwrap().content, "alpha body");
+
+        // Move to the beta header -> content swaps on sync(force=false) (note changed).
+        app.move_selection(1);
+        app.sync_context(&conn, false);
+        assert_eq!(app.ctx_note_path.as_deref(), Some("beta.md"));
+        assert_eq!(app.ctx_content.as_ref().unwrap().content, "beta body");
+
+        // Delete all tasks -> view empties -> pane clears.
+        db::delete_tasks_for_note(&conn, "alpha.md").unwrap();
+        db::delete_tasks_for_note(&conn, "beta.md").unwrap();
+        app.refresh(&conn).unwrap();
+        assert!(app.ctx_note_path.is_none());
+        assert!(app.ctx_content.is_none());
+    }
+
+    /// A note with no cached content (e.g. a note the daemon hasn't cached) shows a
+    /// placeholder, not a crash: `sync_context` records the note_path with `None`.
+    #[test]
+    fn sync_context_handles_uncached_note() {
+        let conn = db::open(":memory:").unwrap();
+        db::upsert_task(&conn, &task(1, " ", 1, "alpha.md")).unwrap();
+        // Deliberately no note_contents row for alpha.md.
+        let mut app = App::new();
+        app.refresh(&conn).unwrap();
+        assert_eq!(app.ctx_note_path.as_deref(), Some("alpha.md"));
+        assert!(
+            app.ctx_content.is_none(),
+            "uncached note should yield None content, not an error"
+        );
+    }
+
+    /// Headless render smoke (TestBackend): `draw` with the split-pane layout must not
+    /// panic, and the context pane must actually render its title and the selected
+    /// task's line text. Exercises the full draw path (incl. `draw_context_pane`)
+    /// without a real terminal.
+    #[test]
+    fn draw_renders_context_pane_without_panic() {
+        use ratatui::backend::TestBackend;
+
+        let conn = db::open(":memory:").unwrap();
+        db::upsert_task(&conn, &task(1, " ", 3, "alpha.md")).unwrap();
+        db::upsert_note_content(
+            &conn,
+            "alpha.md",
+            "# Alpha\nsome lead-in\n- [ ] the actual task text here\nfollow-up\n",
+            Some("h"),
+        )
+        .unwrap();
+
+        let mut app = App::new();
+        app.filter = StatusFilter::All;
+        app.refresh(&conn).unwrap();
+        app.expanded.insert("alpha.md".to_string());
+        app.rebuild();
+        app.state.select(Some(1)); // on the task row
+        app.sync_context(&conn, false);
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        // Must not panic.
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+        let buf = terminal.backend().buffer();
+        let rendered: String = buf.content.iter().map(|c| c.symbol().to_string()).collect();
+        assert!(rendered.contains("Context"), "pane title should render");
+        assert!(
+            rendered.contains("the actual task text here"),
+            "the task line should appear in the context pane"
+        );
     }
 }
