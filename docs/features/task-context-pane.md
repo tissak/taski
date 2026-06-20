@@ -120,8 +120,8 @@ write-back notice + the checkbox visibly flipping on the next poll.
 |---|---|---|
 | Move task selection | existing (arrows / `j` `k`) | unchanged |
 | Toggle task | `Space` | unchanged |
-| Scroll context pane | `J` / `K` or `Ctrl-d`/`Ctrl-u` | must **not** collide with existing keys (`f` filter, `q` quit, etc.) |
-| Toggle pane on/off | `Tab` (proposed) | reclaim full width for the list |
+| Scroll context pane | `J` / `K` (uppercase) | chosen so lowercase `j`/`k` keeps moving the task list; no collision with `f`/`q`/`Tab` |
+| Toggle pane on/off | `p` | chosen over `Tab` (which is expand/collapse-all); reclaims full width for the list |
 
 ---
 

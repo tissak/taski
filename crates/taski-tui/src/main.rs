@@ -57,6 +57,10 @@ const RECENT_ACTION_LIMIT: i64 = 64;
 /// drained as the daemon resolves them, so this only bounds growth if the daemon
 /// stalls; oldest entries are dropped first.
 const TRACK_CAP: usize = 64;
+/// Minimum terminal width (in columns) at which the context pane is shown alongside
+/// the list. Below this the list takes the full width so neither side is unreadably
+/// narrow. The pane can also be toggled off explicitly with `p`.
+const MIN_SPLIT_WIDTH: u16 = 60;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -292,6 +296,13 @@ struct App {
     /// index). Re-fetched when the selection moves to a different note and force-read on
     /// each refresh so toggles/edits land within ~1 poll.
     ctx_content: Option<NoteContent>,
+    /// Whether the context pane is shown. Toggled with `p`; also hidden automatically
+    /// below [`MIN_SPLIT_WIDTH`] columns so neither pane is unreadably narrow.
+    pane_visible: bool,
+    /// Manual scroll offset (in lines) applied on top of the auto-centered context
+    /// window. `J`/`K` adjust it; any task navigation resets it to 0 (recenter on the
+    /// new task). It survives index refreshes so a scroll isn't undone ~750ms later.
+    ctx_scroll: i32,
 }
 
 impl App {
@@ -309,6 +320,8 @@ impl App {
             notice: None,
             ctx_note_path: None,
             ctx_content: None,
+            pane_visible: true,
+            ctx_scroll: 0,
         }
     }
 
@@ -381,6 +394,7 @@ impl App {
     fn cycle_filter(&mut self) {
         self.filter = self.filter.next();
         self.rebuild();
+        self.ctx_scroll = 0;
     }
 
     /// Toggle / expand / collapse the group under the cursor. `Enter` toggles a
@@ -424,6 +438,7 @@ impl App {
             self.expanded.remove(&note);
         }
         self.rebuild();
+        self.ctx_scroll = 0;
     }
 
     /// `Tab`: expand every group currently visible.
@@ -434,12 +449,14 @@ impl App {
             }
         }
         self.rebuild();
+        self.ctx_scroll = 0;
     }
 
     /// `Shift-Tab`: collapse every group.
     fn collapse_all(&mut self) {
         self.expanded.clear();
         self.rebuild();
+        self.ctx_scroll = 0;
     }
 
     /// Shift the selection by `delta` display rows, clamping at the ends.
@@ -451,6 +468,20 @@ impl App {
         let current = self.state.selected().unwrap_or(0) as i32;
         let next = (current + delta).clamp(0, len as i32 - 1) as usize;
         self.state.select(Some(next));
+        // Recenter the context pane on the newly-selected task.
+        self.ctx_scroll = 0;
+    }
+
+    /// `J`/`K`: scroll the context pane by `delta` lines (positive = down). Bounded at
+    /// draw time against the note length, so the key handler need not know the pane size.
+    fn scroll_context(&mut self, delta: i32) {
+        self.ctx_scroll = self.ctx_scroll.saturating_add(delta);
+    }
+
+    /// `p`: show/hide the context pane. When hidden (or below [`MIN_SPLIT_WIDTH`]) the
+    /// list reclaims the full width.
+    fn toggle_pane(&mut self) {
+        self.pane_visible = !self.pane_visible;
     }
 
     /// The task under the cursor, if the cursor is on a task row (never a header).
@@ -482,18 +513,24 @@ impl App {
             None => {
                 self.ctx_note_path = None;
                 self.ctx_content = None;
+                self.ctx_scroll = 0;
             }
-            Some(np) if force || changed => {
-                self.ctx_content = match db::note_content(conn, &np) {
-                    Ok(nc) => nc,
-                    Err(e) => {
-                        eprintln!("taski: could not read note content for {np}: {e:#}");
-                        None
+            Some(np) => {
+                if force || changed {
+                    self.ctx_content = match db::note_content(conn, &np) {
+                        Ok(nc) => nc,
+                        Err(e) => {
+                            eprintln!("taski: could not read note content for {np}: {e:#}");
+                            None
+                        }
+                    };
+                    self.ctx_note_path = Some(np);
+                    if changed {
+                        // Selection moved to a different note: recenter the pane.
+                        self.ctx_scroll = 0;
                     }
-                };
-                self.ctx_note_path = Some(np);
+                }
             }
-            Some(_) => { /* same note as cached; keep it */ }
         }
     }
 
@@ -575,6 +612,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, conn: &Connection) -> 
             KeyCode::Char('f') => app.cycle_filter(),
             KeyCode::Tab => app.expand_all(),
             KeyCode::BackTab => app.collapse_all(),
+            // Uppercase J/K scroll the context pane (lowercase j/k move the task list).
+            KeyCode::Char('J') => app.scroll_context(1),
+            KeyCode::Char('K') => app.scroll_context(-1),
+            KeyCode::Char('p') => app.toggle_pane(),
             _ => {}
         }
 
@@ -668,12 +709,17 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let footer_area = chunks[chunks.len() - 1];
     let notice_area = notice_present.then(|| chunks[1]);
 
-    // Split the list region into [task list | context pane] (ADR-0006). The list keeps
-    // its title/counts block; the pane gets its own block titled with the note path.
-    let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(list_area);
-    let list_col = cols[0];
-    let ctx_col = cols[1];
+    // Split the list region into [task list | context pane] (ADR-0006), unless the pane
+    // is toggled off (`p`) or the terminal is too narrow for both to be readable. The
+    // list keeps its title/counts block; the pane gets its own block (note-path title).
+    let show_pane = app.pane_visible && list_area.width >= MIN_SPLIT_WIDTH;
+    let (list_col, ctx_col) = if show_pane {
+        let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(list_area);
+        (cols[0], Some(cols[1]))
+    } else {
+        (list_area, None)
+    };
 
     let open_total = app
         .tasks
@@ -731,15 +777,19 @@ fn draw(frame: &mut Frame, app: &mut App) {
 
     // Context pane (ADR-0006): show the selected task's note content in situ, with the
     // task's line highlighted. Read-only — the TUI gets this from the index, never the
-    // vault. `target_line` is None when the cursor is on a group header.
-    let target_line = app.selected_task().map(|t| t.line_number);
-    draw_context_pane(
-        frame,
-        ctx_col,
-        app.ctx_note_path.as_deref(),
-        app.ctx_content.as_ref(),
-        target_line,
-    );
+    // vault. `target_line` is None when the cursor is on a group header. Skipped when the
+    // pane is toggled off or the terminal is too narrow.
+    if let Some(ctx_col) = ctx_col {
+        let target_line = app.selected_task().map(|t| t.line_number);
+        draw_context_pane(
+            frame,
+            ctx_col,
+            app.ctx_note_path.as_deref(),
+            app.ctx_content.as_ref(),
+            target_line,
+            app.ctx_scroll,
+        );
+    }
 
     let footer = Paragraph::new(Line::from(vec![
         Span::raw(" "),
@@ -755,6 +805,10 @@ fn draw(frame: &mut Frame, app: &mut App) {
         Span::raw(" filter  ·  "),
         Span::styled("Tab/⇧Tab", Style::default().fg(Color::Yellow)),
         Span::raw(" expand/collapse all  ·  "),
+        Span::styled("J/K", Style::default().fg(Color::Yellow)),
+        Span::raw(" scroll context  ·  "),
+        Span::styled("p", Style::default().fg(Color::Yellow)),
+        Span::raw(" toggle pane  ·  "),
         Span::styled("q", Style::default().fg(Color::Yellow)),
         Span::raw(" quit "),
     ]))
@@ -878,13 +932,15 @@ fn context_view(
 /// Render the context pane into `area`: a bordered block titled with the note path,
 /// showing a window of the note's content centered on `target_line` (or the top of the
 /// note when the cursor is on a header), with a line-number gutter and the target line
-/// highlighted. Shows a graceful placeholder when content is unavailable.
+/// highlighted. `scroll` shifts the window up/down from the auto-centered position.
+/// Shows a graceful placeholder when content is unavailable.
 fn draw_context_pane(
     frame: &mut Frame,
     area: Rect,
     note_path: Option<&str>,
     content: Option<&NoteContent>,
     target_line: Option<usize>,
+    scroll: i32,
 ) {
     let title = Line::from(vec![
         Span::raw(" Context — "),
@@ -913,10 +969,18 @@ fn draw_context_pane(
                     Style::new().add_modifier(Modifier::DIM),
                 ))]
             } else {
-                // Center on the target line within the available rows; clamped to the
-                // note bounds by `context_view`.
-                let (start, count, highlight) =
+                // Center on the target line (no scroll), then apply the manual scroll
+                // offset and clamp the start so the window always fits within the note.
+                let (centered, count, _) =
                     context_view(line_count, target_line, inner.height as usize);
+                let rows = count;
+                let max_start = line_count.saturating_sub(rows) + 1;
+                let start = ((centered as i32) + scroll).clamp(1, max_start as i32) as usize;
+                // The highlight sits at the target line if it is still in view after scroll.
+                let highlight = target_line.and_then(|t| {
+                    let t = t.clamp(1, line_count);
+                    (t >= start && t < start + rows).then_some(t - start)
+                });
                 let num_width = line_count.to_string().len();
                 (0..count)
                     .map(|i| {
@@ -1772,6 +1836,155 @@ mod tests {
         assert!(
             rendered.contains("the actual task text here"),
             "the task line should appear in the context pane"
+        );
+    }
+
+    /// `scroll_context` adjusts the pane offset; any task navigation recenters it to 0,
+    /// and the offset saturates at the i32 bounds (no overflow panic).
+    #[test]
+    fn scroll_context_adjusts_and_resets_on_navigation() {
+        let mut app = App::new();
+        app.tasks = vec![task(1, " ", 1, "alpha.md"), task(2, " ", 2, "alpha.md")];
+        app.expanded.insert("alpha.md".to_string());
+        app.filter = StatusFilter::All;
+        app.rebuild();
+        app.state.select(Some(1)); // on task 2
+
+        app.scroll_context(3);
+        assert_eq!(app.ctx_scroll, 3);
+        app.scroll_context(-1);
+        assert_eq!(app.ctx_scroll, 2);
+
+        // Saturation at the bounds (no overflow panic).
+        app.ctx_scroll = i32::MAX;
+        app.scroll_context(1);
+        assert_eq!(app.ctx_scroll, i32::MAX);
+        app.ctx_scroll = i32::MIN;
+        app.scroll_context(-1);
+        assert_eq!(app.ctx_scroll, i32::MIN);
+
+        // Any task navigation recenters the pane.
+        for reset_in in ["move", "filter", "collapse", "expand"] {
+            app.ctx_scroll = 5;
+            match reset_in {
+                "move" => app.move_selection(-1),
+                "filter" => app.cycle_filter(),
+                "collapse" => app.collapse_all(),
+                "expand" => app.expand_all(),
+                _ => unreachable!(),
+            }
+            assert_eq!(app.ctx_scroll, 0, "{reset_in} should recenter the pane");
+        }
+    }
+
+    /// `toggle_pane` flips pane visibility.
+    #[test]
+    fn toggle_pane_flips_visibility() {
+        let mut app = App::new();
+        assert!(app.pane_visible, "pane is visible by default");
+        app.toggle_pane();
+        assert!(!app.pane_visible);
+        app.toggle_pane();
+        assert!(app.pane_visible);
+    }
+
+    /// A manual scroll survives an index refresh of the same note (so the pane isn't
+    /// yanked back ~750ms later), but moving to another note recenters it.
+    #[test]
+    fn scroll_survives_refresh_but_resets_on_navigation() {
+        let conn = db::open(":memory:").unwrap();
+        db::upsert_task(&conn, &task(1, " ", 1, "alpha.md")).unwrap();
+        db::upsert_task(&conn, &task(2, " ", 1, "beta.md")).unwrap();
+        db::upsert_note_content(&conn, "alpha.md", "a", None).unwrap();
+        db::upsert_note_content(&conn, "beta.md", "b", None).unwrap();
+
+        let mut app = App::new();
+        app.refresh(&conn).unwrap(); // cursor on the alpha header
+        app.ctx_scroll = 7;
+        // Refresh the SAME note (force) -> scroll must survive.
+        app.refresh(&conn).unwrap();
+        assert_eq!(app.ctx_scroll, 7, "refresh must not wipe a manual scroll");
+
+        // Move to the beta header -> recenters.
+        app.move_selection(1);
+        assert_eq!(app.ctx_scroll, 0, "moving to another note recenters");
+    }
+
+    /// With the pane toggled off (`p`), `draw` renders a full-width list and no pane —
+    /// the "Context" title is absent while the task row is still shown.
+    #[test]
+    fn draw_hides_pane_when_toggled_off() {
+        use ratatui::backend::TestBackend;
+
+        let conn = db::open(":memory:").unwrap();
+        db::upsert_task(&conn, &task(1, " ", 3, "alpha.md")).unwrap();
+        db::upsert_note_content(
+            &conn,
+            "alpha.md",
+            "# Alpha\n- [ ] do the thing\n",
+            Some("h"),
+        )
+        .unwrap();
+
+        let mut app = App::new();
+        app.filter = StatusFilter::All;
+        app.refresh(&conn).unwrap();
+        app.expanded.insert("alpha.md".to_string());
+        app.rebuild();
+        app.state.select(Some(1));
+        app.sync_context(&conn, false);
+        app.toggle_pane(); // hide the pane
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(
+            !rendered.contains("Context"),
+            "pane title must not render when toggled off"
+        );
+        assert!(rendered.contains("task 1"), "the list still shows the task");
+    }
+
+    /// Below [`MIN_SPLIT_WIDTH`] the pane auto-hides even when `pane_visible` is true,
+    /// so neither pane is unreadably narrow.
+    #[test]
+    fn draw_hides_pane_below_min_width() {
+        use ratatui::backend::TestBackend;
+
+        let conn = db::open(":memory:").unwrap();
+        db::upsert_task(&conn, &task(1, " ", 1, "alpha.md")).unwrap();
+        db::upsert_note_content(&conn, "alpha.md", "- [ ] short task\n", None).unwrap();
+
+        let mut app = App::new();
+        app.filter = StatusFilter::All;
+        app.refresh(&conn).unwrap();
+        app.expanded.insert("alpha.md".to_string());
+        app.rebuild();
+        app.state.select(Some(1));
+        app.sync_context(&conn, false);
+        assert!(app.pane_visible); // still visible in principle...
+
+        // ...but width 40 < MIN_SPLIT_WIDTH(60) -> the pane is auto-hidden.
+        let backend = TestBackend::new(40, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(
+            !rendered.contains("Context"),
+            "pane must auto-hide below MIN_SPLIT_WIDTH"
         );
     }
 }
