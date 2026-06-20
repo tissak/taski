@@ -105,9 +105,10 @@ pub fn parse_tasks(markdown: &str, note_path: &str) -> Vec<Task> {
     tasks
 }
 
-/// True if the (left-trimmed) line opens or closes a fenced code block.
+/// True if the (left-trimmed) line opens or closes a fenced code block. Recognises
+/// both CommonMark fence forms: backtick (```` ``` ````) and tilde (`~~~`).
 fn is_fence(trimmed_line: &str) -> bool {
-    trimmed_line.starts_with("```")
+    trimmed_line.starts_with("```") || trimmed_line.starts_with("~~~")
 }
 
 /// Try to interpret a single line as a task checkbox line.
@@ -342,6 +343,30 @@ some prose
         assert_eq!(tasks[2].status, Status::InProgress);
         assert_eq!(tasks[2].raw_checkbox_char, "/");
         assert_eq!(tasks[2].line_number, 5);
+    }
+
+    /// Tilde fences (`~~~`) are valid CommonMark and appear in some Obsidian notes.
+    /// Tasks inside a tilde-fenced block must NOT be parsed — mirrors the backtick
+    /// fence behaviour exercised above.
+    #[test]
+    fn skips_tasks_inside_tilde_fences() {
+        let md = "\
+- [ ] real task before the fence
+
+~~~text
+- [ ] fake task inside a tilde fence
+- [x] also fake
+~~~
+
+- [x] real task after the fence
+";
+
+        let tasks = parse_tasks(md, "tilde.md");
+        assert_eq!(tasks.len(), 2, "should skip the tilde-fenced tasks");
+        assert_eq!(tasks[0].status, Status::Open);
+        assert_eq!(tasks[0].text, "real task before the fence");
+        assert_eq!(tasks[1].status, Status::Done);
+        assert_eq!(tasks[1].text, "real task after the fence");
     }
 
     #[test]

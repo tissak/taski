@@ -7,4 +7,3 @@ rust-version.workspace = true
 [dependencies]
 taski-core.workspace = true
 rusqlite.workspace = true
-thiserror.workspace = true

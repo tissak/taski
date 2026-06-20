@@ -348,6 +348,20 @@ pub fn resolve_action(
     Ok(())
 }
 
+/// Delete resolved (`done`/`failed`) actions whose `resolved_at` is strictly older
+/// than `older_than` (unix seconds). Pending actions are never deleted, nor are
+/// resolved actions that resolved at or after the cutoff. Returns the row count
+/// removed. Called once on daemon startup to bound the `pending_actions` table's
+/// growth (M2 housekeeping).
+pub fn prune_old_actions(conn: &Connection, older_than: i64) -> rusqlite::Result<usize> {
+    let deleted = conn.execute(
+        "DELETE FROM pending_actions
+         WHERE state != 'pending' AND resolved_at IS NOT NULL AND resolved_at < ?1",
+        rusqlite::params![older_than],
+    )?;
+    Ok(deleted)
+}
+
 /// Current unix time in seconds, or 0 if the clock is before the epoch.
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
@@ -500,5 +514,62 @@ mod tests {
         let id2 = enqueue_action(&conn, 99, "note2.md", 1, "x", " ").unwrap();
         resolve_action(&conn, id2, "failed", Some("note changed externally")).unwrap();
         assert!(pending_actions(&conn).unwrap().is_empty());
+    }
+
+    /// M2 housekeeping: `prune_old_actions` deletes only resolved actions older than
+    /// the cutoff. Pending actions and recently-resolved actions are kept.
+    #[test]
+    fn prune_old_actions_deletes_only_old_resolved() {
+        let conn = open(":memory:").unwrap();
+
+        // Helper: enqueue + resolve at a specific resolved_at timestamp.
+        let enqueue_resolved = |task_id: i64, state: &str, resolved_at: i64| {
+            let id = enqueue_action(&conn, task_id, "note.md", 1, " ", "x").unwrap();
+            // Resolve, then backdate resolved_at to control the cutoff test.
+            conn.execute(
+                "UPDATE pending_actions SET state = ?1, resolved_at = ?2 WHERE id = ?3",
+                rusqlite::params![state, resolved_at, id],
+            )
+            .unwrap();
+        };
+
+        // Two OLD resolved actions (one done, one failed) — both should be pruned.
+        enqueue_resolved(1, "done", 1_000);
+        enqueue_resolved(2, "failed", 1_500);
+        // One RECENT resolved action — must survive.
+        enqueue_resolved(3, "done", 9_000);
+        // One action resolved exactly AT the cutoff — must survive (strict `<`).
+        enqueue_resolved(4, "done", 5_000);
+        // One still-PENDING action (enqueued, never resolved) — must survive.
+        let pending_id = enqueue_action(&conn, 5, "note.md", 1, " ", "x").unwrap();
+
+        // Cutoff: 5_000. Only resolved_at < 5_000 is pruned → ids 1 and 2.
+        let pruned = prune_old_actions(&conn, 5_000).unwrap();
+        assert_eq!(
+            pruned, 2,
+            "only the two old resolved actions should be pruned"
+        );
+
+        // The two old ones are gone; recent/at-cutoff/pending survive.
+        let mut stmt = conn
+            .prepare("SELECT id FROM pending_actions ORDER BY id ASC")
+            .unwrap();
+        let survivors: Vec<i64> = stmt
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        drop(stmt);
+        assert_eq!(survivors, vec![3, 4, pending_id], "survivors mismatch");
+
+        // The pending action is still fetchable as pending.
+        let pending = pending_actions(&conn).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, pending_id);
+        assert_eq!(pending[0].state, "pending");
+
+        // A second prune with a fresh cutoff is a no-op when nothing qualifies.
+        let pruned_again = prune_old_actions(&conn, 0).unwrap();
+        assert_eq!(pruned_again, 0);
     }
 }

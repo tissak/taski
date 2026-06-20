@@ -1789,7 +1789,6 @@ version = "0.1.0"
 dependencies = [
  "rusqlite",
  "taski-core",
- "thiserror 2.0.18",
 ]
 
 [[package]]

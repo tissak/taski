@@ -28,6 +28,12 @@ use taski_db as db;
 use taski_db::PendingAction;
 use walkdir::WalkDir;
 
+/// Retention window for resolved `pending_actions`: rows in `done`/`failed` state
+/// older than this many seconds are pruned on daemon startup (M2 housekeeping) so
+/// the table does not grow without bound. Seven days balances auditability against
+/// unbounded growth.
+const ACTION_RETENTION_SECS: i64 = 7 * 86_400;
+
 /// CLI configuration (PRD §12, Slice 1).
 #[derive(Parser, Debug)]
 #[command(
@@ -67,6 +73,16 @@ pub fn run() -> Result<()> {
         Ok(n) if n > 0 => tracing::warn!(count = n, "swept stale *.taski.tmp files"),
         Ok(_) => {}
         Err(e) => tracing::warn!(err = %e, "temp-file sweep failed; continuing"),
+    }
+
+    // Prune resolved pending_actions older than the retention window so the table
+    // does not grow without bound (M2 housekeeping). Done once at startup; pending
+    // actions are never pruned.
+    let cutoff = unix_now() - ACTION_RETENTION_SECS;
+    match db::prune_old_actions(&conn, cutoff) {
+        Ok(n) if n > 0 => tracing::warn!(count = n, "pruned old resolved actions"),
+        Ok(_) => tracing::debug!("no old resolved actions to prune"),
+        Err(e) => tracing::warn!(err = %e, "action pruning failed; continuing"),
     }
 
     let total = scan_vault(&conn, &vault_root)?;
@@ -650,6 +666,15 @@ fn note_mtime(path: &Path) -> Option<i64> {
         .duration_since(UNIX_EPOCH)
         .ok()
         .map(|d| d.as_secs() as i64)
+}
+
+/// Current unix time in seconds, or 0 if the clock is before the epoch. Used to
+/// compute the `pending_actions` prune cutoff at startup.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Remove any leftover `<name>.taski.tmp` files under `vault_root` left behind by a
