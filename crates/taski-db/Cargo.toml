@@ -7,3 +7,7 @@ rust-version.workspace = true
 [dependencies]
 taski-core.workspace = true
 rusqlite.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

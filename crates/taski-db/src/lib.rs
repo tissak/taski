@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use anyhow::Context;
 use rusqlite::Connection;
 
 // Re-export the shared domain types so downstream crates (e.g. the TUI) can depend on
@@ -72,8 +73,18 @@ fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 /// Open (or create) the database at `path`, configure WAL multi-process access, and
-/// ensure the schema exists at the current version.
-pub fn open(path: &str) -> rusqlite::Result<Connection> {
+/// ensure the schema exists at the current version. Parent directories of `path` are
+/// created if missing (SQLite itself will not), so a configured path like
+/// `~/.local/share/taski/taski.db` works on first run. A bare filename or `:memory:`
+/// has no usable parent and is left untouched.
+pub fn open(path: &str) -> anyhow::Result<Connection> {
+    if let Some(parent) = std::path::Path::new(path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating database directory {}", parent.display()))?;
+    }
     let conn = Connection::open(path)?;
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
     ensure_schema(&conn)?;
@@ -654,5 +665,20 @@ mod tests {
         // A second prune with a fresh cutoff is a no-op when nothing qualifies.
         let pruned_again = prune_old_actions(&conn, 0).unwrap();
         assert_eq!(pruned_again, 0);
+    }
+
+    /// Regression: `open` creates missing parent directories so a configured path like
+    /// `~/.local/share/taski/taski.db` works on first run (SQLite itself returns
+    /// SQLITE_CANTOPEN when the directory is absent).
+    #[test]
+    fn open_creates_missing_parent_directories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A nested path whose parent directories do not exist yet.
+        let db_path = dir.path().join("a/b/c/deep.db");
+        let conn = open(&db_path.to_string_lossy()).expect("open creates parent dirs");
+
+        assert!(db_path.exists(), "db file should have been created");
+        // The connection is usable.
+        assert!(all_tasks(&conn).unwrap().is_empty());
     }
 }
