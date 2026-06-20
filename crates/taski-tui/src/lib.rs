@@ -196,14 +196,9 @@ impl StatusFilter {
 
 /// One renderable row in the grouped list. `Header` carries per-note counts computed
 /// from the full (unfiltered) task set so the triage overview stays accurate under any
-/// filter; `Task` carries the task the cursor can act on.
-//
-// `large_enum_variant`: the `Task` arm dominates the enum's size (the Tier 1
-// metadata fields pushed `Task` past clippy's 200-byte threshold). Boxing the
-// field (`Box<Task>`) is the proper fix but would touch every match arm and
-// every construction site — a TUI-internal refactor outside Tier 1's stated
-// read-path scope. Deferred to a dedicated cleanup; the allow is intentional.
-#[allow(clippy::large_enum_variant)]
+/// filter; `Task` carries the task the cursor can act on. The `Task` arm is boxed so
+/// `Task`'s size (it grew substantially after the Tier 1 metadata fields landed)
+/// doesn't dominate the enum's stack footprint.
 #[derive(Debug, Clone)]
 enum DisplayRow {
     Header {
@@ -213,7 +208,7 @@ enum DisplayRow {
         collapsed: bool,
     },
     Task {
-        task: Task,
+        task: Box<Task>,
     },
 }
 
@@ -295,7 +290,9 @@ fn build_view(
             });
             if is_expanded {
                 for t in visible {
-                    rows.push(DisplayRow::Task { task: t.clone() });
+                    rows.push(DisplayRow::Task {
+                        task: Box::new(t.clone()),
+                    });
                 }
             }
         }
@@ -717,7 +714,7 @@ impl App {
     fn selected_task(&self) -> Option<&Task> {
         let idx = self.state.selected()?;
         match self.rows.get(idx)? {
-            DisplayRow::Task { task } => Some(task),
+            DisplayRow::Task { task } => Some(task.as_ref()),
             _ => None,
         }
     }
@@ -1999,10 +1996,10 @@ mod tests {
                 collapsed: false,
             },
             DisplayRow::Task {
-                task: task(10, " ", 1, "a.md"),
+                task: Box::new(task(10, " ", 1, "a.md")),
             },
             DisplayRow::Task {
-                task: task(11, " ", 2, "a.md"),
+                task: Box::new(task(11, " ", 2, "a.md")),
             },
         ];
         let mut state = ListState::default();
@@ -2017,7 +2014,7 @@ mod tests {
                 collapsed: false,
             },
             DisplayRow::Task {
-                task: task(11, " ", 2, "a.md"),
+                task: Box::new(task(11, " ", 2, "a.md")),
             },
         ];
         reconcile_view_selection(&rows2, Some("a.md"), Some(11), Some(2), &mut state);
