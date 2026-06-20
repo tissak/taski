@@ -139,6 +139,21 @@ fn restore_terminal() -> Result<()> {
     Ok(())
 }
 
+/// Derive "today" as a `YYYY-MM-DD` string from the wall clock, via the pure
+/// `taski_core::ymd_from_unix` (no date crate — ADR-0009 Phase 1). The TUI calls
+/// this on `App` construction and on each index refresh so a session spanning
+/// midnight keeps the Today view correct. Falls back to the epoch on a
+/// pre-epoch clock (matching `taski_core`'s convention).
+fn today_string() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // `ymd_from_unix` is re-exported by `taski-db` so the TUI takes no direct
+    // `taski-core` dependency (the established re-export pattern).
+    db::ymd_from_unix(secs)
+}
+
 // ---------------------------------------------------------------------------
 // View model: grouping + filtering over the raw task list.
 // ---------------------------------------------------------------------------
@@ -217,7 +232,21 @@ impl DisplayRow {
 /// Groups with no filter-matching task are hidden entirely (no empty headers).
 /// Headers always carry the true open/total counts (from the full group, ignoring the
 /// filter); task rows are emitted only when the group is expanded.
-fn build_view(tasks: &[Task], filter: StatusFilter, expanded: &HashSet<String>) -> Vec<DisplayRow> {
+///
+/// `today_only` (ADR-0009 Phase 1) adds an orthogonal, stricter predicate on top of
+/// `filter`: when true, only tasks whose `scheduled_date == Some(today)` are visible.
+/// It is kept independent of `filter` (today-ness vs open/done) so the two compose —
+/// e.g. `today_only + Open` = today's open work. `today` is a `YYYY-MM-DD` string; it
+/// is only consulted when `today_only` is true.
+fn build_view(
+    tasks: &[Task],
+    filter: StatusFilter,
+    expanded: &HashSet<String>,
+    today_only: bool,
+    today: &str,
+) -> Vec<DisplayRow> {
+    let scheduled_today =
+        |t: &Task| -> bool { !today_only || t.scheduled_date.as_deref() == Some(today) };
     let mut rows = Vec::new();
     let mut i = 0;
     while i < tasks.len() {
@@ -229,7 +258,10 @@ fn build_view(tasks: &[Task], filter: StatusFilter, expanded: &HashSet<String>) 
         let group = &tasks[i..j];
         let total_count = group.len();
         let open_count = group.iter().filter(|t| t.status == Status::Open).count();
-        let visible: Vec<&Task> = group.iter().filter(|t| filter.matches(&t.status)).collect();
+        let visible: Vec<&Task> = group
+            .iter()
+            .filter(|t| filter.matches(&t.status) && scheduled_today(t))
+            .collect();
         if !visible.is_empty() {
             let is_expanded = expanded.contains(&note_path);
             rows.push(DisplayRow::Header {
@@ -338,6 +370,15 @@ struct App {
     /// window. `J`/`K` adjust it; any task navigation resets it to 0 (recenter on the
     /// new task). It survives index refreshes so a scroll isn't undone ~750ms later.
     ctx_scroll: i32,
+    /// ADR-0009 Phase 1: when true, `build_view` additionally restricts the list to
+    /// tasks whose `scheduled_date == today`. Independent of `filter` (today-ness and
+    /// open/done are orthogonal axes): `today_only + Open` = today's open work.
+    /// Toggled with `T` (lowercase `t` is reserved for the Phase 2 mark gesture).
+    today_only: bool,
+    /// The wall-clock "today" as `YYYY-MM-DD`, derived via `taski_core::ymd_from_unix`
+    /// (pure, no date crate). Stored on the struct (not recomputed each render) so it
+    /// stays stable across a single draw and is straightforward to pin in tests.
+    today: String,
 }
 
 impl App {
@@ -357,6 +398,8 @@ impl App {
             ctx_content: None,
             pane_visible: true,
             ctx_scroll: 0,
+            today_only: false,
+            today: today_string(),
         }
     }
 
@@ -375,13 +418,21 @@ impl App {
     /// Rebuild rows from the current tasks/filter/expanded and preserve selection.
     fn rebuild(&mut self) {
         let (note, task_id, idx) = self.snapshot();
-        self.rows = build_view(&self.tasks, self.filter, &self.expanded);
+        self.rows = build_view(
+            &self.tasks,
+            self.filter,
+            &self.expanded,
+            self.today_only,
+            &self.today,
+        );
         reconcile_view_selection(&self.rows, note.as_deref(), task_id, idx, &mut self.state);
     }
 
     /// Re-read the index from the DB, then rebuild the view and poll the resolution
     /// of actions enqueued this session so a refused write-back gets surfaced.
     fn refresh(&mut self, conn: &Connection) -> Result<()> {
+        // Refresh "today" so a session spanning midnight keeps the Today view correct.
+        self.today = today_string();
         self.tasks = db::all_tasks(conn).context("reading tasks from index")?;
         self.rebuild();
         self.poll_action_resolutions(conn)?;
@@ -428,6 +479,16 @@ impl App {
     /// `f`: cycle All -> Open -> Done -> All, preserving selection.
     fn cycle_filter(&mut self) {
         self.filter = self.filter.next();
+        self.rebuild();
+        self.ctx_scroll = 0;
+    }
+
+    /// `T`: toggle the ADR-0009 "Today" view — when on, `build_view` additionally
+    /// restricts the list to tasks whose `scheduled_date == today`. Independent of
+    /// the `f` status-cycle. Lowercase `t` is intentionally NOT bound (reserved for
+    /// the Phase 2 mark gesture).
+    fn toggle_today(&mut self) {
+        self.today_only = !self.today_only;
         self.rebuild();
         self.ctx_scroll = 0;
     }
@@ -659,6 +720,9 @@ fn run_loop(
             KeyCode::Right => app.toggle_at_cursor(ToggleMode::Expand),
             KeyCode::Left => app.toggle_at_cursor(ToggleMode::Collapse),
             KeyCode::Char('f') => app.cycle_filter(),
+            // ADR-0009 Phase 1: `T` toggles the Today view (read-only). Lowercase
+            // `t` is reserved for the Phase 2 mark-for-today write gesture.
+            KeyCode::Char('T') => app.toggle_today(),
             KeyCode::Tab => app.expand_all(),
             KeyCode::BackTab => app.collapse_all(),
             // Uppercase J/K scroll the context pane (lowercase j/k move the task list).
@@ -782,7 +846,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         .filter(|r| matches!(r, DisplayRow::Header { .. }))
         .count();
 
-    let title = Line::from(vec![
+    let mut title_spans: Vec<Span> = vec![
         Span::raw(" Taski — "),
         Span::styled(
             format!("filter: {}", app.filter.label()),
@@ -790,22 +854,40 @@ fn draw(frame: &mut Frame, app: &mut App) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!(
-            "   {open_total} open of {total} total   ·   {notes} notes "
-        )),
-    ]);
+    ];
+    // ADR-0009 Phase 1: surface the Today view state so the user can see it's on.
+    if app.today_only {
+        title_spans.push(Span::raw("  ·  "));
+        title_spans.push(Span::styled(
+            "today",
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    title_spans.push(Span::raw(format!(
+        "   {open_total} open of {total} total   ·   {notes} notes "
+    )));
+    let title = Line::from(title_spans);
     let block = Block::default().borders(Borders::ALL).title(title);
 
     if app.rows.is_empty() {
-        let msg = match (app.tasks.is_empty(), app.filter) {
-            (true, _) => "No tasks — run `cargo run -p taski-daemon` first to populate the index.",
-            (false, StatusFilter::Open) => "No open tasks. Press `f` to change the filter.",
-            (false, StatusFilter::Done) => "No done tasks. Press `f` to change the filter.",
-            (false, StatusFilter::All) => "No tasks match.",
+        let msg = match (app.tasks.is_empty(), app.filter, app.today_only) {
+            (true, _, _) => {
+                "No tasks — run `cargo run -p taski-daemon` first to populate the index."
+            }
+            (false, _, true) => "No tasks scheduled for today. Press `T` to leave the Today view.",
+            (false, StatusFilter::Open, false) => "No open tasks. Press `f` to change the filter.",
+            (false, StatusFilter::Done, false) => "No done tasks. Press `f` to change the filter.",
+            (false, StatusFilter::All, false) => "No tasks match.",
         };
         frame.render_widget(Paragraph::new(msg).block(block), list_col);
     } else {
-        let items: Vec<ListItem> = app.rows.iter().map(row_to_item).collect();
+        let items: Vec<ListItem> = app
+            .rows
+            .iter()
+            .map(|r| row_to_item(r, &app.today))
+            .collect();
         let list = List::new(items)
             .block(block)
             .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
@@ -852,6 +934,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
         Span::raw(" collapse/expand  ·  "),
         Span::styled("f", Style::default().fg(Color::Yellow)),
         Span::raw(" filter  ·  "),
+        Span::styled("T", Style::default().fg(Color::Yellow)),
+        Span::raw(" today  ·  "),
         Span::styled("Tab/⇧Tab", Style::default().fg(Color::Yellow)),
         Span::raw(" expand/collapse all  ·  "),
         Span::styled("J/K", Style::default().fg(Color::Yellow)),
@@ -867,8 +951,11 @@ fn draw(frame: &mut Frame, app: &mut App) {
 
 /// Render one display row as a list item. Group headers are bold with a cyan
 /// expand/collapse marker and dim counts; task rows are indented, with the checkbox
-/// coloured by status, done tasks struck through, and a yellow due date when present.
-fn row_to_item(row: &DisplayRow) -> ListItem<'static> {
+/// coloured by status, done tasks struck through, a yellow due date when present,
+/// and a `⏳ <date>` scheduled-date suffix in cyan (bold/bright cyan when the
+/// scheduled date is "today" — the ADR-0009 "this is a today task" affordance).
+/// `today` is a `YYYY-MM-DD` string used only for the bold-today highlight.
+fn row_to_item(row: &DisplayRow, today: &str) -> ListItem<'static> {
     match row {
         DisplayRow::Header {
             note_path,
@@ -898,7 +985,7 @@ fn row_to_item(row: &DisplayRow) -> ListItem<'static> {
         }
         DisplayRow::Task { task } => {
             let checkbox = format!("[{}]", task.raw_checkbox_char);
-            let mut spans: Vec<Span> = Vec::with_capacity(6);
+            let mut spans: Vec<Span> = Vec::with_capacity(8);
             spans.push(Span::raw("    ")); // indent under the header marker
             spans.push(Span::styled(checkbox, checkbox_style(&task.status)));
             spans.push(Span::raw(format!(" {}", task.text)));
@@ -908,6 +995,20 @@ fn row_to_item(row: &DisplayRow) -> ListItem<'static> {
                     format!("· {due}"),
                     Style::default().fg(Color::Yellow),
                 ));
+            }
+            // ADR-0009 Phase 1: scheduled-date suffix. Parallel to (not replacing)
+            // the yellow due-date above. Cyan normally; bold when == today.
+            if let Some(sched) = &task.scheduled_date {
+                let is_today = sched.as_str() == today;
+                let style = if is_today {
+                    Style::default()
+                        .fg(Color::LightCyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Cyan)
+                };
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(format!("⏳ {sched}"), style));
             }
             let item_style = match task.status {
                 Status::Done => Style::new()
@@ -1077,6 +1178,7 @@ mod tests {
             note_hash: None,
             note_mtime: None,
             due_date: None,
+            scheduled_date: None,
             updated_at: 1,
         }
     }
@@ -1084,6 +1186,13 @@ mod tests {
     fn task_with_due(id: i64, raw: &str, line: usize, note: &str, due: &str) -> Task {
         let mut t = task(id, raw, line, note);
         t.due_date = Some(due.to_string());
+        t
+    }
+
+    /// Build a task with a scheduled date set (ADR-0009 Phase 1).
+    fn task_with_scheduled(id: i64, raw: &str, line: usize, note: &str, sched: &str) -> Task {
+        let mut t = task(id, raw, line, note);
+        t.scheduled_date = Some(sched.to_string());
         t
     }
 
@@ -1175,7 +1284,7 @@ mod tests {
             task(3, " ", 1, "beta.md"),
         ];
         let expanded = HashSet::new();
-        let rows = build_view(&tasks, StatusFilter::All, &expanded);
+        let rows = build_view(&tasks, StatusFilter::All, &expanded, false, "");
         // Two collapsed groups -> two headers, no task rows.
         assert_eq!(rows.len(), 2);
         let (note, open, total, collapsed) = header(&rows[0]);
@@ -1194,7 +1303,7 @@ mod tests {
     fn build_view_expanded_emits_task_rows_in_line_order() {
         let tasks = vec![task(1, " ", 1, "alpha.md"), task(2, "x", 2, "alpha.md")];
         let expanded = HashSet::from(["alpha.md".to_string()]);
-        let rows = build_view(&tasks, StatusFilter::All, &expanded);
+        let rows = build_view(&tasks, StatusFilter::All, &expanded, false, "");
         assert_eq!(rows.len(), 3, "header + two tasks");
         assert!(matches!(rows[0], DisplayRow::Header { .. }));
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
@@ -1206,7 +1315,7 @@ mod tests {
     fn build_view_open_filter_hides_done_tasks() {
         let tasks = vec![task(1, " ", 1, "alpha.md"), task(2, "x", 2, "alpha.md")];
         let expanded = HashSet::from(["alpha.md".to_string()]);
-        let rows = build_view(&tasks, StatusFilter::Open, &expanded);
+        let rows = build_view(&tasks, StatusFilter::Open, &expanded, false, "");
         assert_eq!(rows.len(), 2, "header + only the open task");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
     }
@@ -1219,7 +1328,7 @@ mod tests {
             task(2, "x", 1, "beta.md"),  // done
         ];
         let expanded = HashSet::new();
-        let rows = build_view(&tasks, StatusFilter::Open, &expanded);
+        let rows = build_view(&tasks, StatusFilter::Open, &expanded, false, "");
         // Only alpha has an open task; beta is hidden under the Open filter.
         assert_eq!(rows.len(), 1);
         assert_eq!(header(&rows[0]).0, "alpha.md");
@@ -1230,7 +1339,7 @@ mod tests {
     fn build_view_preserves_due_date_on_task_row() {
         let tasks = vec![task_with_due(1, " ", 1, "alpha.md", "2026-07-01")];
         let expanded = HashSet::from(["alpha.md".to_string()]);
-        let rows = build_view(&tasks, StatusFilter::All, &expanded);
+        let rows = build_view(&tasks, StatusFilter::All, &expanded, false, "");
         match &rows[1] {
             DisplayRow::Task { task } => {
                 assert_eq!(task.due_date.as_deref(), Some("2026-07-01"));
@@ -2034,6 +2143,131 @@ mod tests {
         assert!(
             !rendered.contains("Context"),
             "pane must auto-hide below MIN_SPLIT_WIDTH"
+        );
+    }
+
+    // --- ADR-0009 Phase 1: "Today" view (scheduled_date == today) ----------
+
+    /// With `today_only` on, `build_view` keeps only tasks whose `scheduled_date`
+    /// matches `today`, across notes; tasks with other/None scheduled dates drop out.
+    #[test]
+    fn today_only_keeps_only_scheduled_today_tasks() {
+        let tasks = vec![
+            task_with_scheduled(1, " ", 1, "alpha.md", "2026-06-20"), // today
+            task_with_scheduled(2, " ", 1, "beta.md", "2026-06-21"),  // not today
+            task(3, " ", 1, "gamma.md"),                              // no scheduled date
+        ];
+        let expanded = HashSet::new();
+        let rows = build_view(&tasks, StatusFilter::All, &expanded, true, "2026-06-20");
+        // Only alpha.md has a today-matching task; one collapsed header.
+        assert_eq!(rows.len(), 1);
+        assert_eq!(header(&rows[0]).0, "alpha.md");
+    }
+
+    /// `today_only` composes with the status filter (orthogonal axes): today_only +
+    /// Done still hides a done today-task under the Open filter. Expanding shows the
+    /// right task row.
+    #[test]
+    fn today_only_composes_with_status_filter() {
+        let tasks = vec![
+            task_with_scheduled(1, " ", 1, "alpha.md", "2026-06-20"), // today, open
+            task_with_scheduled(2, "x", 2, "alpha.md", "2026-06-20"), // today, done
+        ];
+        let expanded = HashSet::from(["alpha.md".to_string()]);
+        // Open + today -> only the open today task.
+        let rows = build_view(&tasks, StatusFilter::Open, &expanded, true, "2026-06-20");
+        assert_eq!(rows.len(), 2, "header + one task");
+        assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
+        // All + today -> both today tasks.
+        let rows = build_view(&tasks, StatusFilter::All, &expanded, true, "2026-06-20");
+        assert_eq!(rows.len(), 3, "header + two tasks");
+    }
+
+    /// Toggling `today_only` off shows all tasks again (the filter is a pure
+    /// function of app state; `toggle_today` flips the flag and rebuilds).
+    #[test]
+    fn toggle_today_off_shows_all_tasks() {
+        let mut app = App::new();
+        app.today = "2026-06-20".to_string();
+        app.filter = StatusFilter::All;
+        app.tasks = vec![
+            task_with_scheduled(1, " ", 1, "alpha.md", "2026-06-20"),
+            task(2, " ", 1, "beta.md"), // no scheduled date
+        ];
+        app.expanded.insert("alpha.md".to_string());
+        app.expanded.insert("beta.md".to_string());
+        app.rebuild();
+        // today_only defaults to off -> both notes visible.
+        assert!(!app.today_only);
+        let off_count = app.rows.len();
+
+        // Turn it on -> only alpha (today's task).
+        app.toggle_today();
+        assert!(app.today_only);
+        let today_rows: Vec<_> = app
+            .rows
+            .iter()
+            .filter(|r| matches!(r, DisplayRow::Task { .. }))
+            .collect();
+        assert_eq!(today_rows.len(), 1);
+        assert!(matches!(&today_rows[0], DisplayRow::Task { task } if task.id == 1));
+
+        // Turn it back off -> back to the full set.
+        app.toggle_today();
+        assert!(!app.today_only);
+        assert_eq!(app.rows.len(), off_count);
+    }
+
+    /// A Today-task group with no matching status is hidden entirely (no empty
+    /// header), mirroring the status-filter behaviour.
+    #[test]
+    fn today_only_hides_group_with_no_today_task() {
+        let tasks = vec![
+            task_with_scheduled(1, " ", 1, "alpha.md", "2026-06-20"), // today
+            task(2, " ", 1, "beta.md"),                               // no scheduled date
+        ];
+        let expanded = HashSet::new();
+        let rows = build_view(&tasks, StatusFilter::All, &expanded, true, "2026-06-20");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(header(&rows[0]).0, "alpha.md");
+    }
+
+    /// `row_to_item` renders the `⏳ <date>` suffix, and bolds it when the date is
+    /// today. Headless smoke against the buffer symbols.
+    #[test]
+    fn row_to_item_renders_scheduled_suffix_bold_for_today() {
+        use ratatui::backend::TestBackend;
+        let conn = db::open(":memory:").unwrap();
+        let today_today = task_with_scheduled(1, " ", 1, "alpha.md", "2026-06-20");
+        let other_day = task_with_scheduled(2, " ", 2, "alpha.md", "2026-06-21");
+        db::upsert_task(&conn, &today_today).unwrap();
+        db::upsert_task(&conn, &other_day).unwrap();
+
+        let mut app = App::new();
+        app.today = "2026-06-20".to_string();
+        app.filter = StatusFilter::All;
+        app.refresh(&conn).unwrap();
+        app.expanded.insert("alpha.md".to_string());
+        app.rebuild();
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(rendered.contains('⏳'), "scheduled glyph must render");
+        assert!(
+            rendered.contains("2026-06-20"),
+            "today's scheduled date must render"
+        );
+        assert!(
+            rendered.contains("2026-06-21"),
+            "the other scheduled date must render"
         );
     }
 }

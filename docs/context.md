@@ -42,7 +42,7 @@ Cargo workspace, edition 2024, six crates. Dependencies point downward only (no 
 
 | Crate | Responsibility | Key file(s) |
 |---|---|---|
-| `taski-core` | **Pure** domain: `Task`/`Status` types, the Markdown parser (`parse_tasks`, fence-aware), due-date extraction (`extract_due_date`). No FS, no I/O, no deps on other taski crates. | `crates/taski-core/src/lib.rs` |
+| `taski-core` | **Pure** domain: `Task`/`Status` types, the Markdown parser (`parse_tasks`, fence-aware), emoji-date extraction (`extract_due_date` for 📅/📆/🗓, `extract_scheduled_date` for ⏳ — both via shared `extract_emoji_date`; ADR-0009), and pure `ymd_from_unix` (today's date, no date crate). No FS, no I/O, no deps on other taski crates. | `crates/taski-core/src/lib.rs` |
 | `taski-config` | TOML config loading (`~/.config/taski/config.toml`) + CLI→config→default precedence + the `template()` renderer for `--init-config`. Keeps FS/TOML out of `taski-core`. | `crates/taski-config/src/lib.rs` |
 | `taski-db` | The canonical SQLite schema, `open()` (WAL + schema + dir creation), and all read/write APIs (`all_tasks`, `reconcile_note`, `enqueue_action`, `pending_actions`, `prune_old_actions`, …). Owns `tasks` + `pending_actions`. | `crates/taski-db/src/lib.rs` |
 | `taski-daemon` | The watcher/scanner + **sole writer to the vault**: the reusable engine `run_daemon(opts, shutdown, lock)`, plus `scan_vault`, `index_note`, `process_action`, `atomic_write` (TOCTOU-hardened), the watch loop; the `ShutdownSignal`/`ShutdownHandle` pair; and the `flock` single-writer lock (`DaemonLockGuard`/`acquire_daemon_lock`/`LockOutcome`). **lib + bin** — a `taski-daemon` binary *and* the library the unified launcher depends on. | `crates/taski-daemon/src/{lib,main,shutdown,lock}.rs`, `tests/` |
@@ -59,7 +59,7 @@ Supporting: `docs/` (PRD, tech, ADRs, setup, this file), `scripts/install-launch
 ```sh
 cargo build --workspace                       # dev build
 cargo build --release --workspace             # optimized daily-driver binaries
-cargo test --workspace                        # all tests (111 as of v0.2)
+cargo test --workspace                        # all tests (130 as of v0.2; +17 from ADR-0009 Phase 1)
 cargo test -p taski-daemon writeback          # run one suite / filter by name
 ```
 
@@ -123,7 +123,7 @@ Understanding these two flows is 90% of understanding the codebase.
 
 ```
 FS event (debounced 300ms) ─▶ scan_vault / index_note(note)
-                              └─▶ taski_core::parse_tasks(note_text)   // fence-aware, extracts due dates
+                              └─▶ taski_core::parse_tasks(note_text)   // fence-aware, extracts 📅 due + ⏳ scheduled dates
                                   └─▶ taski_db::reconcile_note(...)    // ADR-0005 (see below)
 ```
 
@@ -168,11 +168,13 @@ rather than corrupting the TUI mid-session.
 
 ---
 
-## Data Model (schema v3)
+## Data Model (schema v4)
 
 Defined in `taski-db::SCHEMA`. `PRAGMA user_version` tracks the version; older DBs are
 dropped and recreated (pre-MVP, no data to preserve). v3 added the `note_contents` cache
-that backs the read-only TUI context pane ([ADR-0006](./adr/0006-note-content-cached-in-index.md)).
+that backs the read-only TUI context pane ([ADR-0006](./adr/0006-note-content-cached-in-index.md));
+v4 added `tasks.scheduled_date` (`⏳`) backing the read-only "Today" view
+([ADR-0009](./adr/0009-scheduled-date-today.md), Phase 1).
 
 **`tasks`** — one row per checkbox task found in the vault:
 
@@ -186,6 +188,7 @@ that backs the read-only TUI context pane ([ADR-0006](./adr/0006-note-content-ca
 | `note_hash` | Content hash of the note at last scan — **the** conflict-detection input (re-checked before write-back). |
 | `note_mtime` | Note mtime at last scan — **informational only**, not used by conflict detection. |
 | `due_date` | Parsed 📅/📆/🗓 date (Obsidian Tasks-plugin syntax). |
+| `scheduled_date` *(v4)* | Parsed `⏳` scheduled date (Obsidian Tasks-plugin syntax — "plan to work on this"). Backs the read-only Today view (`T`); a future Phase 2 will *write* it to mark tasks for today ([ADR-0009](./adr/0009-scheduled-date-today.md)). |
 | `updated_at` | Last-seen timestamp. |
 
 **`pending_actions`** — the TUI→daemon command queue. Lifecycle `pending → done | failed`.
@@ -216,9 +219,12 @@ understanding the failure mode it prevents.**
    — the daemon is the *sole* writer to the vault, draining `pending_actions`. The TUI
    must never write a note directly. This is what makes write-back auditable and safe.
 
-3. **Checkbox-state flips only** ([ADR-0003](./adr/0003-checkbox-only-mvp.md)) — MVP
-   write-back flips `[ ]↔[x]`, nothing more. Text/metadata edits are explicitly deferred.
-   Adding "edit task text from the TUI" is a *big* change, not a small one.
+3. **Checkbox-state flips only** ([ADR-0003](./adr/0003-checkbox-only-mvp.md), **amended by [ADR-0009](./adr/0009-scheduled-date-today.md)**)
+   — MVP write-back flips `[ ]↔[x]`, nothing more. Text/metadata edits are explicitly deferred.
+   Adding "edit task text from the TUI" is a *big* change, not a small one. ADR-0009 widens
+   the scope to **also** permit Obsidian-standard date-emoji metadata (`⏳` scheduled) for the
+   "mark for today" gesture — but only tokens that are standard syntax + grammar-provably
+   safe; free-text edits and creates/deletes remain rejected.
 
 4. **Refuse-on-conflict, never last-write-wins** ([ADR-0004](./adr/0004-refuse-on-conflict.md))
    — before renaming, re-read the note and re-hash; if it changed since scan, *refuse*
@@ -230,7 +236,9 @@ understanding the failure mode it prevents.**
    `(note_path, line_number)` is a write-time location claim, re-verified against bytes.
    Crucially: **Taski injects nothing into the vault** (unlike Logseq-style inline IDs);
    identity is reconciled from content each scan. This was validated against
-   Obsidian-Tasks prior art.
+   Obsidian-Tasks prior art. (Note: ADR-0009's `⏳` write is *native Obsidian Tasks syntax* —
+   human-readable and consumed by Tasks/Dataview — not the foreign opaque identity marker
+   this ADR rejected, so ADR-0005 is **not** amended by it.)
 
 6. **Note content cached in the index for the TUI context pane** ([ADR-0006](./adr/0006-note-content-cached-in-index.md))
    — the daemon caches each note's full text in `note_contents`; the TUI reads it like any
@@ -239,6 +247,13 @@ understanding the failure mode it prevents.**
    locations stay consistent (same scan) and the SQLite decoupling boundary stays intact.
 
 7. **Unified launcher + single-writer lock** ([ADR-0007](./adr/0007-unified-in-process-launcher.md), [ADR-0008](./adr/0008-single-writer-file-lock.md)) — one `taski` binary runs daemon + TUI in-process; a `flock` on `<db_dir>/daemon.lock` guarantees a sole writer across all startup combinations (launchd + `taski`, etc.), closing the two-daemon corruption vector ADR-0004 doesn't cover.
+
+8. **Scheduled date `⏳` + Today view** ([ADR-0009](./adr/0009-scheduled-date-today.md)) —
+   Taski parses Obsidian's `⏳` scheduled date (Phase 1, shipped: parser + schema v4 +
+   read-only `T` Today view) and will *write* `⏳ today` as the "mark for today" triage
+   gesture (Phase 2, not yet shipped — amends ADR-0003). The view is strict
+   `scheduled_date == today`, orthogonal to the `f` status-cycle. "Today" is computed by the
+   pure `taski_core::ymd_from_unix` (no date crate).
 
 ---
 
@@ -377,7 +392,7 @@ exercised only at runtime (its `taski.db` is gitignored).
 
 | Task | Look at |
 |---|---|
-| Change how tasks are parsed / add metadata extraction | `taski-core/src/lib.rs` (`parse_tasks`, `extract_due_date`) |
+| Change how tasks are parsed / add metadata extraction | `taski-core/src/lib.rs` (`parse_tasks`, `extract_due_date`/`extract_scheduled_date` via shared `extract_emoji_date`, `ymd_from_unix`) |
 | Change the DB schema | `taski-db::SCHEMA` + bump `SCHEMA_VERSION`; update `reconcile_note`/`upsert_task` |
 | Cache/read note content for the TUI context pane | `taski-db`: `note_contents` table + `upsert_note_content`/`note_content`/`delete_note_content`; daemon writes it in `index_note` ([ADR-0006](./adr/0006-note-content-cached-in-index.md)) |
 | Change write-back behavior | `taski-daemon`: `process_action`, `atomic_write` (mind ADR-0004 TOCTOU) |

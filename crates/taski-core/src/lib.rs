@@ -72,6 +72,9 @@ pub struct Task {
     pub note_mtime: Option<i64>,
     /// Parsed due date (`None` in Slice 0; Slice 1+ parses Tasks-plugin `📅`).
     pub due_date: Option<String>,
+    /// Parsed scheduled date (Tasks-plugin `⏳` U+23F3, ADR-0009). `None` when the
+    /// task body carries no valid scheduled date. Independent of `due_date`.
+    pub scheduled_date: Option<String>,
     /// Last-seen timestamp, unix seconds.
     pub updated_at: i64,
 }
@@ -129,6 +132,7 @@ fn parse_task_line(raw_line: &str, note_path: &str, line_number: usize, now: i64
         note_hash: None,
         note_mtime: None,
         due_date: extract_due_date(body),
+        scheduled_date: extract_scheduled_date(body),
         updated_at: now,
     })
 }
@@ -137,18 +141,22 @@ fn parse_task_line(raw_line: &str, note_path: &str, line_number: usize, now: i64
 /// emoji-style rendering.
 const VS16: char = '\u{FE0F}';
 
-/// Extract the first due date (`📅`/`📆`/`🗓` + optional VS16 + whitespace +
-/// `YYYY-MM-DD`) from a task body, per the Obsidian Tasks emoji convention. Returns
-/// the normalized `"YYYY-MM-DD"` string, or `None` if no valid due date is present.
+/// Extract the first date from a task body matching the Obsidian Tasks emoji
+/// convention: one of `emojis` + optional VS16 + whitespace + strict
+/// `YYYY-MM-DD`. Returns the normalized `"YYYY-MM-DD"` string, or `None` if no
+/// valid date is present.
 ///
-/// Scans the body left-to-right for the first due-date emoji; at each, skips an
-/// optional VS16, requires at least one whitespace char, then attempts to read a
-/// strict `YYYY-MM-DD`. If the date is invalid (bad format or out-of-range month/day)
-/// the scan continues to the next emoji. Trailing text after the date is allowed.
-fn extract_due_date(body: &str) -> Option<String> {
+/// Scans the body left-to-right; at each occurrence of an emoji in `emojis`,
+/// skips an optional VS16, requires at least one whitespace char, then attempts
+/// to read a strict `YYYY-MM-DD`. If the date is invalid (bad format or
+/// out-of-range month/day) the scan continues to the next emoji. Trailing text
+/// after the date is allowed. This is the shared helper behind
+/// [`extract_due_date`] and [`extract_scheduled_date`]; only the matched emoji
+/// set differs.
+fn extract_emoji_date(body: &str, emojis: &[char]) -> Option<String> {
     let bytes = body.as_bytes();
     for (emoji_off, ch) in body.char_indices() {
-        if !matches!(ch, '📅' | '📆' | '🗓') {
+        if !emojis.contains(&ch) {
             continue;
         }
         let mut pos = emoji_off + ch.len_utf8();
@@ -176,6 +184,22 @@ fn extract_due_date(body: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Extract the due date (`📅`/`📆`/`🗓` + optional VS16 + whitespace +
+/// `YYYY-MM-DD`) from a task body, per the Obsidian Tasks emoji convention.
+/// Returns the normalized `"YYYY-MM-DD"` string, or `None` if no valid due date
+/// is present. See [`extract_emoji_date`] for the full scan semantics.
+fn extract_due_date(body: &str) -> Option<String> {
+    extract_emoji_date(body, &['📅', '📆', '🗓'])
+}
+
+/// Extract the scheduled date (`⏳` U+23F3 + optional VS16 + whitespace +
+/// `YYYY-MM-DD`) from a task body, per the Obsidian Tasks emoji convention
+/// (ADR-0009). Grammar identical to [`extract_due_date`]; only the leading
+/// emoji differs.
+fn extract_scheduled_date(body: &str) -> Option<String> {
+    extract_emoji_date(body, &['⏳'])
 }
 
 /// Read and validate a `YYYY-MM-DD` starting at `bytes[pos]`. Returns the normalized
@@ -211,6 +235,39 @@ fn parse_date_at(bytes: &[u8], pos: usize) -> Option<String> {
         date.push(b as char);
     }
     Some(date)
+}
+
+/// Convert a Unix timestamp (seconds since 1970-01-01 UTC) to a `YYYY-MM-DD`
+/// calendar date string.
+///
+/// Pure (no I/O) so it is unit-testable, and used by the TUI to derive "today"
+/// from the wall clock without pulling in a date crate. Uses Howard Hinnant's
+/// `civil_from_days` algorithm, which handles the full proleptic Gregorian
+/// calendar (including leap years and dates before the epoch). Negative
+/// timestamps (pre-1970) are handled via floor division of days.
+pub fn ymd_from_unix(secs: i64) -> String {
+    // 86_400 seconds per day. `div_euclid` floors toward negative infinity, so
+    // a pre-epoch timestamp maps to the correct prior calendar day.
+    let days = secs.div_euclid(86_400);
+    civil_from_days(days)
+}
+
+/// Howard Hinnant's `civil_from_days`: convert a count of days since
+/// 1970-01-01 into a `(year, month, day)` Gregorian calendar date. Returns the
+/// formatted `YYYY-MM-DD`. All arithmetic is in `i64` to avoid unsigned
+/// underflow in the month/dance steps.
+fn civil_from_days(z_in: i64) -> String {
+    let z = z_in + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = y + if m <= 2 { 1 } else { 0 };
+    format!("{year:04}-{m:02}-{d:02}")
 }
 
 /// Match `^\s*[-*+]\s+\[(.)\]\s+(.+)$` for a single line, returning the two captured
@@ -531,5 +588,98 @@ plain text
         let tasks = parse_tasks("- [ ] ship it 📅 2025-11-11\n", "d.md");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].due_date.as_deref(), Some("2025-11-11"));
+    }
+
+    // --- extract_scheduled_date unit tests (ADR-0009 Phase 1) ---------------
+
+    #[test]
+    fn extract_scheduled_date_plain() {
+        assert_eq!(
+            extract_scheduled_date("buy shampoo ⏳ 2026-06-20"),
+            Some("2026-06-20".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_scheduled_date_none_when_no_emoji() {
+        assert_eq!(extract_scheduled_date("no date here"), None);
+    }
+
+    #[test]
+    fn extract_scheduled_date_tolerates_variation_selector() {
+        // VS16 (U+FE0F) immediately after ⏳ is optional but accepted, matching
+        // the due-date parser's behaviour for 📅.
+        assert_eq!(
+            extract_scheduled_date("task \u{23F3}\u{FE0F} 2026-06-20"),
+            Some("2026-06-20".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_scheduled_date_allows_multiple_spaces() {
+        assert_eq!(
+            extract_scheduled_date("⏳   2026-06-20"),
+            Some("2026-06-20".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_scheduled_date_none_when_bad_format() {
+        assert_eq!(extract_scheduled_date("⏳ 20260620"), None);
+        assert_eq!(extract_scheduled_date("⏳ 26-06-20"), None);
+        assert_eq!(extract_scheduled_date("⏳ 2026/06/20"), None);
+    }
+
+    /// `⏳` with no whitespace before the date is rejected — exactly as `📅` is
+    /// (the two parsers share `extract_emoji_date`, so behaviour is consistent).
+    #[test]
+    fn extract_scheduled_date_no_space_is_rejected_like_due() {
+        assert_eq!(extract_scheduled_date("⏳2026-06-20"), None);
+        assert_eq!(extract_due_date("📅2026-06-20"), None);
+    }
+
+    /// A body with both a due date and a scheduled date parses each
+    /// independently (the two date axes are orthogonal — ADR-0009).
+    #[test]
+    fn due_and_scheduled_parse_independently() {
+        let body = "📅 2026-06-20 ⏳ 2026-06-21";
+        assert_eq!(extract_due_date(body).as_deref(), Some("2026-06-20"));
+        assert_eq!(extract_scheduled_date(body).as_deref(), Some("2026-06-21"));
+    }
+
+    #[test]
+    fn parse_task_line_wires_scheduled_date_into_task() {
+        let tasks = parse_tasks("- [ ] buy shampoo ⏳ 2026-06-20\n", "d.md");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].scheduled_date.as_deref(), Some("2026-06-20"));
+        assert!(tasks[0].due_date.is_none());
+    }
+
+    // --- ymd_from_unix unit tests (ADR-0009 Phase 1) -----------------------
+
+    #[test]
+    fn ymd_from_unix_epoch_is_1970_01_01() {
+        assert_eq!(ymd_from_unix(0), "1970-01-01");
+    }
+
+    #[test]
+    fn ymd_from_unix_known_anchors() {
+        // 2026-06-20 = day 20624 = 1_781_913_600 seconds.
+        assert_eq!(ymd_from_unix(1_781_913_600), "2026-06-20");
+        // 2024-02-29 (leap day) = day 19782 = 1_709_164_800 seconds.
+        assert_eq!(ymd_from_unix(1_709_164_800), "2024-02-29");
+    }
+
+    #[test]
+    fn ymd_from_unix_handles_leap_days() {
+        // Div-by-400 leap (2000) and the day after a leap day (2012-03-01) round-trip.
+        assert_eq!(ymd_from_unix(951_782_400), "2000-02-29");
+        assert_eq!(ymd_from_unix(1_330_560_000), "2012-03-01");
+    }
+
+    #[test]
+    fn ymd_from_unix_pre_epoch_floor_division() {
+        // One second before the epoch lands on 1969-12-31 (floor toward -inf).
+        assert_eq!(ymd_from_unix(-1), "1969-12-31");
     }
 }

@@ -28,7 +28,9 @@ Authoritative record of technology choices for Taski. Each entry has a one-line 
 | **`walkdir`** | Recursive vault scan with hidden-dir pruning (`.obsidian` / `.trash` / `.git`). | 2026-06-20 |
 | **`ctrlc`** | Graceful SIGINT shutdown of the watch loop. | 2026-06-20 |
 | **`fs2`** | `flock`-based single-writer lock (`daemon.lock`) preventing two daemons from racing on `atomic_write` / `reconcile_note`. Auto-released on crash. See ADR-0008. | 2026-06-20 |
-| **Line-based parser** (in `taski-core`) | Current Markdown checkbox parser — fence-aware (backtick + tilde), tolerates leading blockquote markers, extracts Obsidian Tasks-plugin `📅`/`📆`/`🗓` due dates. Chosen over `pulldown-cmark` for now (YAGNI; checkboxes are line-oriented). | 2026-06-20 |
+| **Line-based parser** (in `taski-core`) | Current Markdown checkbox parser — fence-aware (backtick + tilde), tolerates leading blockquote markers, extracts Obsidian Tasks-plugin `📅`/`📆`/`🗓` due dates and `⏳` scheduled dates (ADR-0009). Chosen over `pulldown-cmark` for now (YAGNI; checkboxes are line-oriented). | 2026-06-20 |
+
+> **Write-back scope (ADR-0003, amended by ADR-0009):** the daemon may mutate the vault by (a) checkbox-state flips, and (b) Obsidian-standard date-emoji metadata (`⏳` scheduled). Task-text edits, creates/deletes, and arbitrary metadata remain rejected. Each new write token requires a pure, proptested line-rewrite ("never corrupts") and its own ADR. The `⏳` write reuses `atomic_write` unchanged — its TOCTOU guard is whole-file-hash and byte-count-agnostic.
 
 > **Deferred (revisit when needed):** `pulldown-cmark` (adopt when real edge cases — tasks in nested lists / inline code / callouts — exceed the line parser).
 

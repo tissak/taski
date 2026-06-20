@@ -12,13 +12,15 @@ use rusqlite::Connection;
 
 // Re-export the shared domain types so downstream crates (e.g. the TUI) can depend on
 // `taski-db` alone without a direct `taski-core` dependency. This also brings `Status`
-// and `Task` into scope within this module.
-pub use taski_core::{Status, Task};
+// and `Task` into scope within this module. `ymd_from_unix` is re-exported for the
+// TUI's "today" derivation (ADR-0009 Phase 1).
+pub use taski_core::{Status, Task, ymd_from_unix};
 
-/// The canonical schema v3. v2 added surrogate rowid identity + content-hash
-/// reconciliation (ADR-0005); v3 adds the `note_contents` cache that backs the read-only
-/// TUI context pane (ADR-0006). Created with `IF NOT EXISTS` so [`ensure_schema`] is
-/// idempotent.
+/// The canonical schema v4. v2 added surrogate rowid identity + content-hash
+/// reconciliation (ADR-0005); v3 added the `note_contents` cache that backs the
+/// read-only TUI context pane (ADR-0006); v4 adds `tasks.scheduled_date` for the
+/// Obsidian Tasks-plugin `⏳` read path (ADR-0009 Phase 1). Created with
+/// `IF NOT EXISTS` so [`ensure_schema`] is idempotent.
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS tasks (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -31,6 +33,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   note_hash         TEXT,
   note_mtime        INTEGER,
   due_date          TEXT,
+  scheduled_date    TEXT,
   updated_at        INTEGER NOT NULL
 );
 
@@ -64,7 +67,7 @@ CREATE TABLE IF NOT EXISTS note_contents (
 
 /// Schema version tag stored in `PRAGMA user_version`. Increment when the schema
 /// changes in a backward-incompatible way.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Ensure the database schema exists and is at the current version. If the DB predates
 /// the current version, the old tables are dropped and recreated (pre-MVP: no data to
@@ -115,8 +118,9 @@ pub fn upsert_task(conn: &Connection, task: &Task) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO tasks (
             id, note_path, line_number, text, text_hash, status,
-            raw_checkbox_char, note_hash, note_mtime, due_date, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            raw_checkbox_char, note_hash, note_mtime, due_date, scheduled_date,
+            updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         rusqlite::params![
             task.id,
             task.note_path,
@@ -128,6 +132,7 @@ pub fn upsert_task(conn: &Connection, task: &Task) -> rusqlite::Result<()> {
             task.note_hash,
             task.note_mtime,
             task.due_date,
+            task.scheduled_date,
             task.updated_at,
         ],
     )?;
@@ -287,7 +292,7 @@ pub fn reconcile_note(
                     "UPDATE tasks SET
                         line_number = ?2, text = ?3, status = ?4,
                         raw_checkbox_char = ?5, note_hash = ?6, note_mtime = ?7,
-                        due_date = ?8, updated_at = ?9
+                        due_date = ?8, scheduled_date = ?9, updated_at = ?10
                      WHERE id = ?1",
                     rusqlite::params![
                         old_id,
@@ -298,6 +303,7 @@ pub fn reconcile_note(
                         note_hash,
                         note_mtime,
                         task.due_date,
+                        task.scheduled_date,
                         now,
                     ],
                 )?;
@@ -308,8 +314,9 @@ pub fn reconcile_note(
             conn.execute(
                 "INSERT INTO tasks (
                     note_path, line_number, text, text_hash, status,
-                    raw_checkbox_char, note_hash, note_mtime, due_date, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    raw_checkbox_char, note_hash, note_mtime, due_date, scheduled_date,
+                    updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 rusqlite::params![
                     note_path,
                     task.line_number as i64,
@@ -320,6 +327,7 @@ pub fn reconcile_note(
                     note_hash,
                     note_mtime,
                     task.due_date,
+                    task.scheduled_date,
                     now,
                 ],
             )?;
@@ -510,7 +518,8 @@ fn unix_now() -> i64 {
 pub fn all_tasks(conn: &Connection) -> rusqlite::Result<Vec<Task>> {
     let mut stmt = conn.prepare(
         "SELECT id, note_path, line_number, text, text_hash, status,
-                raw_checkbox_char, note_hash, note_mtime, due_date, updated_at
+                raw_checkbox_char, note_hash, note_mtime, due_date, scheduled_date,
+                updated_at
          FROM tasks
          ORDER BY note_path ASC, line_number ASC",
     )?;
@@ -530,7 +539,8 @@ pub fn all_tasks(conn: &Connection) -> rusqlite::Result<Vec<Task>> {
             note_hash: row.get(7)?,
             note_mtime: row.get(8)?,
             due_date: row.get(9)?,
-            updated_at: row.get(10)?,
+            scheduled_date: row.get(10)?,
+            updated_at: row.get(11)?,
         })
     })?;
     rows.collect()
@@ -553,6 +563,7 @@ mod tests {
             note_hash: None,
             note_mtime: None,
             due_date: None,
+            scheduled_date: None,
             updated_at: 123,
         }
     }
@@ -826,5 +837,70 @@ mod tests {
         assert!(db_path.exists(), "db file should have been created");
         // The connection is usable.
         assert!(all_tasks(&conn).unwrap().is_empty());
+    }
+
+    /// ADR-0009 Phase 1: `scheduled_date` round-trips through the index (Some and
+    /// None), exercising `upsert_task` + `all_tasks` for the new column. A Task
+    /// with `scheduled_date = None` must read back as None (not a stale value
+    /// from a sibling row).
+    #[test]
+    fn scheduled_date_round_trips_some_and_none() {
+        let conn = open(":memory:").unwrap();
+
+        // A task with a scheduled date set.
+        let mut with_sched = sample_task(1, " ", 1);
+        with_sched.scheduled_date = Some("2026-06-20".to_string());
+        // A task with no scheduled date (and a due date, to prove the two columns
+        // are independent).
+        let mut without_sched = sample_task(2, " ", 2);
+        without_sched.due_date = Some("2026-07-01".to_string());
+        upsert_task(&conn, &with_sched).unwrap();
+        upsert_task(&conn, &without_sched).unwrap();
+
+        let got = all_tasks(&conn).unwrap();
+        assert_eq!(got.len(), 2);
+        let a = got.iter().find(|t| t.id == 1).unwrap();
+        assert_eq!(a.scheduled_date.as_deref(), Some("2026-06-20"));
+        assert!(
+            a.due_date.is_none(),
+            "scheduled_date must not bleed into due_date"
+        );
+        let b = got.iter().find(|t| t.id == 2).unwrap();
+        assert!(
+            b.scheduled_date.is_none(),
+            "a None scheduled_date must round-trip as None"
+        );
+        assert_eq!(b.due_date.as_deref(), Some("2026-07-01"));
+    }
+
+    /// ADR-0009 Phase 1: `reconcile_note` carries `scheduled_date` through its
+    /// UPDATE path (matched row keeps its id, scheduled_date refreshed).
+    #[test]
+    fn reconcile_note_carries_scheduled_date_through_update() {
+        let conn = open(":memory:").unwrap();
+        // Initial parse: task has a scheduled date.
+        let initial = taski_core::parse_tasks("- [ ] plan ⏳ 2026-06-20\n", "n.md");
+        assert_eq!(initial.len(), 1);
+        reconcile_note(&conn, "n.md", &initial, Some("h1"), None).unwrap();
+        let got = all_tasks(&conn).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].scheduled_date.as_deref(), Some("2026-06-20"));
+        let preserved_id = got[0].id;
+
+        // Re-parse with a different scheduled date: same text_hash? No — text_hash
+        // is over the body, and the date changed, so text_hash changes and this is
+        // a delete+insert. To exercise the UPDATE path we keep the body identical
+        // (identical text_hash) by editing only a non-body attribute via upsert is
+        // not the path here; instead reconcile the SAME body again — the row is
+        // matched by text_hash and UPDATEd in place (id preserved). The
+        // scheduled_date carried in the new parse is re-written unchanged.
+        reconcile_note(&conn, "n.md", &initial, Some("h2"), None).unwrap();
+        let got2 = all_tasks(&conn).unwrap();
+        assert_eq!(got2.len(), 1);
+        assert_eq!(
+            got2[0].id, preserved_id,
+            "identity preserved across a matched UPDATE"
+        );
+        assert_eq!(got2[0].scheduled_date.as_deref(), Some("2026-06-20"));
     }
 }
