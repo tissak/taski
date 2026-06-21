@@ -21,6 +21,10 @@ pub struct Config {
     pub vault: Option<String>,
     /// Path to the taski SQLite index database.
     pub db: Option<String>,
+    /// ADR-0014: path (relative to vault root) of the inbox note that quick-add
+    /// (`a` key) appends to. Defaults to `"task-inbox.md"` via
+    /// [`resolve_inbox_path`]. `None` = default.
+    pub inbox_path: Option<String>,
     /// Directories (relative to vault root) to exclude from scanning and indexing.
     /// Each entry is a path component or nested path, e.g. `["templates"]` or
     /// `["templates", "archive/drafts"]`. Hidden directories (`.obsidian`, `.trash`,
@@ -110,6 +114,16 @@ pub fn resolve_db(cli: Option<&str>, cfg: &Config) -> PathBuf {
     PathBuf::from("./taski.db")
 }
 
+/// ADR-0014: resolve the quick-add inbox path (relative to vault root) from the
+/// config, falling back to the compiled default `"task-inbox.md"`. Never errors.
+/// Mirrors [`resolve_db`]'s precedence pattern but config-only (no CLI flag).
+pub fn resolve_inbox_path(cfg: &Config) -> String {
+    cfg.inbox_path
+        .as_deref()
+        .unwrap_or("task-inbox.md")
+        .to_string()
+}
+
 /// Render a ready-to-use config file body for `taski-daemon --init-config`. If `vault`
 /// is given it is baked in as an active key; otherwise a commented placeholder is
 /// emitted so the user knows to fill it in. `db` is always written (the caller
@@ -130,7 +144,11 @@ pub fn template(vault: Option<&str>, db: &str) -> String {
          \n\
          # Directories to exclude from scanning (relative to vault root).\n\
          # Hidden directories (.obsidian, .trash, .git) are always excluded.\n\
-         # exclude_dirs = [\"templates\", \"archive/drafts\"]\n",
+         # exclude_dirs = [\"templates\", \"archive/drafts\"]\n\
+         \n\
+         # ADR-0014: inbox note for the quick-add (`a` key) feature. Appends\n\
+         # `- [ ] <text> ➕ <today>` here. Defaults to \"task-inbox.md\".\n\
+         # inbox_path = \"task-inbox.md\"\n",
     )
 }
 
@@ -194,6 +212,7 @@ mod tests {
             vault: Some("/from/config".into()),
             db: None,
             exclude_dirs: vec![],
+            inbox_path: None,
         };
         let v = resolve_vault(Some("/from/cli"), &cfg).expect("ok");
         assert_eq!(v, PathBuf::from("/from/cli"));
@@ -205,6 +224,7 @@ mod tests {
             vault: Some("/from/config".into()),
             db: None,
             exclude_dirs: vec![],
+            inbox_path: None,
         };
         let v = resolve_vault(None, &cfg).expect("ok");
         assert_eq!(v, PathBuf::from("/from/config"));
@@ -225,6 +245,7 @@ mod tests {
             vault: None,
             db: Some("/from/config.db".into()),
             exclude_dirs: vec![],
+            inbox_path: None,
         };
         assert_eq!(
             resolve_db(Some("/from/cli.db"), &cfg),
@@ -238,6 +259,7 @@ mod tests {
             vault: None,
             db: Some("/from/config.db".into()),
             exclude_dirs: vec![],
+            inbox_path: None,
         };
         assert_eq!(resolve_db(None, &cfg), PathBuf::from("/from/config.db"));
     }
@@ -248,6 +270,20 @@ mod tests {
             resolve_db(None, &Config::default()),
             PathBuf::from("./taski.db")
         );
+    }
+
+    #[test]
+    fn resolve_inbox_path_uses_config_when_set() {
+        let cfg = Config {
+            inbox_path: Some("my-inbox.md".into()),
+            ..Config::default()
+        };
+        assert_eq!(resolve_inbox_path(&cfg), "my-inbox.md");
+    }
+
+    #[test]
+    fn resolve_inbox_path_defaults_when_unset() {
+        assert_eq!(resolve_inbox_path(&Config::default()), "task-inbox.md");
     }
 
     /// `config_path_from` honors a set `TASKI_CONFIG`, ignores an empty value, and

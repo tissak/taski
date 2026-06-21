@@ -1,6 +1,6 @@
 # Taski — Engineering Context & Onboarding
 
-*Onboarding guide for new engineers. Last updated: 2026-06-21 (post-v0.4 — adds Tier 1 metadata parsing [tags, priority, start/created/done/cancelled dates, schema v6], Tier 2 views [overdue `O`, group-by cycling `G`], the `✅` done-date stamp on toggle [ADR-0012], and the `❌` cancelled-date stamp on cancel [ADR-0013]; 291 tests across 6 crates).*
+*Onboarding guide for new engineers. Last updated: 2026-06-21 (post-v0.4 — adds Tier 1 metadata parsing [tags, priority, start/created/done/cancelled dates, schema v6], Tier 2 views [overdue `O`, group-by cycling `G`], the `✅` done-date stamp on toggle [ADR-0012], the `❌` cancelled-date stamp on cancel [ADR-0013], and the `➕` quick-add inbox creation [ADR-0014]; 309 tests across 6 crates).*
 
 This document is the "operating manual" for working on Taski: what it is, how it's
 built, the decisions that are load-bearing (and must not be casually undone), and the
@@ -42,8 +42,8 @@ Cargo workspace, edition 2024, six crates. Dependencies point downward only (no 
 
 | Crate | Responsibility | Key file(s) |
 |---|---|---|
-| `taski-core` | **Pure** domain: `Task`/`Status`/`Priority` types, the Markdown parser (`parse_tasks`, fence-aware), emoji extraction (`extract_due_date` 📅/📆/🗓, `extract_scheduled_date` ⏳, `extract_start_date` 🛫, `extract_created_date` ➕, `extract_done_date` ✅, `extract_cancelled_date` ❌ — all via shared `extract_emoji_date`; plus `extract_priority` 🔺/⏫/🔼/🔽/⏬ and `extract_tags` `#tag`), the pure `rewrite_scheduled` line-rewrite oracle (ADR-0009 Phase 2), and pure `ymd_from_unix` (today's date, no date crate). No FS, no I/O, no deps on other taski crates. | `crates/taski-core/src/lib.rs` |
-| `taski-config` | TOML config loading (`~/.config/taski/config.toml`) + CLI→config→default precedence + the `template()` renderer for `--init-config`. Fields include `exclude_dirs` for skipping vault subdirectory trees. Keeps FS/TOML out of `taski-core`. | `crates/taski-config/src/lib.rs` |
+| `taski-core` | **Pure** domain: `Task`/`Status`/`Priority` types, the Markdown parser (`parse_tasks`, fence-aware), emoji extraction (`extract_due_date` 📅/📆/🗓, `extract_scheduled_date` ⏳, `extract_start_date` 🛫, `extract_created_date` ➕, `extract_done_date` ✅, `extract_cancelled_date` ❌ — all via shared `extract_emoji_date`; plus `extract_priority` 🔺/⏫/🔼/🔽/⏬ and `extract_tags` `#tag`), the pure `rewrite_scheduled` line-rewrite oracle (ADR-0009 Phase 2) and `inbox_line_for` construction oracle (ADR-0014), and pure `ymd_from_unix` (today's date, no date crate). No FS, no I/O, no deps on other taski crates. | `crates/taski-core/src/lib.rs` |
+| `taski-config` | TOML config loading (`~/.config/taski/config.toml`) + CLI→config→default precedence + the `template()` renderer for `--init-config`. Fields include `exclude_dirs` for skipping vault subdirectory trees and `inbox_path` for the quick-add target note (ADR-0014). Keeps FS/TOML out of `taski-core`. | `crates/taski-config/src/lib.rs` |
 | `taski-db` | The canonical SQLite schema, `open()` (WAL + schema + dir creation), and all read/write APIs (`all_tasks`, `reconcile_note`, `enqueue_action` / `enqueue_set_scheduled` / `enqueue_bullet_toggle`, `pending_actions`, `prune_old_actions`, `delete_tasks_for_excluded_dirs`, …). Owns `tasks` + `pending_actions` + `note_contents`. | `crates/taski-db/src/lib.rs` |
 | `taski-daemon` | The watcher/scanner + **sole writer to the vault**: the reusable engine `run_daemon(opts, shutdown, lock)`, plus `scan_vault`, `index_note`, `process_action` (checkbox flips) / `process_metadata_action` (`⏳` writes) / `process_bullet_action` (checkbox↔bullet toggle) — all three reuse `atomic_write` (ADR-0009/0011), the watch loop; the `ShutdownSignal`/`ShutdownHandle` pair; and the `flock` single-writer lock (`DaemonLockGuard`/`acquire_daemon_lock`/`LockOutcome`). The drain loop dispatches on `pending_actions.action_type`. Also handles `exclude_dirs` purge + filtered scanning. **lib + bin** — a `taski-daemon` binary *and* the library the unified launcher depends on. | `crates/taski-daemon/src/{lib,main,shutdown,lock}.rs`, `tests/` |
 | `taski-tui` | The `ratatui` client: polls the index, groups by note/tag/priority/folder (`G` cycling), filters (status-cycle `f`, Today view `T`, Overdue `O`, text search `/`, file search `F`), renders, submits toggle (`Space`) / mark-for-today (`t`) / bullet toggle (`b`) / undo (`u`) actions, and shows the context pane via the cached `note_contents` table. Never touches vault files. **lib + bin** — public entry points `run()` / `run_with_db(db)` / `run_combined(db, quit_hook)`; `main.rs` is a thin shim. Key internal modules: `App` (state machine), `build_view` (filter pipeline + HashMap grouping), `draw` (render), `run_loop` (input). | `crates/taski-tui/src/{lib,main}.rs` |
@@ -263,7 +263,8 @@ filter predicates within each bucket and emits `Header` + `Task` rows.
 | `t` | Mark/unmark selected task for today (writes `⏳ <today>`) |
 | `b` | Toggle selected task between checkbox (`- [ ]`) and bullet (`-`) format |
 | `d` | Cancel selected task (`- [ ]` → `- [-]`, stamps `❌ <today>`; press again to un-cancel) [ADR-0013] |
-| `u` | Undo the last checkbox flip (incl. cancel), or bullet toggle, action |
+| `a` | Quick-add: open text-entry modal; type task text, Enter appends `- [ ] <text> ➕ <today>` to the inbox note (`u` to undo) [ADR-0014] |
+| `u` | Undo the last checkbox flip (incl. cancel), bullet toggle, or quick-add action |
 | `/` | Open text search prompt (matches `task.text`, case-insensitive) |
 | `F` | Open file/path search prompt (matches `task.note_path`) |
 | `p` | Toggle the context pane (right-half note preview) |
@@ -310,10 +311,11 @@ existing dev DBs are dropped+recreated and the index rebuilds from the vault.
 
 **`pending_actions`** — the TUI→daemon command queue. Lifecycle `pending → done | failed`.
 Each row carries `task_id`, an `action_type` (`checkbox`, `set_scheduled`, `toggle_bullet`,
-or `undo`), and a `payload` (NULL for checkbox flips; the desired date / NULL-to-unmark for
-`set_scheduled`; the prior checkbox char for undo). Checkbox rows also hold
-`expected_char`/`new_char`; date-action rows leave them empty and the daemon dispatches on
-`action_type`. On failure an `error` is recorded. Resolved rows older than 7 days are pruned
+`undo`, `quick_add`, or `quick_add_undo`), and a `payload` (NULL for checkbox flips; the desired
+date / NULL-to-unmark for `set_scheduled`; the prior checkbox char for undo; the task text for
+`quick_add`/`quick_add_undo` (with `note_path` = inbox path, `task_id` = 0 sentinel)). Checkbox rows
+also hold `expected_char`/`new_char`; date-action rows leave them empty and the daemon dispatches
+on `action_type`. On failure an `error` is recorded. Resolved rows older than 7 days are pruned
 on daemon startup (`ACTION_RETENTION_SECS`).
 
 **`note_contents`** *(v3)* — per-note full-text cache backing the read-only TUI context
@@ -348,7 +350,7 @@ understanding the failure mode it prevents.**
    itself (`[ ]`→`[x]` stamps `✅ <today>`, `[x]`→`[ ]` clears it) — no new action type, no
    new gesture. Both amendments admit tokens under the unchanged grammar-provability gate:
    standard syntax + single insertion grammar + pure proptested oracle. Free-text edits and
-   creates/deletes remain rejected.
+   creates/deletes remain rejected (arbitrary-note creation and mid-note insertion remain rejected; bounded append-only creation to a designated inbox was admitted by ADR-0014).
 
 4. **Refuse-on-conflict, never last-write-wins** ([ADR-0004](./adr/0004-refuse-on-conflict.md))
    — before renaming, re-read the note and re-hash; if it changed since scan, *refuse*
@@ -432,6 +434,19 @@ understanding the failure mode it prevents.**
     requiring a new "removal-only" boundary ADR, a `restore_task` action type, a schema bump,
     and accepting a restart-data-loss edge; cancel delivers the same UX intent at a fraction
     of the code with strictly better safety properties.
+
+14. **Quick-add — bounded append-only creation to a designated inbox** ([ADR-0014](./adr/0014-quick-add-inbox-creation.md)) —
+    The `a` key opens a single-line text-entry modal; Enter appends `- [ ] <text> ➕ <today>` to a configurable inbox note
+    (default `task-inbox.md`, `inbox_path` in config; created if missing). This is Taski's **first content-creation feature**,
+    opening a **new gate class** — bounded append-only creation — distinct from the grammar-provability token gate of
+    ADRs 0009/0012/0013 (which only edit existing lines). The new gate admits append-only writes to a designated inbox
+    (no mid-note insertion, no text editing, no deletion); appending shifts no existing lines, so no positional
+    reconciliation or `expected_note_hash` is needed. The `➕ <today>` created-date stamp is composed into the appended
+    line (same one-write principle as `✅`/`❌`). No schema change — `pending_actions` carries sentinel values
+    (`task_id=0`, `line_number=0`, empty strings) for unused columns. First-creation of a non-existent inbox skips the
+    TOCTOU re-hash (a bounded ADR-0004 exception — nothing to conflict with). Undo (`u`) removes the appended line
+    (first content-removing undo, safe because the line is positionally and contentually known). Amends ADR-0003 a
+    fourth time.
 
 ---
 
@@ -521,14 +536,16 @@ These are the things that aren't obvious from reading the code and will cost you
   (low value for a personal tool). If you change daemon error wording, sanity-check the
   TUI messages.
 
+- **`friendly_failure_reason` and `render_failure_notice` are twin functions that must stay in sync.** Both map `ApplyOutcome`/`action_type` to user-facing text. `friendly_failure_reason` handles the reason text (✅/❌/scheduled glyph-keyed branches); `render_failure_notice` handles the verb + retry-key (per action_type). When adding a new action_type, add arms to BOTH. A refused quick-add initially fell through to 'Toggle/Space' because only one was updated — caught in review.
+
 - **`exclude_dirs` SQL LIKE patterns need a trailing `%`.** When purging indexed tasks
   for an excluded directory, the SQL is `DELETE … WHERE note_path LIKE ?` with the bind
   value `_System/Templates/%`. The `%` is required — without it, LIKE matches only the
   literal directory path (and SQL's single-char `_` wildcard makes it hairier). If purge
   silently does nothing, check that the bind value ends with `/%`.
 
-- **Undo scope is limited to checkbox flips (`Space`, `d`) and `b` only.** `u` undoes the
-  last checkbox flip (cancel is a flip to `-`, so it's covered), or bullet toggle — not `t`
+- **Undo scope covers checkbox flips (`Space`, `d`), bullet toggles (`b`), and quick-add (`a` — removes the appended line). Not `t` (mark-for-today).** `u` undoes the
+  last checkbox flip (cancel is a flip to `-`, so it's covered), bullet toggle, or quick-add — not `t`
   (mark-for-today). The `t` gesture is already idempotent (pressing `t` again removes the
   mark), so undo adds little value. This is intentional, not a bug.
 
@@ -581,12 +598,12 @@ These are the things that aren't obvious from reading the code and will cost you
 
 | Location | What it guards |
 |---|---|
-| `taski-core` unit tests + `proptest` + `rewrite_scheduled_proptest` + `tag_extraction_proptest` | Parser correctness on a synthetic corpus; never-panics on arbitrary input; due/scheduled/start/created/done/cancelled date extraction; `extract_priority` (incl. the `⏫`=High / `🔺`=Highest mapping); `extract_tags` grammar + dedup; pure `rewrite_scheduled` oracle (256-case ADR-0009 Phase 2); tag-extraction grammar + dedup proptest (256 cases). |
+| `taski-core` unit tests + `proptest` + `rewrite_scheduled_proptest` + `tag_extraction_proptest` + `inbox_line_proptest` | Parser correctness on a synthetic corpus; never-panics on arbitrary input; due/scheduled/start/created/done/cancelled date extraction; `extract_priority` (incl. the `⏫`=High / `🔺`=Highest mapping); `extract_tags` grammar + dedup; pure `rewrite_scheduled` oracle (256-case ADR-0009 Phase 2); tag-extraction grammar + dedup proptest (256 cases); `inbox_line_for` construction oracle (256-case ADR-0014). |
 | `taski-config` unit tests | TOML parsing, precedence (CLI→config→default), env override, `template()` round-trips. |
 | `taski-db` unit tests | Schema, `reconcile_note` identity retention, upsert/read round-trips (incl. Tier 1 metadata + the tag sentinel storage format), action pruning, `open()` creates missing dirs. |
 | `taski-daemon/tests/scan.rs` | End-to-end scan of a fake vault → correct task rows. |
 | `taski-daemon/tests/reconcile.rs` | Content-hash reconciliation: identity survives edits, deletes, reorders. |
-| `taski-daemon/tests/writeback.rs` + `writeback_proptest.rs` + `metadata_writeback_proptest.rs` + `done_date_writeback_proptest.rs` + `cancelled_date_writeback_proptest.rs` | The safety contract: atomic_write commits on match, refuses on conflict, never corrupts; `⏳` metadata write-back "never corrupts" (256-case ADR-0009 Phase 2, oracle = `rewrite_scheduled`); `✅` done-date-on-toggle stamp "never corrupts" (256-case ADR-0012, oracle = `rewrite_done_date`, CRLF assertion, VS16 guards); `❌` cancelled-date-on-cancel stamp "never corrupts" (256-case ADR-0013, oracle = `rewrite_cancelled_date`; also exercises cross-state `✅`-clearing). Also covers `toggle_bullet` and `undo` action types (ADR-0011). |
+| `taski-daemon/tests/writeback.rs` + `writeback_proptest.rs` + `metadata_writeback_proptest.rs` + `done_date_writeback_proptest.rs` + `cancelled_date_writeback_proptest.rs` + `quick_add_writeback_proptest.rs` | The safety contract: atomic_write commits on match, refuses on conflict, never corrupts; `⏳` metadata write-back "never corrupts" (256-case ADR-0009 Phase 2, oracle = `rewrite_scheduled`); `✅` done-date-on-toggle stamp "never corrupts" (256-case ADR-0012, oracle = `rewrite_done_date`, CRLF assertion, VS16 guards); `❌` cancelled-date-on-cancel stamp "never corrupts" (256-case ADR-0013, oracle = `rewrite_cancelled_date`; also exercises cross-state `✅`-clearing); quick-add append/create "never corrupts" (256-case ADR-0014, oracle = `inbox_line_for`; also covers first-creation and undo removal). Also covers `toggle_bullet` and `undo` action types (ADR-0011). |
 | `taski-daemon/src/lock.rs` unit tests | The `flock` single-writer lock: acquire/refuse outcome, lock-path derivation. |
 | `taski-daemon` unit tests in `lib.rs` | `should_exclude_entry`, `path_matches_exclude`, `scan_vault_with_exclude_dirs_skips_matching_directory` — exclude-dir filtering in WalkDir and watcher events. |
 | `taski-tui` unit tests (in `lib.rs`) | View model: grouping (note/tag/priority/folder via `G`, incl. tag fan-out + group ordering), collapse, five-axis filter composition (status + today + overdue + text search + file search), display-index↔Task mapping, selection reconciliation (incl. duplicate task_ids under tag grouping), failure-notice surfacing, context-pane render/scroll/toggle + `context_view` centering (headless `TestBackend` smoke). |
@@ -611,7 +628,8 @@ exercised only at runtime (its `taski.db` is gitignored).
 | Change keybindings (add/remove a key) | `crates/taski-tui/src/lib.rs:run_loop()` — handles three branches: `searching`, `file_searching`, and normal mode. `b` / `u` added in ADR-0011; `d` (cancel) added in ADR-0013 |
 | Change context-pane keybindings/behavior | `taski-tui/src/lib.rs` key match in `run_loop` (`J`/`K` scroll, `p` toggle) + `MIN_SPLIT_WIDTH` auto-hide; `sync_context` for the read path |
 | Add/change vault directory exclusions | Add `exclude_dirs` to `~/.config/taski/config.toml`; restart daemon. Purge happens on startup — see `delete_tasks_for_excluded_dirs` in `taski-db`, `should_exclude_entry`/`path_matches_exclude` in `taski-daemon` |
-| Change undo behavior | `taski-tui/src/lib.rs` `submit_undo` (enqueues the reverse via `db::enqueue_action` for checkbox undo or `db::enqueue_bullet_toggle` for bullet undo); daemon dispatches to `process_action` / `process_bullet_action` like other action types |
+| Change undo behavior | `taski-tui/src/lib.rs` `submit_undo` (enqueues the reverse via `db::enqueue_action` for checkbox undo, `db::enqueue_bullet_toggle` for bullet undo, or `db::enqueue_quick_add_undo` for quick-add undo — `LastAction::QuickAdd` arm); daemon dispatches to `process_action` / `process_bullet_action` / `process_quick_add_undo` like other action types |
+| Change quick-add behavior | `crates/taski-tui/src/lib.rs`: `start_quick_add`/`submit_quick_add`/`clear_quick_add`, `run_loop` `a` key + `quick_adding` branch; `crates/taski-daemon/src/lib.rs`: `process_quick_add`/`process_quick_add_undo`; ADR-0014 |
 | Change launcher behavior (combined/daemon/tui dispatch, attach-or-spawn, shutdown handshake) | `crates/taski/src/main.rs` (`run_combined`/`run_combined_spawn`/`run_daemon_only`); ADR-0007 |
 | Change the single-writer lock | `crates/taski-daemon/src/lock.rs` (ADR-0008) |
 | Add a CLI flag | `Cli` struct in the relevant binary's `lib.rs`/`main.rs` |
@@ -649,7 +667,7 @@ A holistic review triaged these as low-value for a personal single-user tool. Th
   the other stamp) are the three metadata *writes* admitted alongside checkbox flips per
   the ADR-0003 principled boundary. Tier 1 added **read-only parsing** of six more tokens
   (`#tags`, priority, start/created/done/cancelled dates — schema v6). Writing the remaining
-  tokens (`🛫` start, `➕` created, priority emojis, `🔁` recurrence) from the TUI remains
+  tokens (`🛫` start, priority emojis, `🔁` recurrence) from the TUI remains
   deferred — each would need its own ADR, pure rewrite oracle, and proptest under the
   ADR-0009 grammar-provability gate. The three dated tokens (`⏳`/`✅`/`❌`) likely exhaust
   the admissible set under that gate.
@@ -672,9 +690,11 @@ If you pick one up, record the decision and update this list.
 ## Glossary
 
 - **Write-back** — reflecting a TUI action into the originating Markdown note, via the
-  daemon. Two action types: **checkbox flips** (`[ ]↔[x]`, ADR-0003) and **`⏳` scheduled-date
-  writes** (`set_scheduled`, ADR-0009 Phase 2). Both reuse the same `atomic_write` TOCTOU
-  guard.
+  daemon. Action types: **checkbox flips** (`[ ]↔[x]`, ADR-0003), **`⏳` scheduled-date
+  writes** (`set_scheduled`, ADR-0009 Phase 2), **`toggle_bullet`** (ADR-0011), and
+  **quick-add** append-only creation (`quick_add`/`quick_add_undo`, ADR-0014). All reuse
+  the same `atomic_write` TOCTOU guard (first-creation via `atomic_create` skips the
+  re-hash — bounded ADR-0004 exception).
 - **Scheduled date (`⏳`)** — Obsidian Tasks-plugin syntax for "plan to work on this." Taski
   parses it, indexes it in `tasks.scheduled_date`, offers a **Today view** (`T`)
   of tasks whose scheduled date == today, and provides a **mark-for-today** toggle (`t`)
@@ -713,12 +733,24 @@ If you pick one up, record the decision and update this list.
 - **Bullet toggle** — the `b` keybinding that converts a checkbox task to a plain bullet
   (`- [ ] task` → `- task`) or back. Implemented as `toggle_bullet` action type, routed
   through the same daemon pipeline (ADR-0011).
-- **Undo** — the `u` keybinding that reverses the last checkbox flip (`Space`) or bullet
-  toggle (`b`). Queues the reverse action immediately; the daemon re-verifies current
-  state, so a failed original naturally fails the undo too (ADR-0011).
+- **Undo** — the `u` keybinding that reverses the last checkbox flip (`Space`), bullet
+  toggle (`b`), or quick-add (`a` — removes the appended line). Queues the reverse action
+  immediately; the daemon re-verifies current state, so a failed original naturally fails
+  the undo too (ADR-0011/0014).
+- **Quick-add** — the `a` keybinding that opens a text-entry modal; Enter appends
+  `- [ ] <text> ➕ <today>` to the designated inbox note. The first content-creation
+  feature (ADR-0014), opening a new gate class (bounded append-only creation) distinct
+  from the grammar-provability token gate.
+- **`inbox_line_for`** — the pure construction oracle in `taski-core` that builds a
+  canonical task line with `➕ <today>` created-date stamp. Strips embedded newlines
+  (single-line only). Called by the daemon's `process_quick_add`; guarded by its own
+  proptest.
+- **Inbox note** — the designated Markdown file (default `task-inbox.md`, configurable via
+  `inbox_path` in config) that quick-add appends to. A capture surface (GTD-style inbox),
+  not a curated note — the user reviews and moves tasks out of it in Obsidian.
 - **`action_type`** — the column on `pending_actions` (schema v5) that distinguishes
-  `checkbox` flips, `set_scheduled` writes, `toggle_bullet` toggles, and `undo` actions.
-  The daemon drain loop dispatches on it.
+  `checkbox` flips, `set_scheduled` writes, `toggle_bullet` toggles, `undo` actions, and
+  `quick_add`/`quick_add_undo` (ADR-0014). The daemon drain loop dispatches on it.
 - **Reconciliation** — re-matching a note's freshly-parsed tasks to existing index rows by
   `text_hash`, preserving surrogate `id`s (ADR-0005).
 - **TOCTOU** — time-of-check-to-time-of-use; the race between reading a file and writing

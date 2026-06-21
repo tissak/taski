@@ -1,6 +1,6 @@
 # ADR-0003: MVP write-back is checkbox-state flips only
 
-- **Status:** Accepted (amended 2026-06-20 by [ADR-0009](./0009-scheduled-date-today.md), 2026-06-21 by [ADR-0012](./0012-done-date-on-toggle.md), 2026-06-21 by [ADR-0013](./0013-delete-task.md))
+- **Status:** Accepted (amended 2026-06-20 by [ADR-0009](./0009-scheduled-date-today.md), 2026-06-21 by [ADR-0012](./0012-done-date-on-toggle.md), 2026-06-21 by [ADR-0013](./0013-cancelled-date-on-cancel.md), 2026-06-21 by [ADR-0014](./0014-quick-add-inbox-creation.md))
 - **Date:** 2026-06-20
 - **Decides:** PRD §10.2 — MVP write-back scope
 
@@ -115,5 +115,36 @@ candidate but depends on a cancel gesture that doesn't exist yet"*) — ADR-0013
 See ADR-0013 for the full design, the three-state stamp decision table, the hard-delete
 alternative that was considered and rejected, and the edge cases.
 
+## Amendment — ADR-0014 (2026-06-21): write-back scope widened to bounded append-only creation
+
+[ADR-0014](./0014-quick-add-inbox-creation.md) ("quick-add") introduces the first **content
+creation** feature — the `a` key opens a text-entry modal that appends
+`- [ ] <text> ➕ <today>` to a designated inbox note (`task-inbox.md` by default, created if
+missing). Unlike the prior three amendments (which admitted new *tokens* under the
+grammar-provability gate), this amendment opens a **new gate class** — bounded append-only
+creation — because quick-add writes arbitrary user text, which fails the grammar-provability
+gate's "single insertion grammar" requirement. The new gate is narrower and structurally
+distinct:
+
+> The write-back scope is widened from **checkbox-state flips + `⏳`/`✅`/`❌` date-emoji
+> stamps** to also include **bounded append-only task creation** to a designated inbox note
+> (`quick_add` action). The ADR-0009 grammar-provability gate is **unchanged** and still
+> governs token writes. A new, separate gate governs creation: Taski may append a
+> well-formed checkbox-task line (with `➕ <today>` created-date stamp) to a designated inbox
+> note, provided the operation is append-only (no modification / reorder / deletion of
+> existing lines), uses the standard `atomic_write` TOCTOU discipline (or a first-creation
+> path with no conflict surface), and re-indexes after write. Arbitrary-note creation,
+> mid-note insertion, text editing, and line deletion remain explicitly rejected.
+
+This amendment does **not** add a schema change (the existing `pending_actions` columns carry
+sentinel values for unused fields) or amend ADR-0004/0005. The first-creation path (inbox file
+does not exist yet) is a bounded, justified exception to ADR-0004's TOCTOU re-hash: a
+non-existent file has no state to conflict with. Undo is extended: `u` after `a` removes the
+appended line (the first content-removing undo, safe because the line is positionally and
+contentually known).
+
+See ADR-0014 for the full design, the new gate's boundary, the first-creation path rationale,
+the undo semantics, and the alternatives.
+
 ## References
-- [`docs/tech.md`](../tech.md), [ADR-0002](./0002-write-back-through-daemon.md), [ADR-0004](./0004-refuse-on-conflict.md), [ADR-0009](./0009-scheduled-date-today.md) *(amendment)*, [ADR-0012](./0012-done-date-on-toggle.md) *(amendment)*, [ADR-0013](./0013-cancelled-date-on-cancel.md) *(amendment)*
+- [`docs/tech.md`](../tech.md), [ADR-0002](./0002-write-back-through-daemon.md), [ADR-0004](./0004-refuse-on-conflict.md), [ADR-0009](./0009-scheduled-date-today.md) *(amendment)*, [ADR-0012](./0012-done-date-on-toggle.md) *(amendment)*, [ADR-0013](./0013-cancelled-date-on-cancel.md) *(amendment)*, [ADR-0014](./0014-quick-add-inbox-creation.md) *(amendment)*

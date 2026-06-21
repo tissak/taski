@@ -324,7 +324,7 @@ pub fn extract_start_date(body: &str) -> Option<String> {
 /// Extract the created date (`➕` + optional VS16 + whitespace + `YYYY-MM-DD`)
 /// from a task body, per the Obsidian Tasks emoji convention.
 pub fn extract_created_date(body: &str) -> Option<String> {
-    extract_emoji_date(body, &['➕'])
+    extract_emoji_date(body, &[CREATED_EMOJI])
 }
 
 /// Extract the done date (`✅` + optional VS16 + whitespace + `YYYY-MM-DD`)
@@ -447,6 +447,13 @@ const DONE_EMOJI: char = '✅';
 /// (Tier 1, schema v6); this const backs the write-path oracle.
 const CANCELLED_EMOJI: char = '❌';
 
+/// The heavy plus sign emoji `➕` (U+2795) — the Obsidian Tasks "created" marker.
+/// ADR-0014: stamped on a quick-add'd inbox task (`- [ ] <text> ➕ <today>`),
+/// the first written token in a *creation* context. Read by the pre-existing
+/// [`extract_created_date`] (Tier 1, schema v6); this const backs the
+/// write-path construction oracle [`inbox_line_for`].
+const CREATED_EMOJI: char = '➕';
+
 /// Pure line-rewrite for the ADR-0009 Phase 2 "mark/unmark for today" gesture.
 /// Given a full task line (including the `- [ ] ` prefix, WITHOUT its trailing
 /// `\n` — the caller handles line terminators) and a desired scheduled state:
@@ -514,6 +521,29 @@ pub fn rewrite_done_date(line: &str, desired: Option<&str>) -> RewriteResult {
 /// for the full "never guesses" contract — every guarantee carries over.
 pub fn rewrite_cancelled_date(line: &str, desired: Option<&str>) -> RewriteResult {
     rewrite_emoji_date(line, desired, CANCELLED_EMOJI)
+}
+
+/// ADR-0014: the pure construction oracle for quick-add. Given the user-typed
+/// task `text` and a `YYYY-MM-DD` `today` string, construct a canonical
+/// Obsidian-Tasks inbox line:
+///
+/// ```text
+/// - [ ] <text> ➕ <today>
+/// ```
+///
+/// This is a **construction** oracle (simpler than the rewrite oracles above — it
+/// builds a line, not edits one). Strips embedded newlines from `text` (the
+/// quick-add modal is single-line only). Empty `text` produces
+/// `"- [ ]  ➕ <today>"` (valid syntax — two spaces between `]` and `➕` — and the
+/// user can fill in the body in Obsidian). Text containing emoji dates (`✅`/`❌`/
+/// `📅`/`⏳`) is preserved verbatim — the scanner will parse them as metadata; a
+/// known edge case the user can fix in Obsidian.
+///
+/// Pure (no I/O) so it is exhaustively proptested in isolation. The daemon's
+/// `process_quick_add` calls this and the proptest cross-checks against it.
+pub fn inbox_line_for(text: &str, today: &str) -> String {
+    let clean: String = text.chars().filter(|&c| c != '\n' && c != '\r').collect();
+    format!("- [ ] {clean} {CREATED_EMOJI} {today}")
 }
 
 /// Shared core behind [`rewrite_scheduled`] (ADR-0009) and [`rewrite_done_date`]

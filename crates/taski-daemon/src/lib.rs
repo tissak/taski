@@ -30,8 +30,8 @@ use notify::RecursiveMode;
 use notify_debouncer_mini::{DebounceEventResult, new_debouncer};
 use rusqlite::Connection;
 use taski_core::{
-    RewriteResult, parse_tasks, rewrite_cancelled_date, rewrite_done_date, rewrite_scheduled,
-    toggle_bullet,
+    RewriteResult, inbox_line_for, parse_tasks, rewrite_cancelled_date, rewrite_done_date,
+    rewrite_scheduled, toggle_bullet,
 };
 use taski_db as db;
 use taski_db::PendingAction;
@@ -602,6 +602,12 @@ pub fn process_pending_actions(conn: &Connection, vault_root: &Path) -> Result<(
                 "checkbox" => process_action(conn, vault_root, action),
                 "set_scheduled" => process_metadata_action(conn, vault_root, action),
                 "toggle_bullet" => process_bullet_action(conn, vault_root, action),
+                // ADR-0014: quick-add (append-only creation) and its undo.
+                // These don't take `conn` — they only touch the vault file; the
+                // drain loop re-indexes `action.note_path` (the inbox) after
+                // `Applied`, same as every other action type.
+                "quick_add" => process_quick_add(vault_root, action),
+                "quick_add_undo" => process_quick_add_undo(vault_root, action),
                 // Unknown action_type: refuse with a distinct, accurate message.
                 // (NOT the checkbox `new_char` phrasing — there is no `new_char`
                 // here; this is an unrecognized write gesture.)
@@ -1155,7 +1161,146 @@ pub fn process_bullet_action(
     }
 }
 
-/// If `s` holds exactly one Unicode scalar value, return it; otherwise `None`.
+// ---------------------------------------------------------------------------
+// ADR-0014: quick-add — bounded append-only task creation to a designated inbox.
+// ---------------------------------------------------------------------------
+
+/// Execute one pending `quick_add` action (ADR-0014): append a canonical
+/// `- [ ] <text> ➕ <today>` task line to the designated inbox note. This is the
+/// wall-clock wrapper; deterministic tests call [`process_quick_add_at`] with a
+/// fixed date.
+///
+/// The inbox path travels in `action.note_path`; the user-typed text travels in
+/// `action.payload`. If the inbox exists, the append uses the full `atomic_write`
+/// TOCTOU guard (ADR-0004 reused). If the inbox does NOT exist, it is created
+/// via [`atomic_create`] (temp → fsync → rename, no TOCTOU re-hash — a
+/// non-existent file has no state to conflict with; bounded ADR-0004 exception).
+pub fn process_quick_add(vault_root: &Path, action: &PendingAction) -> Result<ApplyOutcome> {
+    let today = taski_core::ymd_from_unix(unix_now());
+    process_quick_add_at(vault_root, action, &today)
+}
+
+/// Deterministic-date variant of [`process_quick_add`] for testing. The
+/// daemon's drain loop calls [`process_quick_add`] (wall-clock); tests call
+/// this with a fixed `"2026-06-21"`.
+pub fn process_quick_add_at(
+    vault_root: &Path,
+    action: &PendingAction,
+    today: &str,
+) -> Result<ApplyOutcome> {
+    let inbox_rel = &action.note_path;
+    let text = action.payload.as_deref().unwrap_or("");
+    let line = inbox_line_for(text, today);
+    let inbox_abs = vault_root.join(inbox_rel);
+
+    match fs::read(&inbox_abs) {
+        Ok(original_bytes) => {
+            // Existing inbox: append with the full TOCTOU guard.
+            let original_hash = content_hash(&original_bytes);
+            let mut content = String::from_utf8(original_bytes)
+                .with_context(|| format!("inbox {inbox_rel:?} is not valid UTF-8"))?;
+            // Prepend a newline if the file has content but no trailing newline,
+            // so the appended line starts on its own line. An empty file gets the
+            // line directly (no prepended newline).
+            if !content.ends_with('\n') && !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(&line);
+            content.push('\n');
+            let new_bytes = content.into_bytes();
+            match atomic_write(&inbox_abs, &new_bytes, &original_hash)? {
+                WriteResult::Written => {
+                    tracing::info!(inbox = %inbox_rel, "quick-add appended");
+                    Ok(ApplyOutcome::Applied)
+                }
+                WriteResult::Conflict => Ok(ApplyOutcome::ConflictNoteChanged),
+            }
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            // First-creation: no TOCTOU (nothing to conflict with).
+            let content = format!("{line}\n");
+            atomic_create(&inbox_abs, content.as_bytes())?;
+            tracing::info!(inbox = %inbox_rel, "quick-add created inbox");
+            Ok(ApplyOutcome::Applied)
+        }
+        Err(e) => Err(e).with_context(|| format!("reading inbox {inbox_rel:?}")),
+    }
+}
+
+/// Execute one pending `quick_add_undo` action (ADR-0014): remove the last line
+/// of the inbox if it matches the expected `- [ ] <text> ➕ <today>` content that
+/// `process_quick_add` wrote. This is the wall-clock wrapper; deterministic tests
+/// call [`process_quick_add_undo_at`].
+pub fn process_quick_add_undo(vault_root: &Path, action: &PendingAction) -> Result<ApplyOutcome> {
+    let today = taski_core::ymd_from_unix(unix_now());
+    process_quick_add_undo_at(vault_root, action, &today)
+}
+
+/// Deterministic-date variant of [`process_quick_add_undo`] for testing.
+pub fn process_quick_add_undo_at(
+    vault_root: &Path,
+    action: &PendingAction,
+    today: &str,
+) -> Result<ApplyOutcome> {
+    let inbox_rel = &action.note_path;
+    let text = action.payload.as_deref().unwrap_or("");
+    let expected_line = inbox_line_for(text, today);
+    let inbox_abs = vault_root.join(inbox_rel);
+
+    let original_bytes = match fs::read(&inbox_abs) {
+        Ok(b) => b,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(ApplyOutcome::TaskNotFound),
+        Err(e) => return Err(e).with_context(|| format!("reading inbox {inbox_rel:?}")),
+    };
+    let original_hash = content_hash(&original_bytes);
+    let content = String::from_utf8(original_bytes)
+        .with_context(|| format!("inbox {inbox_rel:?} is not valid UTF-8"))?;
+
+    // The expected suffix is the appended line plus its trailing `\n`.
+    let expected_suffix = format!("{expected_line}\n");
+    if !content.ends_with(&expected_suffix) {
+        // The last line doesn't match — either externally edited or different content.
+        tracing::warn!(inbox = %inbox_rel, "quick-add undo refused: last line mismatch");
+        return Ok(ApplyOutcome::ConflictNoteChanged);
+    }
+
+    // Remove the last line (including its trailing newline).
+    let new_bytes = &content.as_bytes()[..content.len() - expected_suffix.len()];
+    match atomic_write(&inbox_abs, new_bytes, &original_hash)? {
+        WriteResult::Written => {
+            tracing::info!(inbox = %inbox_rel, "quick-add undo removed last line");
+            Ok(ApplyOutcome::Applied)
+        }
+        WriteResult::Conflict => Ok(ApplyOutcome::ConflictNoteChanged),
+    }
+}
+
+/// First-creation helper for ADR-0014: write a brand-new file via temp → fsync →
+/// rename, **without** the TOCTOU re-hash. A non-existent file has no state to
+/// conflict with — the bounded exception to ADR-0004; see ADR-0014 §"The
+/// first-creation path". The temp file is in the same directory as the target
+/// (same FS, atomic rename on POSIX/APFS). Parent directories are created if
+/// missing.
+fn atomic_create(path: &Path, content: &[u8]) -> Result<()> {
+    let dir = path
+        .parent()
+        .with_context(|| format!("inbox path {path:?} has no parent"))?;
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .with_context(|| format!("inbox path {path:?} has no file name"))?;
+    fs::create_dir_all(dir).with_context(|| format!("creating inbox dir {dir:?}"))?;
+    let tmp = dir.join(format!("{file_name}.taski.tmp"));
+
+    let mut file = fs::File::create(&tmp).with_context(|| format!("creating temp {tmp:?}"))?;
+    file.write_all(content)
+        .with_context(|| format!("writing temp {tmp:?}"))?;
+    file.sync_all()
+        .with_context(|| format!("fsyncing temp {tmp:?}"))?;
+    drop(file);
+    fs::rename(&tmp, path).with_context(|| format!("renaming {tmp:?} -> {path:?}"))?;
+    Ok(())
+}
 fn single_char(s: &str) -> Option<char> {
     let mut chars = s.chars();
     let c = chars.next()?;

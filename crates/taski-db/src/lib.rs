@@ -560,6 +560,43 @@ pub fn enqueue_bullet_toggle(
     Ok(conn.last_insert_rowid())
 }
 
+/// ADR-0014: enqueue a quick-add request — append a new task line
+/// (`- [ ] <text> ➕ <today>`) to the designated inbox note. No schema change:
+/// sentinel values fill the NOT NULL columns that are unused for this action
+/// type (`task_id=0`, `line_number=0`, `expected_char=''`, `new_char=''`), per
+/// the established "unused for non-checkbox action types" pattern. The inbox
+/// path travels in `note_path`; the user-typed text travels in `payload`.
+/// Returns the new row id, like [`enqueue_action`].
+pub fn enqueue_quick_add(conn: &Connection, inbox_path: &str, text: &str) -> rusqlite::Result<i64> {
+    conn.execute(
+        "INSERT INTO pending_actions
+            (task_id, note_path, line_number, expected_char, new_char, state,
+             created_at, action_type, payload)
+         VALUES (0, ?1, 0, '', '', 'pending', ?2, 'quick_add', ?3)",
+        rusqlite::params![inbox_path, unix_now(), text],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// ADR-0014: enqueue a quick-add UNDO request — remove the last line from the
+/// inbox if it matches the expected `- [ ] <text> ➕ <today>` content. The daemon
+/// verifies the last line before removing (refuses on mismatch). The inbox path
+/// travels in `note_path`; the original task text travels in `payload`.
+pub fn enqueue_quick_add_undo(
+    conn: &Connection,
+    inbox_path: &str,
+    text: &str,
+) -> rusqlite::Result<i64> {
+    conn.execute(
+        "INSERT INTO pending_actions
+            (task_id, note_path, line_number, expected_char, new_char, state,
+             created_at, action_type, payload)
+         VALUES (0, ?1, 0, '', '', 'pending', ?2, 'quick_add_undo', ?3)",
+        rusqlite::params![inbox_path, unix_now(), text],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
 /// All actions still awaiting processing, oldest first.
 pub fn pending_actions(conn: &Connection) -> rusqlite::Result<Vec<PendingAction>> {
     let mut stmt = conn.prepare(
@@ -1124,6 +1161,35 @@ mod tests {
         assert_eq!(r.action_type, "set_scheduled");
         assert_eq!(r.payload.as_deref(), Some("2026-06-20"));
         assert_eq!(r.error.as_deref(), Some("scheduled date is malformed"));
+    }
+
+    /// ADR-0014: `enqueue_quick_add` / `enqueue_quick_add_undo` round-trip with
+    /// sentinel values (`task_id=0`, `line_number=0`, `expected_char=''`,
+    /// `new_char=''`), the inbox path in `note_path`, and the text in `payload`.
+    #[test]
+    fn enqueue_quick_add_round_trips_with_sentinel_values() {
+        let conn = open(":memory:").unwrap();
+
+        let qa_id = enqueue_quick_add(&conn, "task-inbox.md", "buy milk").unwrap();
+        let undo_id = enqueue_quick_add_undo(&conn, "task-inbox.md", "buy milk").unwrap();
+
+        let pending = pending_actions(&conn).unwrap();
+        assert_eq!(pending.len(), 2);
+
+        let qa = pending.iter().find(|a| a.id == qa_id).unwrap();
+        assert_eq!(qa.action_type, "quick_add");
+        assert_eq!(qa.note_path, "task-inbox.md", "inbox path in note_path");
+        assert_eq!(qa.payload.as_deref(), Some("buy milk"), "text in payload");
+        assert_eq!(qa.task_id, 0, "sentinel task_id");
+        assert_eq!(qa.line_number, 0, "sentinel line_number");
+        assert_eq!(qa.expected_char, "", "unused for quick_add");
+        assert_eq!(qa.new_char, "", "unused for quick_add");
+        assert_eq!(qa.state, "pending");
+
+        let undo = pending.iter().find(|a| a.id == undo_id).unwrap();
+        assert_eq!(undo.action_type, "quick_add_undo");
+        assert_eq!(undo.payload.as_deref(), Some("buy milk"));
+        assert_eq!(undo.note_path, "task-inbox.md");
     }
 
     // --- Tier 1: parsed-metadata round-trips (tags, priority, dates) -------

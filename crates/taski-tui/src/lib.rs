@@ -104,6 +104,9 @@ fn run_inner(db_override: Option<PathBuf>, quit_hook: Option<QuitHook>) -> Resul
     // hard error. Resolve db: override → config → ./taski.db.
     let cfg = taski_config::load().context("loading taski config")?;
     let db_path = taski_config::resolve_db(db_override.as_deref().and_then(Path::to_str), &cfg);
+    // ADR-0014: resolve the inbox path once (config → default) and thread it
+    // into the loop so the `a` key modal knows where to enqueue the write.
+    let inbox_path = taski_config::resolve_inbox_path(&cfg);
 
     // Restore the terminal even if a panic occurs mid-render.
     let original_hook = std::panic::take_hook();
@@ -117,7 +120,7 @@ fn run_inner(db_override: Option<PathBuf>, quit_hook: Option<QuitHook>) -> Resul
     let conn = db::open(&db_path.to_string_lossy()).context("opening taski database")?;
 
     let mut terminal = enter_terminal()?;
-    let result = run_loop(&mut terminal, &conn, quit_hook.as_ref());
+    let result = run_loop(&mut terminal, &conn, quit_hook.as_ref(), &inbox_path);
     restore_terminal()?;
     result
 }
@@ -561,6 +564,18 @@ struct App {
     /// Independent of `filter`, `today_only`, and the search axes (orthogonal).
     /// Purely date-based — does NOT additionally require `status == Open`.
     overdue_only: bool,
+    /// ADR-0014: when true, the quick-add text-entry modal is active (the `a`
+    /// key). Keystrokes accumulate in `quick_add_query` instead of performing
+    /// their normal action. Mirrors `searching`/`file_searching` but does NOT
+    /// call `rebuild()` (no filter to recompute — it's a creation modal, not a
+    /// filter).
+    quick_adding: bool,
+    /// ADR-0014: the text typed so far in the quick-add modal.
+    quick_add_query: String,
+    /// ADR-0014: the resolved inbox path (vault-relative), threaded from
+    /// `run_inner` via `taski_config::resolve_inbox_path`. Defaults to
+    /// `"task-inbox.md"` for tests that construct `App::new()` directly.
+    inbox_path: String,
     /// ADR-0011: the last enqueued write action, for undo (`u` key).
     last_action: Option<LastAction>,
     /// Grouping axis cycled with `G` (Note → Tag → Priority → Folder). Defaults
@@ -585,6 +600,9 @@ enum LastAction {
         note_path: String,
         line_number: usize,
     },
+    /// ADR-0014: a quick-add that appended a line to the inbox. Undo enqueues a
+    /// `quick_add_undo` action (separate action_type, dispatched separately).
+    QuickAdd { inbox_path: String, text: String },
 }
 
 impl App {
@@ -611,6 +629,9 @@ impl App {
             file_query: String::new(),
             file_searching: false,
             overdue_only: false,
+            quick_adding: false,
+            quick_add_query: String::new(),
+            inbox_path: "task-inbox.md".to_string(),
             last_action: None,
             group_by: GroupBy::Note,
         }
@@ -714,6 +735,59 @@ impl App {
             self.file_query.clear();
             self.rebuild();
         }
+    }
+
+    // ── ADR-0014 quick-add (a key) ───────────────────────────────────
+
+    /// Enter the quick-add text-entry modal. Finishes any search prompt so only
+    /// one modal is active at a time. Unlike search, does NOT call `rebuild()`
+    /// (no filter to recompute — it's a creation modal, not a filter).
+    fn start_quick_add(&mut self) {
+        self.searching = false;
+        self.file_searching = false;
+        self.quick_adding = true;
+        self.quick_add_query.clear();
+    }
+
+    /// Append a character to the quick-add query.
+    fn push_quick_add_char(&mut self, c: char) {
+        self.quick_add_query.push(c);
+    }
+
+    /// Pop the last character (Backspace).
+    fn pop_quick_add_char(&mut self) {
+        self.quick_add_query.pop();
+    }
+
+    /// Cancel quick-add: clear the query, exit the modal.
+    fn clear_quick_add(&mut self) {
+        self.quick_adding = false;
+        self.quick_add_query.clear();
+    }
+
+    /// `Enter` in the quick-add modal: enqueue a `quick_add` action for the
+    /// typed text (trimmed; empty text is a no-op that just dismisses the modal).
+    /// Records `LastAction::QuickAdd` so `u` can undo. Exits the modal on both
+    /// success and empty-text.
+    fn submit_quick_add(&mut self, conn: &Connection) {
+        let text = self.quick_add_query.trim();
+        if text.is_empty() {
+            self.clear_quick_add();
+            return;
+        }
+        let text = text.to_string();
+        let inbox = self.inbox_path.clone();
+        let result = db::enqueue_quick_add(conn, &inbox, &text).context("enqueuing quick_add");
+        // S4: only record an undoable action if the enqueue succeeded.
+        if result.is_ok() {
+            self.last_action = Some(LastAction::QuickAdd {
+                inbox_path: inbox,
+                text: text.clone(),
+            });
+        }
+        self.quick_add_query.clear();
+        self.quick_adding = false;
+        self.track_enqueued(result);
     }
 
     /// Re-read the index from the DB, then rebuild the view and poll the resolution
@@ -1065,6 +1139,10 @@ impl App {
                 line_number,
             } => db::enqueue_bullet_toggle(conn, task_id, &note_path, line_number)
                 .context("enqueuing undo bullet toggle"),
+            LastAction::QuickAdd { inbox_path, text } => {
+                db::enqueue_quick_add_undo(conn, &inbox_path, &text)
+                    .context("enqueuing quick_add_undo")
+            }
         };
         // Don't update last_action (undo doesn't get its own undo).
         self.track_enqueued(result);
@@ -1124,8 +1202,12 @@ fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     conn: &Connection,
     quit_hook: Option<&QuitHook>,
+    inbox_path: &str,
 ) -> Result<()> {
     let mut app = App::new();
+    // ADR-0014: thread the resolved inbox path from `run_inner` (which read
+    // `Config`). `App::new()` defaults to `"task-inbox.md"` for tests.
+    app.inbox_path = inbox_path.to_string();
     // `None` => never refreshed yet, so the first iteration reads immediately.
     let mut last_refresh: Option<Instant> = None;
 
@@ -1169,6 +1251,18 @@ fn run_loop(
                 KeyCode::Enter => app.finish_file_search(),
                 KeyCode::Backspace => app.pop_file_search_char(),
                 KeyCode::Char(c) => app.push_file_search_char(c),
+                _ => {}
+            }
+        } else if app.quick_adding {
+            // ADR-0014: quick-add modal (a key). Keystrokes build the query;
+            // Enter enqueues a `quick_add` action, Esc cancels. Unlike search
+            // it does NOT call `rebuild()` (no filter to recompute — it's a
+            // creation modal, not a filter).
+            match key.code {
+                KeyCode::Esc => app.clear_quick_add(),
+                KeyCode::Enter => app.submit_quick_add(conn),
+                KeyCode::Backspace => app.pop_quick_add_char(),
+                KeyCode::Char(c) => app.push_quick_add_char(c),
                 _ => {}
             }
         } else {
@@ -1222,6 +1316,12 @@ fn run_loop(
                 KeyCode::Char('/') => app.start_search(),
                 // ADR-0010 file search: `F` opens the file/path search prompt.
                 KeyCode::Char('F') => app.start_file_search(),
+                // ADR-0014 quick-add: `a` opens the inbox text-entry modal. The
+                // actual vault append is the daemon's job via `enqueue_quick_add`;
+                // the TUI never touches files directly. Suppressed during a search
+                // prompt — `a` falls through to `push_search_char` in the search
+                // arms above, exactly like `b`/`d`/`t`.
+                KeyCode::Char('a') => app.start_quick_add(),
                 KeyCode::Tab => app.expand_all(),
                 KeyCode::BackTab => app.collapse_all(),
                 // Uppercase J/K scroll the context pane (lowercase j/k move the task list).
@@ -1392,6 +1492,12 @@ fn render_failure_notice(action: &PendingAction) -> String {
         // so a failed cancel's retry key is `d`, not `Space`. No new action_type
         // or LastAction variant is introduced for this (per ADR-0013).
         _ if action.new_char == "-" => ("Cancel", "d"),
+        // ADR-0014: quick-add (a key) and its undo (u key). These carry their
+        // own action_types, so they're matched here — not in the checkbox
+        // wildcard. A refused quick-add surfaces "Quick add not applied — …
+        // Press a to try again", not the done-toggle wording.
+        "quick_add" => ("Quick add", "a"),
+        "quick_add_undo" => ("Quick-add undo", "u"),
         // The default/checkbox path (done-toggle).
         _ => ("Toggle", "Space"),
     };
@@ -1593,6 +1699,27 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Span::styled(cursor, Style::default().add_modifier(Modifier::SLOW_BLINK)),
         ]))
         .style(Style::new())
+    } else if app.quick_adding {
+        // ADR-0014: quick-add modal prompt. Mirrors the search/file-search prompt
+        // layout but uses a "+" prefix (the `➕` creation emoji used in the written
+        // task line) and shows which inbox the write targets.
+        let cursor = if (app.quick_add_query.len() as u16) < footer_area.width.saturating_sub(12) {
+            "█"
+        } else {
+            ""
+        };
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!(" + to {}  ", app.inbox_path),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(
+                app.quick_add_query.clone(),
+                Style::default().fg(Color::Green),
+            ),
+            Span::styled(cursor, Style::default().add_modifier(Modifier::SLOW_BLINK)),
+        ]))
+        .style(Style::new())
     } else {
         Paragraph::new(Line::from(vec![
             Span::raw(" "),
@@ -1618,6 +1745,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Span::raw(" bullet  ·  "),
             Span::styled("u", Style::default().fg(Color::Yellow)),
             Span::raw(" undo  ·  "),
+            Span::styled("a", Style::default().fg(Color::Yellow)),
+            Span::raw(" quick-add  ·  "),
             Span::styled("/", Style::default().fg(Color::Yellow)),
             Span::raw(" search  ·  "),
             Span::styled("F", Style::default().fg(Color::Yellow)),
@@ -2199,6 +2328,139 @@ mod tests {
         assert_eq!(
             undo.new_char, " ",
             "undo new_char must be the forward flip's expected_char (swapped)"
+        );
+    }
+
+    /// ADR-0014: `submit_quick_add` enqueues a `quick_add` action carrying the
+    /// inbox path + typed text (with sentinel `task_id = 0`), records
+    /// `LastAction::QuickAdd` for undo, and exits the modal. End-to-end through
+    /// the real DB queue.
+    #[test]
+    fn submit_quick_add_enqueues_and_records_last_action() {
+        let conn = db::open(":memory:").unwrap();
+        let mut app = App::new();
+        app.inbox_path = "task-inbox.md".to_string();
+        app.quick_add_query = "my new task".to_string();
+        app.quick_adding = true;
+
+        app.submit_quick_add(&conn);
+
+        let pending = db::pending_actions(&conn).unwrap();
+        assert_eq!(pending.len(), 1, "exactly one quick_add action enqueued");
+        assert_eq!(pending[0].action_type, "quick_add");
+        assert_eq!(pending[0].payload.as_deref(), Some("my new task"));
+        assert_eq!(pending[0].note_path, "task-inbox.md");
+        assert_eq!(pending[0].task_id, 0, "quick_add uses sentinel task_id = 0");
+
+        // last_action recorded for undo.
+        assert!(
+            matches!(
+                &app.last_action,
+                Some(LastAction::QuickAdd { inbox_path, text })
+                    if inbox_path == "task-inbox.md" && text == "my new task"
+            ),
+            "last_action must be QuickAdd with the inbox path + text"
+        );
+
+        // Modal exited + query cleared.
+        assert!(!app.quick_adding, "modal must exit after submit");
+        assert!(
+            app.quick_add_query.is_empty(),
+            "query must be cleared after submit"
+        );
+    }
+
+    /// ADR-0014: whitespace-only text is a no-op — no action enqueued, but the
+    /// modal still exits (so `a` + spaces + Enter dismisses the modal cleanly).
+    #[test]
+    fn quick_add_empty_text_is_noop() {
+        let conn = db::open(":memory:").unwrap();
+        let mut app = App::new();
+        app.quick_add_query = "   ".to_string();
+        app.quick_adding = true;
+
+        app.submit_quick_add(&conn);
+
+        assert!(
+            db::pending_actions(&conn).unwrap().is_empty(),
+            "whitespace-only text must not enqueue anything"
+        );
+        assert!(!app.quick_adding, "modal must still exit on empty text");
+    }
+
+    /// ADR-0014: `u` after a quick-add enqueues a `quick_add_undo` action (a
+    /// separate action_type, dispatched separately by the daemon). This is the
+    /// quick-add sibling of `submit_undo_after_toggle_enqueues_reversed_flip`.
+    #[test]
+    fn submit_undo_after_quick_add_enqueues_quick_add_undo() {
+        let conn = db::open(":memory:").unwrap();
+        let mut app = App::new();
+        app.last_action = Some(LastAction::QuickAdd {
+            inbox_path: "task-inbox.md".into(),
+            text: "undo me".into(),
+        });
+
+        app.submit_undo(&conn);
+
+        let pending = db::pending_actions(&conn).unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "exactly one quick_add_undo action enqueued"
+        );
+        assert_eq!(pending[0].action_type, "quick_add_undo");
+        assert_eq!(pending[0].payload.as_deref(), Some("undo me"));
+        assert_eq!(pending[0].note_path, "task-inbox.md");
+    }
+
+    /// ADR-0014 Issue 1 lockdown: a failed quick_add surfaces a notice worded
+    /// for the quick-add gesture ("Quick add not applied — … Press a to try
+    /// again"), NOT the done-toggle wording ("Toggle … Press Space"). Follows
+    /// the `failed_cancel_surfaces_cancel_notice` end-to-end pattern.
+    #[test]
+    fn failed_quick_add_surfaces_quick_add_notice() {
+        let conn = db::open(":memory:").unwrap();
+        let mut app = App::new();
+        app.inbox_path = "task-inbox.md".to_string();
+        app.quick_add_query = "my task".to_string();
+        app.quick_adding = true;
+        app.submit_quick_add(&conn);
+        let id = db::pending_actions(&conn).unwrap()[0].id;
+
+        // Daemon refuses it: the inbox changed externally since the action was
+        // enqueued (the TOCTOU conflict path).
+        db::resolve_action(
+            &conn,
+            id,
+            "failed",
+            Some("note changed externally since scan; quick_add not applied"),
+        )
+        .unwrap();
+        app.refresh(&conn).unwrap();
+
+        let notice = app
+            .notice
+            .as_deref()
+            .expect("quick_add failure should surface a notice");
+        assert!(
+            notice.starts_with("Quick add not applied"),
+            "quick_add notice should be worded for the quick-add gesture: {notice}"
+        );
+        assert!(
+            notice.contains("task-inbox.md"),
+            "notice should name the inbox path"
+        );
+        assert!(
+            notice.contains("Press a"),
+            "notice should hint the `a` retry key, not Space: {notice}"
+        );
+        assert!(
+            !notice.contains("Space"),
+            "quick_add notice must NOT hint the done-toggle retry key: {notice}"
+        );
+        assert!(
+            !notice.contains("Toggle"),
+            "quick_add notice must NOT carry the done-toggle verb: {notice}"
         );
     }
 
