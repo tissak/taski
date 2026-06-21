@@ -1038,13 +1038,36 @@ pub fn process_bullet_action(
     vault_root: &Path,
     action: &PendingAction,
 ) -> Result<ApplyOutcome> {
-    // 1. Current task row.
-    let Some(row) = lookup_task_for_action(conn, action.task_id)? else {
-        return Ok(ApplyOutcome::TaskNotFound);
+    // 1. Resolve the target location and note_hash.
+    //    Normal path: from the task row (lookup_task_for_action).
+    //    Location fallback: if the task_id churned (ADR-0012 ✅/⏳ stamp
+    //      changed text_hash → reconcile_note assigned a new id).
+    //    Bullet undo fallback: if the task row was deleted entirely (the
+    //      forward bullet toggle converted checkbox→bullet, so reconcile_note
+    //      pruned the row — no task exists at that location). Use the action's
+    //      recorded (note_path, line_number) + the note_contents cache for
+    //      note_hash (conflict detection still works — the cache was updated
+    //      when the forward toggle's re-index ran).
+    let (note_path, line_number, note_hash) = match lookup_task_for_action(conn, action.task_id)? {
+        Some(row) => (row.note_path, row.line_number, row.note_hash),
+        None => match lookup_task_by_location(conn, &action.note_path, action.line_number)? {
+            Some(row) => (row.note_path, row.line_number, row.note_hash),
+            None => {
+                tracing::debug!(
+                    task_id = action.task_id,
+                    note_path = %action.note_path,
+                    line_number = action.line_number,
+                    "task_id and location not found; using note_contents fallback"
+                );
+                let cached_hash =
+                    db::note_content(conn, &action.note_path)?.and_then(|nc| nc.note_hash);
+                (action.note_path.clone(), action.line_number, cached_hash)
+            }
+        },
     };
 
     // 2. Read the note fresh from the vault.
-    let note_abs = vault_root.join(&row.note_path);
+    let note_abs = vault_root.join(&note_path);
     let bytes = match fs::read(&note_abs) {
         Ok(b) => b,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(ApplyOutcome::TaskNotFound),
@@ -1053,12 +1076,12 @@ pub fn process_bullet_action(
 
     // 3. Authoritative conflict check via content hash.
     let snapshot_hash = content_hash(&bytes);
-    if Some(&snapshot_hash) != row.note_hash.as_ref() {
+    if Some(&snapshot_hash) != note_hash.as_ref() {
         return Ok(ApplyOutcome::ConflictNoteChanged);
     }
 
-    // 4. Target the task's CURRENT line_number.
-    let Some(line_range) = line_byte_range(&bytes, row.line_number) else {
+    // 4. Target the line.
+    let Some(line_range) = line_byte_range(&bytes, line_number) else {
         return Ok(ApplyOutcome::TaskLineMismatch);
     };
 

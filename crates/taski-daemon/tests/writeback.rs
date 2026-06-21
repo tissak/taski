@@ -1004,3 +1004,87 @@ fn double_set_scheduled_uses_location_fallback() {
         "unmark must remove the ⏳ token"
     );
 }
+
+#[test]
+fn undo_bullet_toggle_uses_note_contents_fallback() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let conn = db::open(&tmp.path().join("btf.db").to_string_lossy()).expect("open db");
+
+    let note = root.join("day.md");
+    fs::write(&note, "- [ ] task one\n").unwrap();
+    scan_vault(&conn, root, &[]).expect("scan");
+
+    // Capture task identity before the forward toggle deletes the row.
+    let tasks = db::all_tasks(&conn).expect("all_tasks");
+    let t1 = tasks[0].clone();
+
+    // Forward bullet toggle: - [ ] task one → - task one
+    db::enqueue_bullet_toggle(&conn, t1.id, &t1.note_path, t1.line_number).expect("enqueue");
+    let action = &db::pending_actions(&conn).expect("pending")[0];
+    let outcome = process_bullet_action(&conn, root, action).expect("process");
+    assert_eq!(outcome, ApplyOutcome::Applied);
+    assert_eq!(fs::read_to_string(&note).unwrap(), "- task one\n");
+
+    // Re-index: the checkbox task is gone from the DB (it's a bullet now).
+    db::resolve_action(&conn, action.id, "done", None).unwrap();
+    index_note(&conn, &note, root).expect("re-index");
+    assert!(
+        db::all_tasks(&conn).unwrap().is_empty(),
+        "task row should be gone after bullet toggle + re-index"
+    );
+
+    // Undo bullet toggle: - task one → - [ ] task one
+    // The action references stale task_id, which no longer exists.
+    // Location lookup also finds nothing (no task at that line — it's a bullet).
+    // The note_contents cache provides the note_hash for conflict detection.
+    db::enqueue_bullet_toggle(&conn, t1.id, &t1.note_path, t1.line_number).expect("enqueue undo");
+    let undo = &db::pending_actions(&conn).expect("pending")[0];
+    let outcome = process_bullet_action(&conn, root, undo).expect("process undo");
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Applied,
+        "undo must succeed via note_contents fallback"
+    );
+
+    // The checkbox is restored.
+    assert_eq!(fs::read_to_string(&note).unwrap(), "- [ ] task one\n");
+}
+
+#[test]
+fn bullet_undo_refused_on_concurrent_edit_via_note_contents_fallback() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let conn = db::open(&tmp.path().join("btc2.db").to_string_lossy()).expect("open db");
+
+    let note = root.join("day.md");
+    fs::write(&note, "- [ ] task one\n").unwrap();
+    scan_vault(&conn, root, &[]).expect("scan");
+
+    let tasks = db::all_tasks(&conn).expect("all_tasks");
+    let t1 = tasks[0].clone();
+
+    // Forward bullet toggle.
+    db::enqueue_bullet_toggle(&conn, t1.id, &t1.note_path, t1.line_number).expect("enqueue");
+    let action = &db::pending_actions(&conn).expect("pending")[0];
+    process_bullet_action(&conn, root, action).expect("process");
+    db::resolve_action(&conn, action.id, "done", None).unwrap();
+    index_note(&conn, &note, root).expect("re-index");
+
+    // Simulate Obsidian editing the note AFTER the re-index. The note_contents
+    // cache has the pre-edit hash; the file now differs.
+    fs::write(&note, "- task one EDITED\n").unwrap();
+
+    // Undo bullet toggle: note_contents hash ≠ file hash → ConflictNoteChanged.
+    db::enqueue_bullet_toggle(&conn, t1.id, &t1.note_path, t1.line_number).expect("enqueue undo");
+    let undo = &db::pending_actions(&conn).expect("pending")[0];
+    let outcome = process_bullet_action(&conn, root, undo).expect("process undo");
+    assert_eq!(
+        outcome,
+        ApplyOutcome::ConflictNoteChanged,
+        "concurrent edit must be detected even via note_contents fallback"
+    );
+
+    // File is untouched (still the edited version).
+    assert_eq!(fs::read_to_string(&note).unwrap(), "- task one EDITED\n");
+}
