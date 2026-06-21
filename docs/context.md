@@ -1,6 +1,6 @@
 # Taski — Engineering Context & Onboarding
 
-*Onboarding guide for new engineers. Last updated: 2026-06-21 (post-v0.4 — adds Tier 1 metadata parsing [tags, priority, start/created/done/cancelled dates, schema v6], Tier 2 views [overdue `O`, group-by cycling `G`], the `✅` done-date stamp on toggle [ADR-0012], the `❌` cancelled-date stamp on cancel [ADR-0013], and the `➕` quick-add inbox creation [ADR-0014]; 309 tests across 6 crates).*
+*Onboarding guide for new engineers. Last updated: 2026-06-21 (post-v0.4 — adds Tier 1 metadata parsing [tags, priority, start/created/done/cancelled dates, schema v6], Tier 2 views [overdue `O`, group-by cycling `G`], the `✅` done-date stamp on toggle [ADR-0012], the `❌` cancelled-date stamp on cancel [ADR-0013], the `➕` quick-add inbox creation [ADR-0014], and the `o` open-in-Obsidian deep-link gesture [ADR-0015]; 319 tests across 6 crates).*
 
 This document is the "operating manual" for working on Taski: what it is, how it's
 built, the decisions that are load-bearing (and must not be casually undone), and the
@@ -43,10 +43,10 @@ Cargo workspace, edition 2024, six crates. Dependencies point downward only (no 
 | Crate | Responsibility | Key file(s) |
 |---|---|---|
 | `taski-core` | **Pure** domain: `Task`/`Status`/`Priority` types, the Markdown parser (`parse_tasks`, fence-aware), emoji extraction (`extract_due_date` 📅/📆/🗓, `extract_scheduled_date` ⏳, `extract_start_date` 🛫, `extract_created_date` ➕, `extract_done_date` ✅, `extract_cancelled_date` ❌ — all via shared `extract_emoji_date`; plus `extract_priority` 🔺/⏫/🔼/🔽/⏬ and `extract_tags` `#tag`), the pure `rewrite_scheduled` line-rewrite oracle (ADR-0009 Phase 2) and `inbox_line_for` construction oracle (ADR-0014), and pure `ymd_from_unix` (today's date, no date crate). No FS, no I/O, no deps on other taski crates. | `crates/taski-core/src/lib.rs` |
-| `taski-config` | TOML config loading (`~/.config/taski/config.toml`) + CLI→config→default precedence + the `template()` renderer for `--init-config`. Fields include `exclude_dirs` for skipping vault subdirectory trees and `inbox_path` for the quick-add target note (ADR-0014). Keeps FS/TOML out of `taski-core`. | `crates/taski-config/src/lib.rs` |
+| `taski-config` | TOML config loading (`~/.config/taski/config.toml`) + CLI→config→default precedence + the `template()` renderer for `--init-config`. Fields include `exclude_dirs` for skipping vault subdirectory trees, `inbox_path` for the quick-add target note (ADR-0014), and `obsidian_vault`/`use_advanced_uri` for the open-in-Obsidian deep link (ADR-0015). Keeps FS/TOML out of `taski-core`. | `crates/taski-config/src/lib.rs` |
 | `taski-db` | The canonical SQLite schema, `open()` (WAL + schema + dir creation), and all read/write APIs (`all_tasks`, `reconcile_note`, `enqueue_action` / `enqueue_set_scheduled` / `enqueue_bullet_toggle`, `pending_actions`, `prune_old_actions`, `delete_tasks_for_excluded_dirs`, …). Owns `tasks` + `pending_actions` + `note_contents`. | `crates/taski-db/src/lib.rs` |
 | `taski-daemon` | The watcher/scanner + **sole writer to the vault**: the reusable engine `run_daemon(opts, shutdown, lock)`, plus `scan_vault`, `index_note`, `process_action` (checkbox flips) / `process_metadata_action` (`⏳` writes) / `process_bullet_action` (checkbox↔bullet toggle) — all three reuse `atomic_write` (ADR-0009/0011), the watch loop; the `ShutdownSignal`/`ShutdownHandle` pair; and the `flock` single-writer lock (`DaemonLockGuard`/`acquire_daemon_lock`/`LockOutcome`). The drain loop dispatches on `pending_actions.action_type`. Also handles `exclude_dirs` purge + filtered scanning. **lib + bin** — a `taski-daemon` binary *and* the library the unified launcher depends on. | `crates/taski-daemon/src/{lib,main,shutdown,lock}.rs`, `tests/` |
-| `taski-tui` | The `ratatui` client: polls the index, groups by note/tag/priority/folder (`G` cycling), filters (status-cycle `f`, Today view `T`, Overdue `O`, text search `/`, file search `F`), renders, submits toggle (`Space`) / mark-for-today (`t`) / bullet toggle (`b`) / undo (`u`) actions, and shows the context pane via the cached `note_contents` table. Never touches vault files. **lib + bin** — public entry points `run()` / `run_with_db(db)` / `run_combined(db, quit_hook)`; `main.rs` is a thin shim. Key internal modules: `App` (state machine), `build_view` (filter pipeline + HashMap grouping), `draw` (render), `run_loop` (input). | `crates/taski-tui/src/{lib,main}.rs` |
+| `taski-tui` | The `ratatui` client: polls the index, groups by note/tag/priority/folder (`G` cycling), filters (status-cycle `f`, Today view `T`, Overdue `O`, text search `/`, file search `F`), renders, submits toggle (`Space`) / mark-for-today (`t`) / bullet toggle (`b`) / undo (`u`) actions, shows the context pane via the cached `note_contents` table, and opens the selected task's note in Obsidian via an `obsidian://` deep link (`o`, ADR-0015 — the TUI's first `std::process::Command` spawn). Never touches vault files. **lib + bin** — public entry points `run()` / `run_with_db(db)` / `run_combined(db, quit_hook)`; `main.rs` is a thin shim. Key internal modules: `App` (state machine), `build_view` (filter pipeline + HashMap grouping), `draw` (render), `run_loop` (input). | `crates/taski-tui/src/{lib,main}.rs` |
 | `taski` | The **unified launcher** binary: runs the daemon (background thread) + TUI (main thread) together by default (`taski`), or either alone via `taski daemon` / `taski tui` subcommands. Attach-or-spawn + single-writer lock (ADRs 0007/0008). | `crates/taski/src/main.rs` |
 
 Supporting: `docs/` (PRD, tech, ADRs, setup, code reviews under `docs/cr/`, this file), `scripts/install-launchd.sh`
@@ -267,12 +267,20 @@ filter predicates within each bucket and emits `Header` + `Task` rows.
 | `u` | Undo the last checkbox flip (incl. cancel), bullet toggle, or quick-add action |
 | `/` | Open text search prompt (matches `task.text`, case-insensitive) |
 | `F` | Open file/path search prompt (matches `task.note_path`) |
+| `o` | Open the selected task's note in Obsidian via an `obsidian://` deep link (native: opens the file; with `use_advanced_uri = true`: jumps to the task's line — requires the Advanced URI plugin). Read-only, TUI-local; macOS only [ADR-0015] |
 | `p` | Toggle the context pane (right-half note preview) |
 | `J` / `K` | Scroll context pane up/down |
+| `?` | Toggle the floating keybindings help overlay (modal: `?`/`Esc`/`q` close it without quitting; `Ctrl-C` still quits from any state). The footer cheat-sheet is trimmed to essentials; the full list lives here |
 | `q` / `Esc` / `Ctrl-C` | Quit |
 
 While a search prompt is active: `Esc` cancels (clears filter), `Enter` dismisses (keeps
 filter), `Backspace` edits query, characters build query.
+
+The footer cheat-sheet is trimmed to the most-used gestures (`j/k move · Space toggle ·
+Enter fold · f filter · / search · ? help · q quit`); the full keybinding list lives in the
+floating help overlay opened by `?`. The overlay is modal — it intercepts keys before
+normal dispatch, so `?`/`Esc`/`q` close it (without quitting) and every other key is
+swallowed until dismissed; `Ctrl-C` remains the always-available emergency exit.
 
 ---
 
@@ -448,6 +456,19 @@ understanding the failure mode it prevents.**
     (first content-removing undo, safe because the line is positionally and contentually known). Amends ADR-0003 a
     fourth time.
 
+15. **Open-in-Obsidian deep-link gesture** ([ADR-0015](./adr/0015-open-in-obsidian-deep-link.md)) —
+    The `o` key builds an `obsidian://` URL from the selected task's `note_path` (+ `line_number`) and hands it to
+    macOS `open`, focusing Obsidian at the task's source note. This is **Taski's first read-only, TUI-local,
+    OS-boundary gesture** — it mutates nothing: no vault write, no daemon round-trip, no `pending_actions` row, no
+    index change. It therefore does **not** amend ADR-0002 or any write-back ADR (the TUI still never opens a vault
+    file; it composes a URL and calls `open`). URL mode is configurable: native `obsidian://open?vault=&file=` by
+    default (zero plugin dependency, opens the file but cannot target a line), or `obsidian://advanced-uri?…&line=`
+    when `use_advanced_uri = true` (jumps to the exact line; requires the Advanced URI community plugin). The vault
+    name is derived from the configured vault path's basename, overridable via `obsidian_vault` in config. The TUI's
+    first `std::process::Command` spawn is fire-and-forget with null stdio (cannot garble the alternate screen); on
+    failure it `tracing::warn!`s (in-TUI failure notice deferred). macOS-only (`open`); Linux/Windows (`xdg-open`/`start`)
+    deferred — note `xdg-open` additionally needs double-encoding of URL values.
+
 ---
 
 ## Gotchas & Landmines (read this before you change anything)
@@ -557,7 +578,19 @@ These are the things that aren't obvious from reading the code and will cost you
   `app.searching` or `app.file_searching` is true, most keystrokes build the search query
   instead of performing their normal action. This means adding a new keybinding requires
   checking whether it should also be available during a search prompt. So far only `Esc`
-  and `Enter` are handled during both, and `Enter` just dismisses the prompt.
+  and `Enter` are handled during both, and `Enter` just dismisses the prompt. (`o`
+  open-in-Obsidian is normal-mode only — during a search prompt it builds the query.)
+- **The `o` open-in-Obsidian spawn must keep null stdio and stay macOS-only for now.**
+  `open_in_obsidian` calls `Command::new("open")` with `.stdout(Stdio::null())` +
+  `.stderr(Stdio::null())` + `.spawn()` (fire-and-forget, never `.wait()`). Do NOT drop the
+  null redirects — the alternate screen is owned for the whole session and any stdio from
+  `open` would garble it. Cross-platform support (`xdg-open` on Linux, `start` on Windows)
+  is deferred; note `xdg-open` additionally requires **double-encoding** of URL parameter
+  values (encode once, then encode the `%` signs to `%25`), which the current single-pass
+  `percent_encode_query` does not produce — adding Linux means extending the encoder, not
+  just swapping the launcher binary. `tracing` is now a `taski-tui` dep (was daemon/launcher
+  only) so the TUI thread's `tracing::warn!` on spawn failure flows through the combined-mode
+  subscriber rather than being swallowed.
 
 ---
 
@@ -599,14 +632,14 @@ These are the things that aren't obvious from reading the code and will cost you
 | Location | What it guards |
 |---|---|
 | `taski-core` unit tests + `proptest` + `rewrite_scheduled_proptest` + `tag_extraction_proptest` + `inbox_line_proptest` | Parser correctness on a synthetic corpus; never-panics on arbitrary input; due/scheduled/start/created/done/cancelled date extraction; `extract_priority` (incl. the `⏫`=High / `🔺`=Highest mapping); `extract_tags` grammar + dedup; pure `rewrite_scheduled` oracle (256-case ADR-0009 Phase 2); tag-extraction grammar + dedup proptest (256 cases); `inbox_line_for` construction oracle (256-case ADR-0014). |
-| `taski-config` unit tests | TOML parsing, precedence (CLI→config→default), env override, `template()` round-trips. |
+| `taski-config` unit tests | TOML parsing, precedence (CLI→config→default), env override, `template()` round-trips, `obsidian_vault`/`use_advanced_uri` deserialize + default-absent (ADR-0015). |
 | `taski-db` unit tests | Schema, `reconcile_note` identity retention, upsert/read round-trips (incl. Tier 1 metadata + the tag sentinel storage format), action pruning, `open()` creates missing dirs. |
 | `taski-daemon/tests/scan.rs` | End-to-end scan of a fake vault → correct task rows. |
 | `taski-daemon/tests/reconcile.rs` | Content-hash reconciliation: identity survives edits, deletes, reorders. |
 | `taski-daemon/tests/writeback.rs` + `writeback_proptest.rs` + `metadata_writeback_proptest.rs` + `done_date_writeback_proptest.rs` + `cancelled_date_writeback_proptest.rs` + `quick_add_writeback_proptest.rs` | The safety contract: atomic_write commits on match, refuses on conflict, never corrupts; `⏳` metadata write-back "never corrupts" (256-case ADR-0009 Phase 2, oracle = `rewrite_scheduled`); `✅` done-date-on-toggle stamp "never corrupts" (256-case ADR-0012, oracle = `rewrite_done_date`, CRLF assertion, VS16 guards); `❌` cancelled-date-on-cancel stamp "never corrupts" (256-case ADR-0013, oracle = `rewrite_cancelled_date`; also exercises cross-state `✅`-clearing); quick-add append/create "never corrupts" (256-case ADR-0014, oracle = `inbox_line_for`; also covers first-creation and undo removal). Also covers `toggle_bullet` and `undo` action types (ADR-0011). |
 | `taski-daemon/src/lock.rs` unit tests | The `flock` single-writer lock: acquire/refuse outcome, lock-path derivation. |
 | `taski-daemon` unit tests in `lib.rs` | `should_exclude_entry`, `path_matches_exclude`, `scan_vault_with_exclude_dirs_skips_matching_directory` — exclude-dir filtering in WalkDir and watcher events. |
-| `taski-tui` unit tests (in `lib.rs`) | View model: grouping (note/tag/priority/folder via `G`, incl. tag fan-out + group ordering), collapse, five-axis filter composition (status + today + overdue + text search + file search), display-index↔Task mapping, selection reconciliation (incl. duplicate task_ids under tag grouping), failure-notice surfacing, context-pane render/scroll/toggle + `context_view` centering (headless `TestBackend` smoke). |
+| `taski-tui` unit tests (in `lib.rs`) | View model: grouping (note/tag/priority/folder via `G`, incl. tag fan-out + group ordering), collapse, five-axis filter composition (status + today + overdue + text search + file search), display-index↔Task mapping, selection reconciliation (incl. duplicate task_ids under tag grouping), failure-notice surfacing, context-pane render/scroll/toggle + `context_view` centering (headless `TestBackend` smoke), and the pure `obsidian_url` + `percent_encode_query` deep-link builder (native vs advanced, RFC 3986 component encoding incl. unicode; ADR-0015), and the `?` help-overlay modal dispatch (`help_dismisses_on`) + headless `TestBackend` render smoke. |
 | `taski-db` unit tests | `delete_tasks_for_excluded_dirs` — verifies exact-match and prefix-match SQL purges the right rows. |
 | `taski` (unified launcher) | No unit tests by design — it's thin dispatch over the two libraries. Correctness is runtime-verified (combined spawn, attach-when-held, refuse-when-held, quit-drain); see the smokes described in ADRs 0007/0008. |
 
@@ -627,6 +660,7 @@ exercised only at runtime (its `taski.db` is gitignored).
 | Change the TUI filter composition / grouping | `crates/taski-tui/src/lib.rs:build_view()` — ANDs five filter axes (status + today + overdue + text search + file search) and buckets survivors by the `G` grouping axis (note/tag/priority/folder; HashMap-based, tag fan-out). The 9-param function carries a documented `#[allow(clippy::too_many_arguments)]` (a parameter-struct refactor is deferred). |
 | Change keybindings (add/remove a key) | `crates/taski-tui/src/lib.rs:run_loop()` — handles three branches: `searching`, `file_searching`, and normal mode. `b` / `u` added in ADR-0011; `d` (cancel) added in ADR-0013 |
 | Change context-pane keybindings/behavior | `taski-tui/src/lib.rs` key match in `run_loop` (`J`/`K` scroll, `p` toggle) + `MIN_SPLIT_WIDTH` auto-hide; `sync_context` for the read path |
+| Change open-in-Obsidian behavior | `crates/taski-tui/src/lib.rs`: `obsidian_url`/`percent_encode_query` (pure URL builder + encoder), `open_in_obsidian` (spawn helper), `run_loop` `o` key; `crates/taski-config/src/lib.rs`: `obsidian_vault`/`use_advanced_uri` fields; ADR-0015 |
 | Add/change vault directory exclusions | Add `exclude_dirs` to `~/.config/taski/config.toml`; restart daemon. Purge happens on startup — see `delete_tasks_for_excluded_dirs` in `taski-db`, `should_exclude_entry`/`path_matches_exclude` in `taski-daemon` |
 | Change undo behavior | `taski-tui/src/lib.rs` `submit_undo` (enqueues the reverse via `db::enqueue_action` for checkbox undo, `db::enqueue_bullet_toggle` for bullet undo, or `db::enqueue_quick_add_undo` for quick-add undo — `LastAction::QuickAdd` arm); daemon dispatches to `process_action` / `process_bullet_action` / `process_quick_add_undo` like other action types |
 | Change quick-add behavior | `crates/taski-tui/src/lib.rs`: `start_quick_add`/`submit_quick_add`/`clear_quick_add`, `run_loop` `a` key + `quick_adding` branch; `crates/taski-daemon/src/lib.rs`: `process_quick_add`/`process_quick_add_undo`; ADR-0014 |
@@ -681,6 +715,12 @@ A holistic review triaged these as low-value for a personal single-user tool. Th
   idempotent (ADR-0011).
 - **External change detection for undo** — undo only reverses the last TUI action, not
   external vault edits. Detecting external edits to offer "revert" is a separate problem.
+- **Cross-platform `o` (open-in-Obsidian) launcher** — the `o` gesture uses macOS `open(1)`
+  (ADR-0015). Linux (`xdg-open`) and Windows (`start`) are deferred; note `xdg-open` requires
+  double-encoding of URL parameter values, which the current single-encoder does not produce.
+- **In-TUI failure notice for `o`** — spawn failures currently `tracing::warn!` only; a visible
+  one-line notice (parallel to write-back's `render_failure_notice`) is deferred to avoid
+  conflating local-OS failures with `pending_actions` lifecycle.
 - **Distribution / packaging / GUI / multi-vault / collaboration** — out of MVP scope (PRD §14).
 
 If you pick one up, record the decision and update this list.
@@ -771,3 +811,10 @@ If you pick one up, record the decision and update this list.
 - **ShutdownSignal** — a shared `Arc<AtomicBool>` (`ShutdownSignal` to set, `ShutdownHandle`
   to check) used to cooperatively stop the daemon; in combined mode the TUI's quit hook
   sets it.
+- **Open in Obsidian** — the `o` keybinding that builds an `obsidian://` deep link from the
+  selected task's `note_path` (+ `line_number`) and hands it to macOS `open`, focusing
+  Obsidian at the task's source note. Read-only and TUI-local — no vault mutation, no daemon
+  round-trip (ADR-0015). Native `obsidian://open` by default (opens the file); `use_advanced_uri = true`
+  switches to `obsidian://advanced-uri?…&line=` for exact-line jumping (requires the Advanced
+  URI community plugin). The pure `obsidian_url` builder + hand-rolled `percent_encode_query`
+  encoder live in `taski-tui`. macOS-only (`open`); `xdg-open`/`start` deferred.

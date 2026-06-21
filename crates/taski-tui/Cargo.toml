@@ -12,3 +12,4 @@ crossterm.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 rusqlite.workspace = true
+tracing.workspace = true

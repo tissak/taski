@@ -25,6 +25,16 @@ pub struct Config {
     /// (`a` key) appends to. Defaults to `"task-inbox.md"` via
     /// [`resolve_inbox_path`]. `None` = default.
     pub inbox_path: Option<String>,
+    /// Optional override of the vault name used for `obsidian://` deep links (the
+    /// `o` TUI key). Defaults to the basename of [`Config::vault`]. Set this only
+    /// if the Obsidian-registered vault name differs from the vault folder name.
+    pub obsidian_vault: Option<String>,
+    /// Use the Advanced URI community plugin (`obsidian://advanced-uri`) for the
+    /// `o` TUI gesture so Obsidian jumps to the task's exact line. Requires the
+    /// plugin installed in Obsidian. Default: `false` (uses native
+    /// `obsidian://open`, which opens the file but cannot target a line).
+    #[serde(default)]
+    pub use_advanced_uri: bool,
     /// Directories (relative to vault root) to exclude from scanning and indexing.
     /// Each entry is a path component or nested path, e.g. `["templates"]` or
     /// `["templates", "archive/drafts"]`. Hidden directories (`.obsidian`, `.trash`,
@@ -148,7 +158,17 @@ pub fn template(vault: Option<&str>, db: &str) -> String {
          \n\
          # ADR-0014: inbox note for the quick-add (`a` key) feature. Appends\n\
          # `- [ ] <text> ➕ <today>` here. Defaults to \"task-inbox.md\".\n\
-         # inbox_path = \"task-inbox.md\"\n",
+         # inbox_path = \"task-inbox.md\"\n\
+         \n\
+         # Optional: override the vault name used for `obsidian://` deep links (the `o` TUI key).\n\
+         # Defaults to the basename of `vault`. Set this only if your Obsidian-registered vault\n\
+         # name differs from the vault folder name.\n\
+         # obsidian_vault = \"My Vault Name\"\n\
+         \n\
+         # Use the Advanced URI community plugin (obsidian://advanced-uri) for the `o` gesture so\n\
+         # Obsidian jumps to the task's exact line. Requires the plugin installed in Obsidian.\n\
+         # Default: false (uses native obsidian://open, which opens the file but cannot target a line).\n\
+         use_advanced_uri = false\n",
     )
 }
 
@@ -213,6 +233,8 @@ mod tests {
             db: None,
             exclude_dirs: vec![],
             inbox_path: None,
+            obsidian_vault: None,
+            use_advanced_uri: false,
         };
         let v = resolve_vault(Some("/from/cli"), &cfg).expect("ok");
         assert_eq!(v, PathBuf::from("/from/cli"));
@@ -225,6 +247,8 @@ mod tests {
             db: None,
             exclude_dirs: vec![],
             inbox_path: None,
+            obsidian_vault: None,
+            use_advanced_uri: false,
         };
         let v = resolve_vault(None, &cfg).expect("ok");
         assert_eq!(v, PathBuf::from("/from/config"));
@@ -246,6 +270,8 @@ mod tests {
             db: Some("/from/config.db".into()),
             exclude_dirs: vec![],
             inbox_path: None,
+            obsidian_vault: None,
+            use_advanced_uri: false,
         };
         assert_eq!(
             resolve_db(Some("/from/cli.db"), &cfg),
@@ -260,6 +286,8 @@ mod tests {
             db: Some("/from/config.db".into()),
             exclude_dirs: vec![],
             inbox_path: None,
+            obsidian_vault: None,
+            use_advanced_uri: false,
         };
         assert_eq!(resolve_db(None, &cfg), PathBuf::from("/from/config.db"));
     }
@@ -284,6 +312,41 @@ mod tests {
     #[test]
     fn resolve_inbox_path_defaults_when_unset() {
         assert_eq!(resolve_inbox_path(&Config::default()), "task-inbox.md");
+    }
+
+    #[test]
+    fn obsidian_fields_deserialize_when_set() {
+        let f = write_temp(
+            "vault = \"/tmp/v\"\nuse_advanced_uri = true\nobsidian_vault = \"My Vault\"\n",
+        );
+        let cfg = load_from(f.path()).expect("parse");
+        assert_eq!(cfg.obsidian_vault.as_deref(), Some("My Vault"));
+        assert!(cfg.use_advanced_uri);
+    }
+
+    #[test]
+    fn obsidian_fields_default_when_absent() {
+        let f = write_temp("vault = \"/tmp/v\"\n");
+        let cfg = load_from(f.path()).expect("parse");
+        assert!(cfg.obsidian_vault.is_none());
+        assert!(!cfg.use_advanced_uri);
+        // Also confirm the derived `Default` impl matches.
+        assert!(Config::default().obsidian_vault.is_none());
+        assert!(!Config::default().use_advanced_uri);
+    }
+
+    #[test]
+    fn template_round_trip_handles_obsidian_fields() {
+        // `use_advanced_uri = false` is an active key in the template; the
+        // commented `obsidian_vault` must stay absent from the parsed Config.
+        let body = template(Some("/tmp/myvault"), "/tmp/taski.db");
+        let f = write_temp(&body);
+        let cfg = load_from(f.path()).expect("template should parse");
+        assert!(!cfg.use_advanced_uri);
+        assert!(cfg.obsidian_vault.is_none());
+        // And the template body should document both new fields.
+        assert!(body.contains("obsidian_vault"));
+        assert!(body.contains("use_advanced_uri = false"));
     }
 
     /// `config_path_from` honors a set `TASKI_CONFIG`, ignores an empty value, and

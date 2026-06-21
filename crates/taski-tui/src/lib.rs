@@ -24,7 +24,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
 use rusqlite::Connection;
 
@@ -107,6 +107,21 @@ fn run_inner(db_override: Option<PathBuf>, quit_hook: Option<QuitHook>) -> Resul
     // ADR-0014: resolve the inbox path once (config → default) and thread it
     // into the loop so the `a` key modal knows where to enqueue the write.
     let inbox_path = taski_config::resolve_inbox_path(&cfg);
+    // Open-in-Obsidian (`o` key): resolve the vault name for `obsidian://` deep
+    // links. An explicit `obsidian_vault` override wins; otherwise derive it from
+    // the resolved vault path's basename. If no vault is configured at all this is
+    // a graceful `None` (the `o` gesture becomes a logged no-op — the TUI still
+    // works as a read-only browser). `use_advanced_uri` flows straight from config.
+    let vault_name = if let Some(name) = cfg.obsidian_vault.as_deref() {
+        Some(name.to_string())
+    } else {
+        taski_config::resolve_vault(None, &cfg).ok().and_then(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+        })
+    };
+    let use_advanced_uri = cfg.use_advanced_uri;
 
     // Restore the terminal even if a panic occurs mid-render.
     let original_hook = std::panic::take_hook();
@@ -120,7 +135,14 @@ fn run_inner(db_override: Option<PathBuf>, quit_hook: Option<QuitHook>) -> Resul
     let conn = db::open(&db_path.to_string_lossy()).context("opening taski database")?;
 
     let mut terminal = enter_terminal()?;
-    let result = run_loop(&mut terminal, &conn, quit_hook.as_ref(), &inbox_path);
+    let result = run_loop(
+        &mut terminal,
+        &conn,
+        quit_hook.as_ref(),
+        &inbox_path,
+        vault_name.as_deref(),
+        use_advanced_uri,
+    );
     restore_terminal()?;
     result
 }
@@ -155,6 +177,38 @@ fn today_string() -> String {
     // `ymd_from_unix` is re-exported by `taski-db` so the TUI takes no direct
     // `taski-core` dependency (the established re-export pattern).
     db::ymd_from_unix(secs)
+}
+
+/// Percent-encode a string for use as a query parameter value in an `obsidian://`
+/// URL. Uses RFC 3986 component encoding: unreserved chars (`A-Za-z0-9-._~`) are
+/// kept; all other bytes are `%XX`-encoded (UTF-8 for non-ASCII). Critically this
+/// encodes `/` as `%2F` and space as `%20`, as required by Obsidian's URL scheme.
+fn percent_encode_query(s: &str) -> String {
+    const UNRESERVED: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if UNRESERVED.contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Build an `obsidian://` deep-link URL for a task's location.
+/// - `advanced == false`: native `obsidian://open?vault=<v>&file=<f>` (opens the
+///   file; no line targeting).
+/// - `advanced == true`: `obsidian://advanced-uri?vault=<v>&filepath=<f>&line=<n>`
+///   (jumps to the line; requires the Advanced URI community plugin).
+fn obsidian_url(vault: &str, note_path: &str, line: usize, advanced: bool) -> String {
+    let v = percent_encode_query(vault);
+    let f = percent_encode_query(note_path);
+    if advanced {
+        format!("obsidian://advanced-uri?vault={v}&filepath={f}&line={line}")
+    } else {
+        format!("obsidian://open?vault={v}&file={f}")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -576,6 +630,14 @@ struct App {
     /// `run_inner` via `taski_config::resolve_inbox_path`. Defaults to
     /// `"task-inbox.md"` for tests that construct `App::new()` directly.
     inbox_path: String,
+    /// The Obsidian vault name used for `obsidian://` deep links (the `o` key).
+    /// `None` when no vault is resolvable from config (the `o` gesture is then a
+    /// logged no-op). Threaded from `run_inner`; defaults to `None` for tests.
+    vault_name: Option<String>,
+    /// Whether the `o` gesture uses the Advanced URI plugin (`obsidian://advanced-uri`
+    /// with `&line=<n>`) instead of the native `obsidian://open`. Threaded from
+    /// `run_inner` via `Config::use_advanced_uri`; defaults to `false` for tests.
+    use_advanced_uri: bool,
     /// ADR-0011: the last enqueued write action, for undo (`u` key).
     last_action: Option<LastAction>,
     /// Grouping axis cycled with `G` (Note → Tag → Priority → Folder). Defaults
@@ -583,6 +645,12 @@ struct App {
     /// switching axes naturally starts every group collapsed (old keys won't
     /// match the new axis's labels) without needing to clear the set.
     group_by: GroupBy,
+    /// Whether the floating "Keybindings" help overlay (`?`) is open. Modal:
+    /// while true, [`run_loop`] intercepts keys before normal-mode dispatch —
+    /// `?`/`Esc`/`q` dismiss it (notably `q` does NOT quit while help is open),
+    /// `Ctrl-C` still quits (the emergency exit), and every other key is
+    /// swallowed so nothing fires while the user is reading.
+    show_help: bool,
 }
 
 /// ADR-0011: information needed to reverse the last write action.
@@ -632,8 +700,11 @@ impl App {
             quick_adding: false,
             quick_add_query: String::new(),
             inbox_path: "task-inbox.md".to_string(),
+            vault_name: None,
+            use_advanced_uri: false,
             last_action: None,
             group_by: GroupBy::Note,
+            show_help: false,
         }
     }
 
@@ -974,6 +1045,13 @@ impl App {
         self.pane_visible = !self.pane_visible;
     }
 
+    /// `?`: toggle the floating keybindings help overlay. The overlay is modal —
+    /// see [`run_loop`] for the dismissal semantics (`?`/`Esc`/`q` close it,
+    /// `Ctrl-C` still quits, other keys are swallowed).
+    fn toggle_help(&mut self) {
+        self.show_help = !self.show_help;
+    }
+
     /// The task under the cursor, if the cursor is on a task row (never a header).
     fn selected_task(&self) -> Option<&Task> {
         let idx = self.state.selected()?;
@@ -1203,11 +1281,17 @@ fn run_loop(
     conn: &Connection,
     quit_hook: Option<&QuitHook>,
     inbox_path: &str,
+    vault_name: Option<&str>,
+    use_advanced_uri: bool,
 ) -> Result<()> {
     let mut app = App::new();
     // ADR-0014: thread the resolved inbox path from `run_inner` (which read
     // `Config`). `App::new()` defaults to `"task-inbox.md"` for tests.
     app.inbox_path = inbox_path.to_string();
+    // Open-in-Obsidian (`o` key): thread the resolved vault name + advanced-uri
+    // flag from `run_inner`. `App::new()` defaults to `None` / `false` for tests.
+    app.vault_name = vault_name.map(|s| s.to_string());
+    app.use_advanced_uri = use_advanced_uri;
     // `None` => never refreshed yet, so the first iteration reads immediately.
     let mut last_refresh: Option<Instant> = None;
 
@@ -1264,6 +1348,22 @@ fn run_loop(
                 KeyCode::Backspace => app.pop_quick_add_char(),
                 KeyCode::Char(c) => app.push_quick_add_char(c),
                 _ => {}
+            }
+        } else if app.show_help {
+            // Help overlay is MODAL: it intercepts keys before normal-mode
+            // dispatch. `?`/`Esc`/`q` close it and do nothing else — notably
+            // `q` does NOT quit while help is open (avoids accidental quit
+            // while reading). `Ctrl-C` stays the emergency exit and quits from
+            // any state. Every other key is swallowed so nothing fires while
+            // the user is reading.
+            if ctrl && key.code == KeyCode::Char('c') {
+                if let Some(hook) = quit_hook {
+                    hook();
+                }
+                return Ok(());
+            }
+            if help_dismisses_on(key.code) {
+                app.show_help = false;
             }
         } else {
             match key.code {
@@ -1328,6 +1428,14 @@ fn run_loop(
                 KeyCode::Char('J') => app.scroll_context(1),
                 KeyCode::Char('K') => app.scroll_context(-1),
                 KeyCode::Char('p') => app.toggle_pane(),
+                // Open the selected task in Obsidian via an `obsidian://` deep link
+                // (read-only and TUI-local — no vault mutation, no daemon involvement).
+                // Suppressed during any search/quick-add prompt: `o` there builds the
+                // query string in the prompt-specific arms above, exactly like `b`/`a`.
+                KeyCode::Char('o') => open_in_obsidian(&app),
+                // `?` toggles the floating keybindings help overlay. Suppressed
+                // during any search/quick-add prompt (there `?` builds the query).
+                KeyCode::Char('?') => app.toggle_help(),
                 _ => {}
             }
         }
@@ -1335,6 +1443,37 @@ fn run_loop(
         // After any selection change, load the newly-selected note's content if the
         // selection moved to a different note (refreshes already force a re-read).
         app.sync_context(conn, false);
+    }
+}
+
+/// Build an `obsidian://` URL for the selected task and hand it to macOS `open`.
+/// Read-only and TUI-local: no vault mutation, no daemon involvement. Best-effort;
+/// logs a `tracing::warn!` if the spawn fails (e.g. `open` missing) or if no vault
+/// name is configured. Borrows `App` immutably — this gesture mutates nothing.
+fn open_in_obsidian(app: &App) {
+    let Some(vault) = app.vault_name.as_deref() else {
+        tracing::warn!("open-in-obsidian: vault name unknown (no vault in config); skipping");
+        return;
+    };
+    let Some(task) = app.selected_task() else {
+        return; // nothing selected — silent no-op
+    };
+    let url = obsidian_url(
+        vault,
+        &task.note_path,
+        task.line_number,
+        app.use_advanced_uri,
+    );
+    match std::process::Command::new("open")
+        .arg(&url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, url = %url, "open-in-obsidian: failed to spawn `open`")
+        }
     }
 }
 
@@ -1721,6 +1860,11 @@ fn draw(frame: &mut Frame, app: &mut App) {
         ]))
         .style(Style::new())
     } else {
+        // Trimmed cheat-sheet: just the most-used gestures + the `? help`
+        // affordance. The FULL keybinding list lives in the floating overlay
+        // opened by `?` (see [`help_popup`]). Same yellow-keycap/DIM styling as
+        // before so it reads as native; the footer's job is now "most common +
+        // discover `?`", not "full list".
         Paragraph::new(Line::from(vec![
             Span::raw(" "),
             Span::styled("j/k", Style::default().fg(Color::Yellow)),
@@ -1728,41 +1872,28 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Span::styled("Space", Style::default().fg(Color::Yellow)),
             Span::raw(" toggle  ·  "),
             Span::styled("Enter", Style::default().fg(Color::Yellow)),
-            Span::raw(" fold group  ·  "),
-            Span::styled("←/→", Style::default().fg(Color::Yellow)),
-            Span::raw(" collapse/expand  ·  "),
+            Span::raw(" fold  ·  "),
             Span::styled("f", Style::default().fg(Color::Yellow)),
             Span::raw(" filter  ·  "),
-            Span::styled("G", Style::default().fg(Color::Yellow)),
-            Span::raw(" group by  ·  "),
-            Span::styled("T", Style::default().fg(Color::Yellow)),
-            Span::raw(" today  ·  "),
-            Span::styled("O", Style::default().fg(Color::Yellow)),
-            Span::raw(" overdue  ·  "),
-            Span::styled("t", Style::default().fg(Color::Yellow)),
-            Span::raw(" mark today  ·  "),
-            Span::styled("b", Style::default().fg(Color::Yellow)),
-            Span::raw(" bullet  ·  "),
-            Span::styled("u", Style::default().fg(Color::Yellow)),
-            Span::raw(" undo  ·  "),
-            Span::styled("a", Style::default().fg(Color::Yellow)),
-            Span::raw(" quick-add  ·  "),
             Span::styled("/", Style::default().fg(Color::Yellow)),
             Span::raw(" search  ·  "),
-            Span::styled("F", Style::default().fg(Color::Yellow)),
-            Span::raw(" file search  ·  "),
-            Span::styled("Tab/⇧Tab", Style::default().fg(Color::Yellow)),
-            Span::raw(" expand/collapse all  ·  "),
-            Span::styled("J/K", Style::default().fg(Color::Yellow)),
-            Span::raw(" scroll context  ·  "),
-            Span::styled("p", Style::default().fg(Color::Yellow)),
-            Span::raw(" toggle pane  ·  "),
+            Span::styled("?", Style::default().fg(Color::Yellow)),
+            Span::raw(" help  ·  "),
             Span::styled("q", Style::default().fg(Color::Yellow)),
             Span::raw(" quit "),
         ]))
         .style(Style::new().add_modifier(Modifier::DIM))
     };
     frame.render_widget(footer, footer_area);
+
+    // The help overlay is rendered LAST so it floats on top of everything else
+    // (list, notice, footer). `Clear` wipes the cells beneath so the popup's
+    // block reads cleanly against the underlying UI rather than blending into it.
+    if app.show_help {
+        let popup = popup_area(area, 70, 90);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(help_popup(), popup);
+    }
 }
 
 /// Render one display row as a list item. Group headers are bold with a cyan
@@ -1977,6 +2108,116 @@ fn draw_context_pane(
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// Whether `key` is one of the help-overlay dismissal keys (`?`, `Esc`, `q`).
+/// Used by [`run_loop`] to decide when to close the modal help overlay. Kept as
+/// a pure free function so the dismissal set is unit-testable in isolation from
+/// the quit path (`Ctrl-C` is handled separately — it always remains able to
+/// quit the app, never a dismissal key).
+fn help_dismisses_on(key: KeyCode) -> bool {
+    matches!(key, KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q'))
+}
+
+/// Centered popup `Rect` for floating overlays. `percent_x` / `percent_y` are
+/// the popup's width / height as a percentage (0–100) of `area`; the rect is
+/// centered on both axes. The well-known ratatui idiom: split the area into
+/// [margin | content | margin] on each axis and take the middle chunk.
+fn popup_area(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
+    let vertical = Layout::vertical([
+        Constraint::Percentage((100 - percent_y) / 2),
+        Constraint::Percentage(percent_y),
+        Constraint::Percentage((100 - percent_y) / 2),
+    ])
+    .split(area);
+    Layout::horizontal([
+        Constraint::Percentage((100 - percent_x) / 2),
+        Constraint::Percentage(percent_x),
+        Constraint::Percentage((100 - percent_x) / 2),
+    ])
+    .split(vertical[1])[1]
+}
+
+/// The floating keybindings help overlay: a bordered `Paragraph` titled
+/// "Keybindings" holding the full key list, grouped under bold cyan headers.
+/// Two aligned columns — yellow keycap (left, padded to [`HELP_KEY_W`]
+/// columns) and a raw description (right) — reusing the footer's visual
+/// language so the overlay feels native. A blank line separates groups, and a
+/// dim hint line at the bottom reminds the user how to dismiss. The keycap and
+/// description wording is fixed copy.
+fn help_popup() -> Paragraph<'static> {
+    /// Fixed column width (in chars) the keycap is left-padded to so the
+    /// descriptions align into a clean right column. Wide enough for the longest
+    /// keycap (`q / Esc / Ctrl-C`). Note: padding is by char count, so
+    /// ambiguous-width glyphs (arrows, ⇧) may drift a column on terminals that
+    /// render them 2-wide — acceptable for a personal TUI.
+    const HELP_KEY_W: usize = 16;
+
+    // Yellow keycap, padded to the fixed column width (matches the footer).
+    let key = |k: &'static str| {
+        Span::styled(
+            format!("{k:<w$}", w = HELP_KEY_W),
+            Style::default().fg(Color::Yellow),
+        )
+    };
+    // Bold cyan group header — a distinct color from the yellow keycaps so the
+    // eye can scan groups quickly.
+    let head = |h: &'static str| {
+        Line::from(vec![Span::styled(
+            h,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )])
+    };
+    // One aligned key/description row: leading indent, padded keycap, gap, desc.
+    let row = |k: &'static str, d: &'static str| {
+        Line::from(vec![Span::raw(" "), key(k), Span::raw("  "), Span::raw(d)])
+    };
+
+    let lines = vec![
+        head("Navigation"),
+        row("j/k ↑/↓", "Move selection up/down"),
+        row("Enter", "Fold group / fold sub-tasks"),
+        row("←/→", "Collapse / expand group"),
+        row("Tab / ⇧Tab", "Expand all / collapse all groups"),
+        row("J / K", "Scroll context pane"),
+        Line::raw(""),
+        head("Filter & view"),
+        row("f", "Cycle status filter (All / Open / Done)"),
+        row("T", "Today view (scheduled == today)"),
+        row("O", "Overdue view (due < today)"),
+        row("G", "Cycle group-by (note / tag / priority / folder)"),
+        row("p", "Toggle context pane"),
+        Line::raw(""),
+        head("Task actions"),
+        row("Space", "Toggle open ↔ done (stamps ✅)"),
+        row("t", "Mark / unmark for today (⏳)"),
+        row("b", "Toggle checkbox ↔ bullet"),
+        row("d", "Cancel / un-cancel (stamps ❌)"),
+        row("u", "Undo last flip / bullet / quick-add"),
+        row("a", "Quick-add to inbox"),
+        row("o", "Open in Obsidian"),
+        Line::raw(""),
+        head("Search"),
+        row("/", "Text search (task body)"),
+        row("F", "File / path search"),
+        Line::raw(""),
+        head("Other"),
+        row("?", "Toggle this help"),
+        row("q / Esc / Ctrl-C", "Quit"),
+        Line::raw(""),
+        Line::from(vec![Span::styled(
+            " ? / Esc / q to close",
+            Style::default().add_modifier(Modifier::DIM),
+        )]),
+    ];
+
+    Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Keybindings "),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2043,6 +2284,37 @@ mod tests {
             } => (group_key, *open_count, *total_count, *collapsed),
             _ => panic!("expected a header row"),
         }
+    }
+
+    #[test]
+    fn obsidian_url_native_mode() {
+        assert_eq!(
+            obsidian_url("My Vault", "Inbox/note.md", 5, false),
+            "obsidian://open?vault=My%20Vault&file=Inbox%2Fnote.md"
+        );
+    }
+
+    #[test]
+    fn obsidian_url_advanced_mode() {
+        assert_eq!(
+            obsidian_url("My Vault", "Inbox/note.md", 5, true),
+            "obsidian://advanced-uri?vault=My%20Vault&filepath=Inbox%2Fnote.md&line=5"
+        );
+    }
+
+    #[test]
+    fn percent_encode_query_special_chars() {
+        // Space -> %20, `/` -> %2F, `#` -> %23, `^` -> %5E, `é` -> %C3%A9 (UTF-8).
+        assert_eq!(
+            percent_encode_query("No#te^naïve.md"),
+            "No%23te%5Ena%C3%AFve.md"
+        );
+    }
+
+    #[test]
+    fn obsidian_url_minimal_well_formed() {
+        let url = obsidian_url("v", "f.md", 1, false);
+        assert_eq!(url, "obsidian://open?vault=v&file=f.md");
     }
 
     /// The data path the live loop relies on: a held `all_tasks` query reflects
@@ -4741,5 +5013,79 @@ mod tests {
         // Only "High" group matches the search.
         assert_eq!(rows.len(), 1);
         assert_eq!(header(&rows[0]).0, "High");
+    }
+
+    // --- `?` keybindings help overlay -------------------------------------
+
+    /// `toggle_help` flips the `show_help` flag (mirrors how `toggle_pane` /
+    /// `toggle_today` are unit-tested).
+    #[test]
+    fn toggle_help_flips_flag() {
+        let mut app = App::new();
+        assert!(!app.show_help, "help is hidden by default");
+        app.toggle_help();
+        assert!(app.show_help);
+        app.toggle_help();
+        assert!(!app.show_help, "toggling again hides it");
+    }
+
+    /// The help-overlay dismissal set is exactly `?`, `Esc`, `q` — and NOT
+    /// arbitrary other keys (those are swallowed while help is open). This is
+    /// the pure decision function [`run_loop`] consults; Ctrl-C is handled
+    /// separately (it quits) and is correctly NOT a dismissal key here.
+    #[test]
+    fn help_dismiss_keys() {
+        assert!(help_dismisses_on(KeyCode::Char('?')));
+        assert!(help_dismisses_on(KeyCode::Esc));
+        assert!(help_dismisses_on(KeyCode::Char('q')));
+        // Non-dismiss keys are swallowed (do NOT close help).
+        assert!(!help_dismisses_on(KeyCode::Char('j')));
+        assert!(!help_dismisses_on(KeyCode::Char(' ')));
+        assert!(!help_dismisses_on(KeyCode::Enter));
+        assert!(
+            !help_dismisses_on(KeyCode::Char('c')),
+            "Ctrl-C quits, not dismisses"
+        );
+    }
+
+    /// Headless render smoke (TestBackend): with `show_help` on, `draw` renders
+    /// the floating "Keybindings" overlay ON TOP of everything else (mirrors
+    /// the `draw_renders_context_pane_without_panic` style). Proves the popup
+    /// block title and at least one keycap land in the buffer without panicking.
+    #[test]
+    fn draw_renders_help_overlay_when_show_help() {
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new();
+        app.show_help = true;
+
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        // Must not panic.
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(
+            rendered.contains("Keybindings"),
+            "the help overlay title should render on top"
+        );
+        assert!(
+            rendered.contains("Space"),
+            "a keycap from the key list should render"
+        );
+        assert!(
+            rendered.contains("Navigation"),
+            "a group header should render"
+        );
+        assert!(
+            rendered.contains("to close"),
+            "the dim dismissal hint should render"
+        );
     }
 }
