@@ -1,6 +1,6 @@
 # Taski — Engineering Context & Onboarding
 
-*Onboarding guide for new engineers. Last updated: 2026-06-21 (post-v0.4 — adds Tier 1 metadata parsing [tags, priority, start/created/done/cancelled dates, schema v6], Tier 2 views [overdue `O`, group-by cycling `G`], the `✅` done-date stamp on toggle [ADR-0012], the `❌` cancelled-date stamp on cancel [ADR-0013], the `➕` quick-add inbox creation [ADR-0014], the `o` open-in-Obsidian deep-link gesture [ADR-0015], and the `i` in-progress toggle gesture [ADR-0016]; 322 tests across 6 crates).*
+*Onboarding guide for new engineers. Last updated: 2026-06-21 (post-v0.4 — adds Tier 1 metadata parsing [tags, priority, start/created/done/cancelled dates, schema v6], Tier 2 views [overdue `O`, group-by cycling `G`], the `✅` done-date stamp on toggle [ADR-0012], the `❌` cancelled-date stamp on cancel [ADR-0013], the `➕` quick-add inbox creation [ADR-0014], the `o` open-in-Obsidian deep-link gesture [ADR-0015], and the `i` in-progress toggle gesture [ADR-0016]; 323 tests across 6 crates).*
 
 This document is the "operating manual" for working on Taski: what it is, how it's
 built, the decisions that are load-bearing (and must not be casually undone), and the
@@ -204,7 +204,7 @@ filter can only reduce the visible set:
 
 | Axis | Gesture | Scope |
 |---|---|---|
-| Status cycle | `f` | `All` → `Open` → `Done` → `All` |
+| Status cycle | `f` | `All` → `Open` → `Done` → `All`. `Open` = active (not-done) tasks — both `Open` and `InProgress` show alongside each other and count toward the open/total counts (ADR-0016 follow-on); `Done`/other states appear only under `All` |
 | Today view | `T` | Tasks whose `scheduled_date == today` |
 | Overdue view | `O` | Tasks whose `due_date` is set and `< today` (purely date-based; composes with status — `O`+Open = open past-due, `O`+Done = completed-was-overdue) |
 | Text search | `/` | Case-insensitive substring of `task.text` |
@@ -256,7 +256,7 @@ filter predicates within each bucket and emits `Header` + `Task` rows.
 | `Enter` | Toggle group expand/collapse on header; fold sub-tasks on task |
 | `←` / `→` | Collapse / expand group at cursor |
 | `Tab` / `⇧Tab` | Expand all / collapse all groups |
-| `f` | Cycle status filter: All → Open → Done → All |
+| `f` | Cycle status filter: All → Open → Done → All (`Open` shows active/not-done tasks — both `Open` and `InProgress`) |
 | `T` | Toggle Today view (tasks scheduled for today) |
 | `O` | Toggle Overdue view (tasks whose `due_date < today`) |
 | `G` | Cycle grouping axis: note → tag → priority → folder → note |

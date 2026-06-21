@@ -215,9 +215,12 @@ fn obsidian_url(vault: &str, note_path: &str, line: usize, advanced: bool) -> St
 // View model: grouping + filtering over the raw task list.
 // ---------------------------------------------------------------------------
 
-/// Status filter cycled with `f`: All -> Open -> Done -> All. `Open` matches only
-/// `Status::Open` (in-progress and other states appear only under `All`) — a
-/// predictable three-state mapping to the labels all / open / done.
+/// Status filter cycled with `f`: All -> Open -> Done -> All. `Open` matches active
+/// (not-done) tasks — both `Status::Open` and `Status::InProgress` — so an
+/// in-progress task shows alongside unstarted ones under the default Open filter.
+/// Done and other states appear only under `All`. This keeps the three-state
+/// mapping (all / open / done) and the open/total counts consistent: an in-progress
+/// task is treated as open for both visibility and counting (see [`is_open_like`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum StatusFilter {
     All,
@@ -229,7 +232,7 @@ impl StatusFilter {
     fn matches(self, status: &Status) -> bool {
         match self {
             StatusFilter::All => true,
-            StatusFilter::Open => matches!(status, Status::Open),
+            StatusFilter::Open => is_open_like(status),
             StatusFilter::Done => matches!(status, Status::Done),
         }
     }
@@ -249,6 +252,16 @@ impl StatusFilter {
             StatusFilter::Done => "done",
         }
     }
+}
+
+/// Whether a task counts as "open" for the `f` status filter and the open/total
+/// counts in group headers and the title bar. Both `Open` and `InProgress` are
+/// active (not-done) states, so an in-progress task shows alongside unstarted ones
+/// under the default Open filter instead of being hidden. `Done` and other states
+/// are excluded. The single predicate keeps the filter, the header counts and the
+/// title count in agreement (ADR-0016 follow-on).
+fn is_open_like(status: &Status) -> bool {
+    matches!(status, Status::Open | Status::InProgress)
 }
 
 /// Grouping axis cycled with `G`: Note → Tag → Priority → Folder → Note. The
@@ -475,7 +488,7 @@ fn build_view(
     for key in &order {
         let bucket = &buckets[index[key]];
         let total_count = bucket.len();
-        let open_count = bucket.iter().filter(|t| t.status == Status::Open).count();
+        let open_count = bucket.iter().filter(|t| is_open_like(&t.status)).count();
         let visible: Vec<&Task> = bucket
             .iter()
             .copied()
@@ -1758,11 +1771,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         (list_area, None)
     };
 
-    let open_total = app
-        .tasks
-        .iter()
-        .filter(|t| t.status == Status::Open)
-        .count();
+    let open_total = app.tasks.iter().filter(|t| is_open_like(&t.status)).count();
     let total = app.tasks.len();
     let notes = app
         .rows
@@ -2559,6 +2568,52 @@ mod tests {
         // Only alpha has an open task; beta is hidden under the Open filter.
         assert_eq!(rows.len(), 1);
         assert_eq!(header(&rows[0]).0, "alpha.md");
+    }
+
+    /// ADR-0016 follow-on: the `Open` status filter treats in-progress as active
+    /// (not-done), so an in-progress task stays visible under Open (it is not
+    /// pushed to `All` only) and counts toward the group's open count. A done-only
+    /// group is still hidden under Open.
+    #[test]
+    fn build_view_open_filter_includes_in_progress() {
+        let expanded = HashSet::new();
+
+        // A group whose only task is in-progress stays visible under Open, and its
+        // open count reflects it.
+        let in_progress = vec![task(1, "/", 1, "alpha.md")];
+        let rows = build_view(
+            &in_progress,
+            StatusFilter::Open,
+            &expanded,
+            false,
+            "",
+            "",
+            "",
+            false,
+            GroupBy::Note,
+        );
+        assert!(
+            !rows.is_empty(),
+            "in-progress task is visible under Open filter"
+        );
+        let h = header(&rows[0]);
+        assert_eq!(h.1, 1, "open_count includes the in-progress task");
+        assert_eq!(h.2, 1);
+
+        // A group with only a done task is still hidden under Open.
+        let done = vec![task(2, "x", 1, "alpha.md")];
+        let rows = build_view(
+            &done,
+            StatusFilter::Open,
+            &expanded,
+            false,
+            "",
+            "",
+            "",
+            false,
+            GroupBy::Note,
+        );
+        assert!(rows.is_empty(), "done-only group is hidden under Open");
     }
 
     /// The due-date column flows through to the task row data (rendered separately).
