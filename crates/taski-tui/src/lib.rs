@@ -1160,6 +1160,37 @@ impl App {
         self.track_enqueued(result);
     }
 
+    /// `i` (ADR-0016): toggle the selected task's in-progress state — the
+    /// third checkbox-flip sibling alongside `Space` (done, ADR-0003/0012) and
+    /// `d` (cancelled, ADR-0013). Reuses the `checkbox` action_type and the
+    /// [`LastAction::CheckboxToggle`] variant (in-progress IS a checkbox flip
+    /// with `new_char = "/"`), so undo-of-in-progress is free: `u` already
+    /// reverses checkbox flips. The daemon's `process_action_at` skips the
+    /// `✅`/`❌` stamp oracles for in-progress flips (ADR-0012/0013 — leave
+    /// dated stamps untouched). The actual vault write is the daemon's job via
+    /// [`enqueue_in_progress`]; the TUI never touches files directly.
+    fn submit_in_progress(&mut self, conn: &Connection) {
+        let (result, last_action) = {
+            let Some(task) = self.selected_task() else {
+                return;
+            };
+            let new_char = in_progress_target_char(&task.raw_checkbox_char);
+            let action = LastAction::CheckboxToggle {
+                task_id: task.id,
+                note_path: task.note_path.clone(),
+                line_number: task.line_number,
+                expected_char: task.raw_checkbox_char.clone(),
+                new_char: new_char.to_string(),
+            };
+            (enqueue_in_progress(conn, task), Some(action))
+        };
+        // S4: only record an undoable action if the enqueue actually succeeded.
+        if result.is_ok() {
+            self.last_action = last_action;
+        }
+        self.track_enqueued(result);
+    }
+
     /// `b` (ADR-0011): toggle the selected task between checkbox and bullet format.
     /// If the line has a checkbox (`- [ ] text` / `- [x] text`), it becomes a plain
     /// bullet (`- text`). If it's already a bullet, it becomes an open checkbox
@@ -1412,6 +1443,14 @@ fn run_loop(
                 // `d` falls through to `push_search_char` in the search arms above,
                 // exactly like `b`.
                 KeyCode::Char('d') => app.submit_cancel(conn),
+                // ADR-0016: `i` marks the selected task in-progress (`- [ ]` →
+                // `- [/]`), the third checkbox-flip sibling alongside `Space`
+                // (done) and `d` (cancelled). Reuses the checkbox action_type;
+                // the daemon skips the ✅/❌ stamp oracles for in-progress flips
+                // (ADR-0012/0013 — leave dated stamps untouched). Suppressed
+                // during a search prompt — `i` falls through to `push_search_char`
+                // in the search arms above, exactly like `b`/`d`/`a`/`t`.
+                KeyCode::Char('i') => app.submit_in_progress(conn),
                 // ADR-0010 text search: `/` opens the search prompt.
                 KeyCode::Char('/') => app.start_search(),
                 // ADR-0010 file search: `F` opens the file/path search prompt.
@@ -1500,6 +1539,19 @@ fn cancel_target_char(raw: &str) -> &'static str {
     }
 }
 
+/// Decide the desired checkbox char for an IN-PROGRESS gesture (ADR-0016) of
+/// `raw`: in-progress (`"/"`) -> open (`" "`); anything else (open, done,
+/// cancelled, forwarded, …) -> in-progress (`"/"`). This is the in-progress
+/// sibling of [`cancel_target_char`]: pressing `i` always targets the
+/// in-progress state unless the task is already in-progress, in which case `i`
+/// re-opens it.
+fn in_progress_target_char(raw: &str) -> &'static str {
+    match raw {
+        "/" => " ",
+        _ => "/",
+    }
+}
+
 /// Enqueue a checkbox-flip request for `task` into the shared `pending_actions`
 /// table. Non-blocking: just inserts a row; the daemon applies it. Returns the new
 /// row id so the caller can track its resolution across refreshes.
@@ -1535,6 +1587,28 @@ fn enqueue_cancel(conn: &Connection, task: &Task) -> Result<i64> {
         new_char,
     )
     .context("enqueuing cancel action")?;
+    Ok(id)
+}
+
+/// Enqueue an in-progress-flip request (ADR-0016) for `task` into the shared
+/// `pending_actions` table. This reuses the existing `checkbox` action type —
+/// in-progress IS a checkbox flip with `new_char = "/"` (the Obsidian
+/// in-progress char). No new action_type, no schema change. The daemon's
+/// `process_action_at` skips the `✅`/`❌` stamp oracles for in-progress flips
+/// (per ADR-0012/0013 — ambiguous, do not guess), so only the checkbox char
+/// changes. Non-blocking: just inserts a row; the daemon applies it. Returns
+/// the new row id so the caller can track its resolution across refreshes.
+fn enqueue_in_progress(conn: &Connection, task: &Task) -> Result<i64> {
+    let new_char = in_progress_target_char(&task.raw_checkbox_char);
+    let id = db::enqueue_action(
+        conn,
+        task.id,
+        &task.note_path,
+        task.line_number,
+        &task.raw_checkbox_char,
+        new_char,
+    )
+    .context("enqueuing in-progress action")?;
     Ok(id)
 }
 
@@ -1631,6 +1705,10 @@ fn render_failure_notice(action: &PendingAction) -> String {
         // so a failed cancel's retry key is `d`, not `Space`. No new action_type
         // or LastAction variant is introduced for this (per ADR-0013).
         _ if action.new_char == "-" => ("Cancel", "d"),
+        // ADR-0016: the in-progress gesture (i key) is also a `checkbox` row,
+        // distinguished by `new_char == "/"`. A failed in-progress flip's retry
+        // key is `i`.
+        _ if action.new_char == "/" => ("Mark in-progress", "i"),
         // ADR-0014: quick-add (a key) and its undo (u key). These carry their
         // own action_types, so they're matched here — not in the checkbox
         // wildcard. A refused quick-add surfaces "Quick add not applied — …
@@ -2193,6 +2271,7 @@ fn help_popup() -> Paragraph<'static> {
         row("t", "Mark / unmark for today (⏳)"),
         row("b", "Toggle checkbox ↔ bullet"),
         row("d", "Cancel / un-cancel (stamps ❌)"),
+        row("i", "Mark in-progress / re-open"),
         row("u", "Undo last flip / bullet / quick-add"),
         row("a", "Quick-add to inbox"),
         row("o", "Open in Obsidian"),
@@ -2964,6 +3043,35 @@ mod tests {
                  render_failure_notice's new_char == \"-\" seam); raw={raw:?}"
             );
         }
+
+        // ADR-0016: document the parallel invariant that makes
+        // `render_failure_notice`'s `new_char == "/"` seam robust:
+        // `toggle_target_char` (the `Space` done-toggle path) NEVER produces
+        // `"/"`. So a failed checkbox action with `new_char == "/"` is
+        // unambiguously an in-progress gesture, never a done-toggle. If this
+        // invariant ever breaks, the failure-notice retry key for a refused
+        // done-toggle would wrongly say "Press i".
+        for raw in [" ", "x", "X", "/", ">", "-", "!", "_"] {
+            assert_ne!(
+                toggle_target_char(raw),
+                "/",
+                "toggle_target_char must never target the in-progress char (would \
+                 break render_failure_notice's new_char == \"/\" seam); raw={raw:?}"
+            );
+        }
+    }
+
+    /// ADR-0016: `i` targets the in-progress char (`/`) from any non-in-progress
+    /// state, and re-opens (` `) an in-progress task. The mirror of
+    /// `cancel_target_char` on the in-progress axis.
+    #[test]
+    fn in_progress_target_char_maps_others_to_in_progress_and_reopens_in_progress() {
+        assert_eq!(in_progress_target_char(" "), "/"); // open -> in-progress
+        assert_eq!(in_progress_target_char("x"), "/"); // done -> in-progress
+        assert_eq!(in_progress_target_char("X"), "/"); // done -> in-progress
+        assert_eq!(in_progress_target_char("-"), "/"); // cancelled -> in-progress
+        assert_eq!(in_progress_target_char(">"), "/"); // forwarded -> in-progress
+        assert_eq!(in_progress_target_char("/"), " "); // in-progress -> re-open
     }
 
     #[test]
@@ -3209,6 +3317,102 @@ mod tests {
         assert!(
             !notice.contains("Space"),
             "cancel notice must NOT hint the done-toggle retry key: {notice}"
+        );
+    }
+
+    /// ADR-0016: `submit_in_progress` enqueues a `checkbox` action row with
+    /// `new_char == "/"` for the cursor task, and records `LastAction::CheckboxToggle`
+    /// so `u` can undo it. Mirrors the DB + App setup used by the cancel enqueue
+    /// path (`failed_cancel_surfaces_cancel_notice` above).
+    #[test]
+    fn submit_in_progress_enqueues_flip_to_in_progress_char() {
+        let conn = db::open(":memory:").unwrap();
+        db::upsert_task(&conn, &task(1, " ", 1, "alpha.md")).unwrap();
+
+        let mut app = App::new();
+        app.filter = StatusFilter::All;
+        app.refresh(&conn).unwrap();
+        app.expanded.insert("alpha.md".to_string());
+        app.rebuild();
+        app.state.select(Some(1)); // on the open task
+        app.submit_in_progress(&conn);
+
+        let pending = db::pending_actions(&conn).unwrap();
+        assert_eq!(pending.len(), 1, "one in-progress action enqueued");
+        let p = &pending[0];
+        assert_eq!(p.task_id, 1);
+        assert_eq!(p.new_char, "/", "in-progress enqueues a flip to '/'");
+        assert_eq!(p.expected_char, " ", "expected_char is the open char");
+        assert_eq!(p.action_type, "checkbox", "reuses the checkbox action_type");
+        assert!(p.error.is_none());
+
+        // The action was tracked for resolution surfacing.
+        assert_eq!(app.pending_session_actions, vec![p.id]);
+
+        // LastAction recorded so `u` can undo it; the new_char is "/".
+        match &app.last_action {
+            Some(LastAction::CheckboxToggle { new_char, .. }) => {
+                assert_eq!(new_char, "/", "undo record carries the in-progress char");
+            }
+            other => panic!("expected CheckboxToggle last_action, got {other:?}"),
+        }
+    }
+
+    /// ADR-0016: a refused in-progress action (a `checkbox` row with
+    /// `new_char='/'`) surfaces a notice worded for the in-progress gesture
+    /// ("Mark in-progress not applied") that hints the `i` retry key (not
+    /// `Space`, not `d`), carrying the plain reason and the note name. Mirrors
+    /// `failed_cancel_surfaces_cancel_notice` assertion-for-assertion.
+    #[test]
+    fn failed_in_progress_surfaces_in_progress_notice() {
+        let conn = db::open(":memory:").unwrap();
+        db::upsert_task(&conn, &task(1, " ", 1, "alpha.md")).unwrap();
+
+        let mut app = App::new();
+        app.filter = StatusFilter::All;
+        app.refresh(&conn).unwrap();
+        app.expanded.insert("alpha.md".to_string());
+        app.rebuild();
+        app.state.select(Some(1)); // on the task
+        app.submit_in_progress(&conn);
+        let pending = db::pending_actions(&conn).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].action_type, "checkbox");
+        assert_eq!(
+            pending[0].new_char, "/",
+            "in-progress enqueues a flip to '/'"
+        );
+
+        // Daemon refuses it: the note changed externally.
+        db::resolve_action(
+            &conn,
+            pending[0].id,
+            "failed",
+            Some("note changed externally since scan; action not applied"),
+        )
+        .unwrap();
+        app.refresh(&conn).unwrap();
+
+        let notice = app
+            .notice
+            .as_deref()
+            .expect("in-progress failure should surface a notice");
+        assert!(
+            notice.starts_with("Mark in-progress not applied"),
+            "in-progress notice should be worded for the in-progress gesture: {notice}"
+        );
+        assert!(notice.contains("alpha.md"), "notice should name the note");
+        assert!(
+            notice.contains("Press i to try again"),
+            "notice should hint the `i` retry key: {notice}"
+        );
+        assert!(
+            !notice.contains("Cancel"),
+            "in-progress notice must NOT carry the cancel wording: {notice}"
+        );
+        assert!(
+            !notice.contains("Space"),
+            "in-progress notice must NOT hint the done-toggle retry key: {notice}"
         );
     }
 

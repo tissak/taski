@@ -1,6 +1,6 @@
 # Taski — Engineering Context & Onboarding
 
-*Onboarding guide for new engineers. Last updated: 2026-06-21 (post-v0.4 — adds Tier 1 metadata parsing [tags, priority, start/created/done/cancelled dates, schema v6], Tier 2 views [overdue `O`, group-by cycling `G`], the `✅` done-date stamp on toggle [ADR-0012], the `❌` cancelled-date stamp on cancel [ADR-0013], the `➕` quick-add inbox creation [ADR-0014], and the `o` open-in-Obsidian deep-link gesture [ADR-0015]; 319 tests across 6 crates).*
+*Onboarding guide for new engineers. Last updated: 2026-06-21 (post-v0.4 — adds Tier 1 metadata parsing [tags, priority, start/created/done/cancelled dates, schema v6], Tier 2 views [overdue `O`, group-by cycling `G`], the `✅` done-date stamp on toggle [ADR-0012], the `❌` cancelled-date stamp on cancel [ADR-0013], the `➕` quick-add inbox creation [ADR-0014], the `o` open-in-Obsidian deep-link gesture [ADR-0015], and the `i` in-progress toggle gesture [ADR-0016]; 322 tests across 6 crates).*
 
 This document is the "operating manual" for working on Taski: what it is, how it's
 built, the decisions that are load-bearing (and must not be casually undone), and the
@@ -263,6 +263,7 @@ filter predicates within each bucket and emits `Header` + `Task` rows.
 | `t` | Mark/unmark selected task for today (writes `⏳ <today>`) |
 | `b` | Toggle selected task between checkbox (`- [ ]`) and bullet (`-`) format |
 | `d` | Cancel selected task (`- [ ]` → `- [-]`, stamps `❌ <today>`; press again to un-cancel) [ADR-0013] |
+| `i` | Mark selected task in-progress (`- [ ]` → `- [/]`; press again to re-open). Leaves any existing `✅`/`❌` stamp untouched [ADR-0016] |
 | `a` | Quick-add: open text-entry modal; type task text, Enter appends `- [ ] <text> ➕ <today>` to the inbox note (`u` to undo) [ADR-0014] |
 | `u` | Undo the last checkbox flip (incl. cancel), bullet toggle, or quick-add action |
 | `/` | Open text search prompt (matches `task.text`, case-insensitive) |
@@ -469,6 +470,17 @@ understanding the failure mode it prevents.**
     failure it `tracing::warn!`s (in-TUI failure notice deferred). macOS-only (`open`); Linux/Windows (`xdg-open`/`start`)
     deferred — note `xdg-open` additionally needs double-encoding of URL values.
 
+16. **In-progress (`/`) toggle gesture** ([ADR-0016](./adr/0016-in-progress-toggle.md)) —
+    The `i` key flips the selected task to the Obsidian in-progress state (`- [ ]` → `- [/]`; press `i` again to
+    re-open). It reuses the `checkbox` action_type with `new_char = '/'` — the exact structural mirror of `d`/cancel
+    (`new_char = '-'`, ADR-0013) and `Space`/done (`new_char = 'x'`). **No new action_type, no schema change, no new
+    `LastAction` variant, no pure oracle, no daemon change, and no ADR-0003 amendment** — in-progress is a checkbox-state
+    flip to a char that was always within the admitted scope; this is the first write-gesture ADR that touches only the
+    TUI. The daemon already had an explicit "other chars (e.g. InProgress `/`) → skip the `✅`/`❌` stamp oracles; only the
+    flip is written" arm (ADR-0012/0013), so a `/` flip leaves any existing `✅`/`❌` stamp untouched (a done task marked
+    in-progress keeps its `✅` — accepted as coherent, not a bug). Undo is free (`u` already reverses checkbox flips). No
+    new proptest — the existing `writeback_proptest` already exercises arbitrary-`new_char` flips.
+
 ---
 
 ## Gotchas & Landmines (read this before you change anything)
@@ -565,8 +577,8 @@ These are the things that aren't obvious from reading the code and will cost you
   literal directory path (and SQL's single-char `_` wildcard makes it hairier). If purge
   silently does nothing, check that the bind value ends with `/%`.
 
-- **Undo scope covers checkbox flips (`Space`, `d`), bullet toggles (`b`), and quick-add (`a` — removes the appended line). Not `t` (mark-for-today).** `u` undoes the
-  last checkbox flip (cancel is a flip to `-`, so it's covered), bullet toggle, or quick-add — not `t`
+- **Undo scope covers checkbox flips (`Space`, `d`, `i`), bullet toggles (`b`), and quick-add (`a` — removes the appended line). Not `t` (mark-for-today).** `u` undoes the
+  last checkbox flip (cancel is a flip to `-` and in-progress to `/`, so both are covered), bullet toggle, or quick-add — not `t`
   (mark-for-today). The `t` gesture is already idempotent (pressing `t` again removes the
   mark), so undo adds little value. This is intentional, not a bug.
 
@@ -658,7 +670,7 @@ exercised only at runtime (its `taski.db` is gitignored).
 | Change write-back behavior | `taski-daemon`: `process_action` (checkbox flips + `✅` stamp, ADR-0012) / `process_metadata_action` (`⏳` writes, ADR-0009), `atomic_write` (mind ADR-0004 TOCTOU); the drain loop dispatches on `pending_actions.action_type` |
 | Change how the TUI looks/behaves | `taski-tui/src/lib.rs`: `App`, `build_view` (filter pipeline), `context_view`/`draw_context_pane`, key handling in `run_loop` |
 | Change the TUI filter composition / grouping | `crates/taski-tui/src/lib.rs:build_view()` — ANDs five filter axes (status + today + overdue + text search + file search) and buckets survivors by the `G` grouping axis (note/tag/priority/folder; HashMap-based, tag fan-out). The 9-param function carries a documented `#[allow(clippy::too_many_arguments)]` (a parameter-struct refactor is deferred). |
-| Change keybindings (add/remove a key) | `crates/taski-tui/src/lib.rs:run_loop()` — handles three branches: `searching`, `file_searching`, and normal mode. `b` / `u` added in ADR-0011; `d` (cancel) added in ADR-0013 |
+| Change keybindings (add/remove a key) | `crates/taski-tui/src/lib.rs:run_loop()` — handles three branches: `searching`, `file_searching`, and normal mode. `b` / `u` added in ADR-0011; `d` (cancel) added in ADR-0013; `i` (in-progress) added in ADR-0016 |
 | Change context-pane keybindings/behavior | `taski-tui/src/lib.rs` key match in `run_loop` (`J`/`K` scroll, `p` toggle) + `MIN_SPLIT_WIDTH` auto-hide; `sync_context` for the read path |
 | Change open-in-Obsidian behavior | `crates/taski-tui/src/lib.rs`: `obsidian_url`/`percent_encode_query` (pure URL builder + encoder), `open_in_obsidian` (spawn helper), `run_loop` `o` key; `crates/taski-config/src/lib.rs`: `obsidian_vault`/`use_advanced_uri` fields; ADR-0015 |
 | Add/change vault directory exclusions | Add `exclude_dirs` to `~/.config/taski/config.toml`; restart daemon. Purge happens on startup — see `delete_tasks_for_excluded_dirs` in `taski-db`, `should_exclude_entry`/`path_matches_exclude` in `taski-daemon` |
@@ -770,10 +782,16 @@ If you pick one up, record the decision and update this list.
   flip. Press `d` again to un-cancel (`[-]` → `[ ]`, clears `❌`). Implemented as a `checkbox`
   action with `new_char='-'` (no new action_type, no schema change), so `u` undo reuses the
   existing checkbox-flip reversal path (ADR-0013).
+- **In-progress toggle** — the `i` keybinding that flips the selected task to the Obsidian
+  in-progress state (`- [ ]` → `- [/]`). Press `i` again to re-open (`[/]` → `[ ]`). Implemented
+  as a `checkbox` action with `new_char='/'` (no new action_type, no schema change, no stamp),
+  mirroring `d`/cancel. The daemon skips the `✅`/`❌` stamp oracles for `/` flips, so a done
+  task marked in-progress keeps its `✅` (and a cancelled task keeps its `❌`) — accepted as
+  coherent. `u` undo reuses the existing checkbox-flip reversal path (ADR-0016).
 - **Bullet toggle** — the `b` keybinding that converts a checkbox task to a plain bullet
   (`- [ ] task` → `- task`) or back. Implemented as `toggle_bullet` action type, routed
   through the same daemon pipeline (ADR-0011).
-- **Undo** — the `u` keybinding that reverses the last checkbox flip (`Space`), bullet
+- **Undo** — the `u` keybinding that reverses the last checkbox flip (`Space`, `d`, `i`), bullet
   toggle (`b`), or quick-add (`a` — removes the appended line). Queues the reverse action
   immediately; the daemon re-verifies current state, so a failed original naturally fails
   the undo too (ADR-0011/0014).

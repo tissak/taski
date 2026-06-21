@@ -69,7 +69,10 @@ fn anchor_char() -> impl Strategy<Value = &'static str> {
 
 /// What the TUI flips the anchor to.
 fn flip_target() -> impl Strategy<Value = &'static str> {
-    prop_oneof![Just("x"), Just(" ")]
+    // `/` (in-progress) exercises the daemon's "other chars → skip the ✅ stamp
+    // oracle" arm (ADR-0012/0016): a char-swap only, no composed stamp. The
+    // reference's `else` branch models this case.
+    prop_oneof![Just("x"), Just(" "), Just("/")]
 }
 
 /// Kinds of concurrent external edits to simulate (L5).
