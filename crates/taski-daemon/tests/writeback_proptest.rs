@@ -1,13 +1,17 @@
-//! 🔑 The integrity guarantee for Taski write-back (ADR-0004 consequence).
+//! 🔑 The integrity guarantee for Taski write-back (ADR-0004 consequence),
+//! amended for ADR-0012 (composed `✅` done-date stamp on Done flips).
 //!
 //! Property: for any generated note and any chance of a concurrent external edit,
-//! `process_action` **never corrupts** the note. Concretely, after processing:
+//! `process_action_at` **never corrupts** the note. Concretely, after processing:
 //!   - the note is still valid UTF-8 and still exists;
 //!   - it has the same number of lines as the appropriate baseline (no lines added
 //!     or dropped by Taski);
-//!   - **either** (unchanged note) the file equals the original with exactly the one
-//!     target checkbox char flipped and nothing else, **or** (concurrent edit) the
-//!     file equals the post-edit content byte-for-byte (Taski refused).
+//!   - **either** (unchanged note) the file equals the original with the anchor
+//!     checkbox char flipped AND, when the target is a Done char (`x`/`X`), a
+//!     ` ✅ <fixed-date>` stamp appended to the anchor line (the composed
+//!     done-date stamp from ADR-0012, in the same byte buffer as the flip),
+//!     nothing else; **or** (concurrent edit) the file equals the post-edit
+//!     content byte-for-byte (Taski refused).
 //!
 //! Cases exercised (safety-review hardening):
 //!   - **L3** — the anchor task may sit on line 1–4 (0–3 prefix lines prepended);
@@ -21,7 +25,7 @@
 
 use proptest::prelude::*;
 
-use taski_daemon::{ApplyOutcome, process_action, scan_vault};
+use taski_daemon::{ApplyOutcome, process_action_at, scan_vault};
 use taski_db as db;
 
 // ---------------------------------------------------------------------------
@@ -213,36 +217,83 @@ proptest! {
             std::fs::write(&note_abs, &edited).unwrap();
         }
 
-        // Enqueue + process the flip.
+        // Enqueue + process the flip. ADR-0012: process_action_at composes the
+        // done-date stamp into the same splice as the flip when target is a Done
+        // char (x/X). The fixed date keeps the byte-exact assertion deterministic.
         db::enqueue_action(
             &conn, anchor.id, note_rel, anchor_line, anchor_ch, target_ch,
         )
         .unwrap();
         let action = db::pending_actions(&conn).unwrap()[0].clone();
-        let outcome = process_action(&conn, root, &action).unwrap();
+        let outcome = process_action_at(&conn, root, &action, "2026-06-20").unwrap();
 
         // The file still exists and is valid UTF-8.
         let on_disk: Vec<u8> = std::fs::read(&note_abs).unwrap();
         std::str::from_utf8(&on_disk).expect("note must remain valid UTF-8");
 
         if edit == EditKind::None {
-            // MUST apply: file = original with the anchor checkbox char → target_ch,
-            // independently computed via byte offsets.
+            // MUST apply: file = original with the anchor checkbox char → target_ch
+            // AND, when target_ch is a Done char, ` ✅ 2026-06-20` appended to the
+            // anchor line (the composed done-date stamp, ADR-0012). Mirror
+            // process_action_at's CR-trim + oracle discipline exactly.
+            let ls = line_start(original.as_bytes(), anchor_line);
+            let le = original.as_bytes()[ls..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(original.len(), |p| ls + p);
+            // CR-trim: `line_byte_range` includes a trailing `\r`; the stamp goes
+            // BEFORE the `\r\n`. Same discipline as process_action_at.
+            let content_end = if le > ls && original.as_bytes()[le - 1] == b'\r' {
+                le - 1
+            } else {
+                le
+            };
+            let orig_line = &original[ls..content_end];
+
+            // Flip the checkbox char in the decoded line.
             let (cs, ce) = anchor_checkbox_range(original.as_bytes(), anchor_line)
                 .expect("anchor must have a checkbox in the original");
             let target_c = target_ch.chars().next().unwrap();
-            let mut expected = Vec::with_capacity(original.len() + 4);
-            expected.extend_from_slice(&original.as_bytes()[..cs]);
-            expected.extend_from_slice(target_c.encode_utf8(&mut [0u8; 4]).as_bytes());
-            expected.extend_from_slice(&original.as_bytes()[ce..]);
+            let rel_cs = cs - ls;
+            let rel_ce = ce - ls;
+            let mut flipped = String::with_capacity(orig_line.len() + 4);
+            flipped.push_str(&orig_line[..rel_cs]);
+            flipped.push(target_c);
+            flipped.push_str(&orig_line[rel_ce..]);
+
+            // Apply the done-date oracle exactly as process_action_at does. The
+            // generated anchor never carries a ✅ (anchor_trailing has none), so
+            // Unparseable is impossible here — Unchanged on clear, Rewritten on stamp.
+            let final_line = if matches!(target_c, 'x' | 'X') || target_c == ' ' {
+                let desired: Option<&str> = if matches!(target_c, 'x' | 'X') {
+                    Some("2026-06-20")
+                } else {
+                    None
+                };
+                match taski_core::rewrite_done_date(&flipped, desired) {
+                    taski_core::RewriteResult::Rewritten(s) => s,
+                    taski_core::RewriteResult::Unchanged => flipped,
+                    taski_core::RewriteResult::Unparseable => unreachable!(
+                        "clean anchor (no ✅) is never Unparseable"
+                    ),
+                }
+            } else {
+                // Non-done/non-open target (not generated here, but kept for parity).
+                flipped
+            };
+
+            let mut expected = Vec::with_capacity(original.len() + final_line.len());
+            expected.extend_from_slice(&original.as_bytes()[..ls]);
+            expected.extend_from_slice(final_line.as_bytes());
+            expected.extend_from_slice(&original.as_bytes()[content_end..]);
 
             prop_assert_eq!(outcome, ApplyOutcome::Applied);
             prop_assert_eq!(
                 &on_disk[..], &expected[..],
-                "on apply the file must equal the original with exactly the one \
-                 checkbox char flipped"
+                "on apply the file must equal the original with the flip + composed \
+                 done-date stamp (when target is Done)"
             );
-            // Newline count preserved (byte surgery touches only the checkbox char).
+            // Newline count preserved (the splice touches only the anchor line content).
             let orig_nl = original.bytes().filter(|&b| b == b'\n').count();
             let disk_nl = on_disk.iter().filter(|&&b| b == b'\n').count();
             prop_assert_eq!(disk_nl, orig_nl, "apply must not change newline count");

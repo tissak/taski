@@ -1,6 +1,6 @@
 # ADR-0003: MVP write-back is checkbox-state flips only
 
-- **Status:** Accepted (amended 2026-06-20 by [ADR-0009](./0009-scheduled-date-today.md))
+- **Status:** Accepted (amended 2026-06-20 by [ADR-0009](./0009-scheduled-date-today.md), 2026-06-21 by [ADR-0012](./0012-done-date-on-toggle.md))
 - **Date:** 2026-06-20
 - **Decides:** PRD §10.2 — MVP write-back scope
 
@@ -60,5 +60,29 @@ Free-text edits fail (ii)/(iii). Each new token type requires its own ADR.
 
 See ADR-0009 for the full design, the phased delivery, and the alternatives analysis.
 
+## Amendment — ADR-0012 (2026-06-21): write-back scope widened to `✅` done-on-toggle
+
+[ADR-0012](./0012-done-date-on-toggle.md) stamps `✅ <today>` on the same byte-buffer splice
+that flips the checkbox `[ ]→[x]` — the done-date stamp is **composed into `process_action`**,
+not a new action type. It also clears `✅` on `[x]→[ ]` (symmetry). The ADR-0009 principled
+boundary is **unchanged**; `✅` is the second token admitted under it:
+
+> The write-back scope is widened from **checkbox-state flips + `⏳` scheduled** to
+> **checkbox-state flips + `⏳` scheduled + `✅` done (stamped on flip)**. The ADR-0009
+> principled boundary is **unchanged**: Taski may write tokens that are (i) standard
+> Obsidian Tasks syntax, (ii) have a single unambiguous insertion grammar, and (iii) are
+> produced by a pure, proptested line-rewrite with a "never-corrupts" contract. Free-text
+> edits, creates/deletes, and arbitrary metadata remain explicitly rejected. Each
+> subsequent token type still requires its own ADR.
+
+Unlike the `⏳` amendment (which added a new gesture + action type), this one does **not**
+add a new action type, schema column, or TUI key — the stamp rides inside the existing
+checkbox `pending_action`. `rewrite_done_date` is a one-line wrapper over a generalized
+`rewrite_emoji_date` that also backs `rewrite_scheduled` (ADR-0009), guarded by its own
+256-case proptest.
+
+See ADR-0012 for the full design, the compose-vs-split rationale, the CRLF-hazard analysis,
+and the alternatives.
+
 ## References
-- [`docs/tech.md`](../tech.md), [ADR-0002](./0002-write-back-through-daemon.md), [ADR-0004](./0004-refuse-on-conflict.md), [ADR-0009](./0009-scheduled-date-today.md) *(amendment)*
+- [`docs/tech.md`](../tech.md), [ADR-0002](./0002-write-back-through-daemon.md), [ADR-0004](./0004-refuse-on-conflict.md), [ADR-0009](./0009-scheduled-date-today.md) *(amendment)*, [ADR-0012](./0012-done-date-on-toggle.md) *(amendment)*

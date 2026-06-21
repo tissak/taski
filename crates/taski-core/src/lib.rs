@@ -438,6 +438,9 @@ pub enum RewriteResult {
 /// The hourglass emoji `⏳` (U+23F3) — the Obsidian Tasks "scheduled" marker.
 const SCHEDULED_EMOJI: char = '⏳';
 
+/// The check-mark button emoji `✅` (U+2705) — the Obsidian Tasks "done" marker.
+const DONE_EMOJI: char = '✅';
+
 /// Pure line-rewrite for the ADR-0009 Phase 2 "mark/unmark for today" gesture.
 /// Given a full task line (including the `- [ ] ` prefix, WITHOUT its trailing
 /// `\n` — the caller handles line terminators) and a desired scheduled state:
@@ -459,7 +462,40 @@ const SCHEDULED_EMOJI: char = '⏳';
 /// The checkbox marker (`- [ ]`/`- [x]`) and every other byte (text, tags,
 /// other emojis like 📅/🛫) outside the `⏳` token's span is preserved
 /// byte-for-byte. Pure (no I/O) so it is exhaustively proptested in isolation.
+///
+/// Thin wrapper over the shared [`rewrite_emoji_date`] core (ADR-0012
+/// generalized the body so `✅` done-dates reuse the identical grammar + splice).
 pub fn rewrite_scheduled(line: &str, desired: Option<&str>) -> RewriteResult {
+    rewrite_emoji_date(line, desired, SCHEDULED_EMOJI)
+}
+
+/// Pure line-rewrite for the ADR-0012 done-date stamp (the `✅` stamp composed
+/// into a checkbox flip). Given a full task line (WITHOUT its trailing `\n` —
+/// the caller handles line terminators) and a desired done-date state:
+///
+/// - `desired = Some("YYYY-MM-DD")` (stamp on completion): if a parseable `✅`
+///   token already exists, **replace** its date bytes with `desired` (canonical
+///   re-done behaviour); otherwise **append** ` ✅ YYYY-MM-DD` at the end of the
+///   line.
+/// - `desired = None` (clear on un-completion): if a parseable `✅` token
+///   exists, **remove** it and its single preceding ASCII space; otherwise
+///   return [`RewriteResult::Unchanged`].
+///
+/// Identical grammar + splice to [`rewrite_scheduled`]; only the leading emoji
+/// differs (`✅` U+2705 instead of `⏳` U+23F3). See that function's docs for the
+/// full "never guesses" contract — every guarantee (idempotency, malformed
+/// refusal, byte-for-byte preservation of unrelated content) carries over.
+pub fn rewrite_done_date(line: &str, desired: Option<&str>) -> RewriteResult {
+    rewrite_emoji_date(line, desired, DONE_EMOJI)
+}
+
+/// Shared core behind [`rewrite_scheduled`] (ADR-0009) and [`rewrite_done_date`]
+/// (ADR-0012). The two emojis share the identical insertion grammar (emoji +
+/// optional VS16 + whitespace + strict `YYYY-MM-DD`, scanned right-to-left by
+/// the Tasks parser) and the identical append / replace / remove splice, so this
+/// private helper takes the leading `emoji` as a parameter. Pure (no I/O) so it
+/// is exhaustively proptested in isolation via both wrappers.
+fn rewrite_emoji_date(line: &str, desired: Option<&str>, emoji: char) -> RewriteResult {
     // Defensive: the TUI passes `ymd_from_unix(now)`, but the write path never
     // trusts the caller. A malformed `desired` is refused, never written.
     if let Some(d) = desired
@@ -469,16 +505,16 @@ pub fn rewrite_scheduled(line: &str, desired: Option<&str>) -> RewriteResult {
     }
 
     let bytes = line.as_bytes();
-    // How many raw `⏳` chars are on the line. Zero/one is workable; two or more
-    // is ambiguous (which one to edit?) → refuse rather than guess.
-    let hourglass_count = line.chars().filter(|&c| c == SCHEDULED_EMOJI).count();
-    // The first parseable `⏳` token, if any (parser-consistent via the shared
-    // grammar helper). When exactly one `⏳` is present, this is Some iff that
-    // `⏳` forms a clean token; None means the lone `⏳` is malformed.
-    let token = find_emoji_date_span(line, &[SCHEDULED_EMOJI]);
+    // How many raw `emoji` chars are on the line. Zero/one is workable; two or
+    // more is ambiguous (which one to edit?) → refuse rather than guess.
+    let emoji_count = line.chars().filter(|&c| c == emoji).count();
+    // The first parseable `emoji` token, if any (parser-consistent via the shared
+    // grammar helper). When exactly one `emoji` is present, this is Some iff that
+    // `emoji` forms a clean token; None means the lone `emoji` is malformed.
+    let token = find_emoji_date_span(line, &[emoji]);
 
     match desired {
-        None => match (hourglass_count, token) {
+        None => match (emoji_count, token) {
             (0, _) => RewriteResult::Unchanged,
             (1, Some((span, _))) => {
                 // Remove the token and its single preceding ASCII space.
@@ -492,23 +528,23 @@ pub fn rewrite_scheduled(line: &str, desired: Option<&str>) -> RewriteResult {
                 out.push_str(&line[span.end..]);
                 RewriteResult::Rewritten(out)
             }
-            // 1 malformed `⏳`, or ≥2 `⏳` → never guess.
+            // 1 malformed `emoji`, or ≥2 `emoji` → never guess.
             _ => RewriteResult::Unparseable,
         },
-        Some(date) => match (hourglass_count, token) {
+        Some(date) => match (emoji_count, token) {
             (0, None) => {
-                // No `⏳` at all → append ` ⏳ YYYY-MM-DD` at the logical line end.
+                // No `emoji` at all → append ` <emoji> YYYY-MM-DD` at the logical line end.
                 let mut out = String::with_capacity(line.len() + 12);
                 out.push_str(line);
                 out.push(' ');
-                out.push(SCHEDULED_EMOJI);
+                out.push(emoji);
                 out.push(' ');
                 out.push_str(date);
                 RewriteResult::Rewritten(out)
             }
             (1, Some((span, _))) => {
                 // Exactly one clean token: idempotent if the date already matches,
-                // else replace ONLY its date bytes (keep `⏳` + VS16 + whitespace).
+                // else replace ONLY its date bytes (keep `<emoji>` + VS16 + whitespace).
                 let existing_date = &line[span.end - 10..span.end];
                 if existing_date == date {
                     return RewriteResult::Unchanged;
@@ -519,7 +555,7 @@ pub fn rewrite_scheduled(line: &str, desired: Option<&str>) -> RewriteResult {
                 out.push_str(&line[span.end..]);
                 RewriteResult::Rewritten(out)
             }
-            // A `⏳` is present but malformed (lone bad token), or ≥2 `⏳` → refuse.
+            // An `emoji` is present but malformed (lone bad token), or ≥2 `emoji` → refuse.
             _ => RewriteResult::Unparseable,
         },
     }
@@ -1514,6 +1550,176 @@ plain text
         ] {
             let _ = rewrite_scheduled(line, desired);
         }
+    }
+
+    // ── rewrite_done_date unit tests (ADR-0012) ─────────────────────
+    //
+    // Mirrors the rewrite_scheduled suite on the `✅` axis. Identical grammar
+    // + splice, different leading emoji — these tests pin that the
+    // `rewrite_emoji_date` refactor preserved byte-for-byte behaviour when the
+    // emoji parameter is `✅` (U+2705) instead of `⏳` (U+23F3).
+
+    #[test]
+    fn done_date_appended_when_none_present() {
+        let r = rewrite_done_date("- [ ] buy shampoo", Some("2026-06-21"));
+        assert_eq!(
+            r,
+            RewriteResult::Rewritten("- [ ] buy shampoo ✅ 2026-06-21".to_string())
+        );
+        // The appended token is parseable and is the only ✅.
+        let RewriteResult::Rewritten(s) = r else {
+            unreachable!()
+        };
+        assert_eq!(extract_done_date(&s).as_deref(), Some("2026-06-21"));
+    }
+
+    #[test]
+    fn done_date_replaced_when_other_date_present() {
+        // Canonical re-done: existing ✅ date is overwritten with `desired`.
+        let r = rewrite_done_date("- [x] ship ✅ 2026-06-19", Some("2026-06-21"));
+        assert_eq!(
+            r,
+            RewriteResult::Rewritten("- [x] ship ✅ 2026-06-21".to_string())
+        );
+    }
+
+    #[test]
+    fn done_date_preserves_due_and_tags_on_append() {
+        // 📅 due date and #tags are untouched; the ✅ is appended AFTER the tags.
+        let r = rewrite_done_date("- [x] ship 📅 2026-07-01 #urgent", Some("2026-06-21"));
+        assert_eq!(
+            r,
+            RewriteResult::Rewritten("- [x] ship 📅 2026-07-01 #urgent ✅ 2026-06-21".to_string())
+        );
+        // Replacing an existing ✅ must keep a preceding 📅 byte-for-byte.
+        let r2 = rewrite_done_date("- [ ] ship 📅 2026-07-01 ✅ 2026-06-19", Some("2026-06-21"));
+        assert_eq!(
+            r2,
+            RewriteResult::Rewritten("- [ ] ship 📅 2026-07-01 ✅ 2026-06-21".to_string())
+        );
+    }
+
+    #[test]
+    fn done_date_keeps_vs16_and_spacing_when_replacing() {
+        // The token's leading ✅ + VS16 + whitespace run is preserved; only the
+        // date bytes change.
+        let r = rewrite_done_date("- [ ] x \u{2705}\u{FE0F}  2026-06-19", Some("2026-06-21"));
+        assert_eq!(
+            r,
+            RewriteResult::Rewritten("- [ ] x \u{2705}\u{FE0F}  2026-06-21".to_string())
+        );
+    }
+
+    #[test]
+    fn done_date_unchanged_when_already_today() {
+        // Idempotent: an already-matching ✅ date returns Unchanged (only the
+        // checkbox flip would be written by the daemon).
+        let r = rewrite_done_date("- [x] ship ✅ 2026-06-21", Some("2026-06-21"));
+        assert_eq!(r, RewriteResult::Unchanged);
+    }
+
+    #[test]
+    fn done_date_removed_on_unmark() {
+        // Un-completion: the ✅ token and its single preceding ASCII space are
+        // stripped, mirroring how unmark removes a ⏳.
+        let r = rewrite_done_date("- [x] ship ✅ 2026-06-20", None);
+        assert_eq!(r, RewriteResult::Rewritten("- [x] ship".to_string()));
+    }
+
+    #[test]
+    fn done_date_unparseable_on_malformed() {
+        // A ✅ present but the date is garbage → refuse, never guess (never
+        // append a 2nd ✅). Fires for both Some (stamp) and None (clear).
+        assert_eq!(
+            rewrite_done_date("- [x] x ✅ not-a-date", Some("2026-06-21")),
+            RewriteResult::Unparseable
+        );
+        assert_eq!(
+            rewrite_done_date("- [x] x ✅ not-a-date", None),
+            RewriteResult::Unparseable
+        );
+    }
+
+    #[test]
+    fn done_date_unparseable_on_nbsp_instead_of_ascii_space() {
+        // NBSP (U+00A0) is not ASCII whitespace → the lone ✅ is malformed → refuse.
+        let nbsp = "\u{00A0}";
+        let line = format!("- [x] x ✅{nbsp}2026-06-20");
+        assert_eq!(
+            rewrite_done_date(&line, Some("2026-06-21")),
+            RewriteResult::Unparseable
+        );
+    }
+
+    #[test]
+    fn done_date_unparseable_on_two_done_emojis() {
+        // Ambiguous: which one do we edit? Refuse rather than guess.
+        let line = "- [x] x ✅ 2026-06-20 ✅ 2026-06-21";
+        assert_eq!(
+            rewrite_done_date(line, Some("2026-06-22")),
+            RewriteResult::Unparseable
+        );
+        assert_eq!(rewrite_done_date(line, None), RewriteResult::Unparseable);
+    }
+
+    #[test]
+    fn done_date_unparseable_on_bad_desired() {
+        // Defensive: the write path never trusts the caller's date.
+        assert_eq!(
+            rewrite_done_date("- [x] x", Some("2026/06/21")),
+            RewriteResult::Unparseable
+        );
+        assert_eq!(
+            rewrite_done_date("- [x] x", Some("2026-13-40")),
+            RewriteResult::Unparseable
+        );
+        assert_eq!(
+            rewrite_done_date("- [x] x", Some("not-a-date")),
+            RewriteResult::Unparseable
+        );
+    }
+
+    #[test]
+    fn done_date_unchanged_when_no_token_on_clear() {
+        // Clearing a ✅ that isn't there is a no-op (only the flip would write).
+        assert_eq!(
+            rewrite_done_date("- [x] ship", None),
+            RewriteResult::Unchanged
+        );
+    }
+
+    #[test]
+    fn done_date_preserves_recurring_token() {
+        // A recurring task's 🔁 recurrence token is ordinary trailing content —
+        // preserved byte-for-byte — while only the ✅ date token is replaced,
+        // removed, or appended. Parallel to rewrite_scheduled's recurring test.
+        let line = "- [ ] build feature 🔁 every day ✅ 2026-06-19";
+
+        // Replace the date: 🔁 preserved, only the ✅ date swaps.
+        assert_eq!(
+            rewrite_done_date(line, Some("2026-07-01")),
+            RewriteResult::Rewritten("- [ ] build feature 🔁 every day ✅ 2026-07-01".to_string())
+        );
+
+        // Remove the done date: 🔁 preserved, ✅ token gone.
+        assert_eq!(
+            rewrite_done_date(line, None),
+            RewriteResult::Rewritten("- [ ] build feature 🔁 every day".to_string())
+        );
+
+        // Idempotent: asking for the date already present is a no-op.
+        assert_eq!(
+            rewrite_done_date(line, Some("2026-06-19")),
+            RewriteResult::Unchanged
+        );
+
+        // Append when no ✅ is present: the recurrence token is preserved and the
+        // new ✅ is appended at the end of the content.
+        let recurring_no_done = "- [ ] build feature 🔁 every day";
+        assert_eq!(
+            rewrite_done_date(recurring_no_done, Some("2026-07-01")),
+            RewriteResult::Rewritten("- [ ] build feature 🔁 every day ✅ 2026-07-01".to_string())
+        );
     }
 
     // ── toggle_bullet unit tests (ADR-0011) ────────────────────────

@@ -1,6 +1,6 @@
 # Taski — Roadmap
 
-*Status: Living document. Last updated: 2026-06-20 (Tier 1 metadata parsing shipped: tags, priority, start/created/done/cancelled dates; schema v6; 218 tests).*
+*Status: Living document. Last updated: 2026-06-21 (Tier 1 metadata parsing + Tier 2 views shipped; `✅` done-date-on-toggle interop fix shipped [ADR-0012]; 283 tests).*
 *Source: feature-gap analysis synthesizing the [Obsidian Tasks](https://publish.obsidian.md/tasks) plugin feature set, [`PRD.md`](./PRD.md) §14 non-goals, and the "Deferred / Intentionally Not Done" list in [`context.md`](./context.md). This file is the single view of "what's next"; it supersedes the scattered deferred/parking-lot notes.*
 
 ---
@@ -12,10 +12,10 @@
 - **Write-path items** touch the vault and must follow the [ADR-0009 pattern](./adr/0009-scheduled-date-today.md): a pure rewrite oracle in `taski-core`, a 256-case proptest, a new `pending_actions.action_type`, and a daemon dispatch branch. Each is marked **(needs ADR)**.
 - Effort is relative: **S** ≈ a focused slice, **M** ≈ a multi-day slice, **L** ≈ a multi-slice feature.
 
-## Where Taski is today (v0.4 + Tier 1)
+## Where Taski is today (v0.4 + Tier 1/2 + interop fix)
 
 - **Reads:** every checkbox task in the vault, `📅`/`📆`/`🗓` due date, `⏳` scheduled date, `🛫` start date, `➕`/`✅`/`❌` created/done/cancelled dates, `#tags` (multi-value), `🔺`/`⏫`/`🔼`/`🔽`/`⏬` priority.
-- **Writes:** checkbox toggle, `⏳` mark-for-today, checkbox↔bullet conversion, undo.
+- **Writes:** checkbox toggle (stamps `✅ <today>` on done, clears on un-done — ADR-0012), `⏳` mark-for-today, checkbox↔bullet conversion, undo.
 - **Views:** status cycle (`f`), Today (`T`), text search (`/`), file search (`F`), overdue (`O`), group-by cycling (`G`: note/tag/priority/folder), note context pane (`p`).
 
 Taski now parses **8 of ~15** Obsidian Tasks metadata tokens (up from 2). The metadata is now surfaced as filters and groupings; remaining view-side gaps are the "Happens" date union and urgency-score sort (Tier 2), plus the write-path items (Tier 3).
@@ -35,17 +35,25 @@ Each item extends the parser and the `tasks` schema only. No vault writes, no AD
 | **Start date** | `🛫` | "hide can't-start-yet" tasks — declutters daily views | S | — | ✅ parsed + indexed |
 | **Created / done / cancelled dates** | `➕` `✅` `❌` | done-task review ("completed this week"), task age | S | — | ✅ parsed + indexed |
 
-> **Note:** parsing is the read path; the Tier 2 *views* (tag filter, group-by-tag, urgency sort, overdue/happens) and the Tier 3 `✅`-on-toggle interop fix remain open — the metadata is now available for them to consume.
+> **Note:** parsing is the read path; the Tier 2 *views* (tag filter, group-by-tag, urgency sort, overdue/happens) and the `✅`-on-toggle interop fix are now shipped. Remaining Tier 2 views (happens, urgency sort) and `❌`-on-cancel remain open.
 
 ---
 
-## Interop correctness gap (flag separately — bug-shaped)
+## Interop correctness gap — ✅ SHIPPED (ADR-0012)
 
-**Toggling a task done via Taski does not stamp the `✅` done date** (nor `❌` on cancel). The Tasks plugin auto-writes these on completion, and Tasks queries like `done this month` depend on them — so **tasks completed in Taski are invisible to Tasks-plugin "done" queries in Obsidian.**
+**Toggling a task done via Taski now stamps the `✅` done date.** The Tasks plugin auto-writes
+`✅ <completion-date>` on completion, and Tasks queries like `done this month` depend on it —
+so tasks completed in Taski are now visible to Tasks-plugin "done" queries in Obsidian.
 
-- **Fix:** extend the checkbox-toggle write to also stamp `✅ <today>` on `[ ]`→`[x]` (and `❌` if/when cancel is supported).
-- **Effort:** M. It's a write-path change → **(needs ADR)**, but small and well-templated: a pure `rewrite_done_date` oracle + proptest, mirroring `rewrite_scheduled` (ADR-0009 Phase 2).
-- **Why it ranks high:** it's correctness against the ecosystem Taski claims to interoperate with, not just a nicety.
+- **Shipped:** the `✅ <today>` stamp composes into the same byte buffer as the checkbox flip
+  in `process_action_at` — one write, one hash, one rename. On `[ ]`→`[x]` the stamp is
+  appended (or its date replaced); on `[x]`→`[ ]` the `✅` is removed (symmetry). Flips
+  to/from in-progress (`/`) leave `✅` untouched. Malformed `✅` refuses the whole action.
+  The pure `rewrite_done_date` oracle shares a generalized `rewrite_emoji_date` core with
+  `rewrite_scheduled` (ADR-0009); two 256-case proptests guard the safety contract. See
+  [ADR-0012](./adr/0012-done-date-on-toggle.md).
+- **Still open:** `❌` cancelled-date stamping (depends on a cancel gesture that doesn't
+  exist yet).
 
 ---
 
@@ -105,7 +113,7 @@ Matches the project's vertical-slice philosophy and the architecture (read path 
 
 1. **~~Tier 1 metadata parsing~~** — tags, priority, start, created/done/cancelled. Read-only, no risk, unlocks everything below. **✅ Done (schema v6).**
 2. **Tier 2 views** — overdue, happens, group-by, urgency sort (each as its dependency lands).
-3. **The `✅`/`❌`-on-toggle interop fix** — small write-path slice, high correctness value.
+3. **~~The `✅`-on-toggle interop fix~~** — small write-path slice, high correctness value. **✅ Done (ADR-0012).** `❌`-on-cancel remains open (depends on a cancel gesture).
 4. **Bulk operations** — the highest-impact single feature; do after metadata is rich enough to act on.
 5. **Recurrence write-back** — the viewer→manager leap; last because it's the hardest write.
 

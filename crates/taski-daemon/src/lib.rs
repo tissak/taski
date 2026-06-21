@@ -29,7 +29,7 @@ use clap::Parser;
 use notify::RecursiveMode;
 use notify_debouncer_mini::{DebounceEventResult, new_debouncer};
 use rusqlite::Connection;
-use taski_core::{RewriteResult, parse_tasks, rewrite_scheduled, toggle_bullet};
+use taski_core::{RewriteResult, parse_tasks, rewrite_done_date, rewrite_scheduled, toggle_bullet};
 use taski_db as db;
 use taski_db::PendingAction;
 use walkdir::WalkDir;
@@ -564,6 +564,12 @@ pub enum ApplyOutcome {
     /// ADR-0011: `taski_core::toggle_bullet` returned `Unparseable` — the line
     /// is not a valid checkbox or bullet format.
     BulletUnparseable,
+    /// ADR-0012: an existing `✅` on the line is malformed (bad date, NBSP,
+    /// stray variation selectors, more than one `✅`), so `rewrite_done_date`
+    /// refused to guess — the whole toggle (flip + stamp) is refused, the vault
+    /// is untouched. Parallel to [`ApplyOutcome::MetadataUnparseable`] on the
+    /// `✅` axis.
+    DoneDateUnparseable,
 }
 
 /// Process every currently-pending action to completion, resolving each (`done` on
@@ -647,6 +653,9 @@ pub fn process_pending_actions(conn: &Connection, vault_root: &Path) -> Result<(
                         ApplyOutcome::BulletUnparseable => {
                             "line could not be converted to a bullet; action not applied"
                         }
+                        ApplyOutcome::DoneDateUnparseable => {
+                            "existing ✅ is malformed or unparseable; toggle not applied"
+                        }
                         ApplyOutcome::Applied => unreachable!(),
                     };
                     tracing::warn!(id = action.id, outcome = ?outcome, "{msg}");
@@ -665,9 +674,29 @@ pub fn process_pending_actions(conn: &Connection, vault_root: &Path) -> Result<(
     Ok(())
 }
 
-/// Execute one pending checkbox flip per ADR-0002/0004/0005. The vault is mutated
-/// **only** on a successful [`ApplyOutcome::Applied`]; every other path leaves it
-/// untouched.
+/// Execute one pending checkbox flip per ADR-0002/0004/0005, **composing the
+/// ADR-0012 `✅` done-date stamp into the same byte buffer as the flip** (one
+/// write, one hash, one rename). The vault is mutated **only** on a successful
+/// [`ApplyOutcome::Applied`]; every other path leaves it untouched.
+///
+/// This is the wall-clock wrapper: it derives `<today>` via the pure
+/// [`taski_core::ymd_from_unix`] and delegates to [`process_action_at`].
+/// Deterministic tests call [`process_action_at`] directly with a fixed date.
+///
+/// See [`process_action_at`] for the full sequence.
+pub fn process_action(
+    conn: &Connection,
+    vault_root: &Path,
+    action: &PendingAction,
+) -> Result<ApplyOutcome> {
+    let today = taski_core::ymd_from_unix(unix_now());
+    process_action_at(conn, vault_root, action, &today)
+}
+
+/// Deterministic-seam inner behind [`process_action`] (ADR-0012): same as
+/// `process_action` but with `<today>` supplied by the caller so byte-exact test
+/// assertions are possible. Production callers use [`process_action`]; tests use
+/// this with a fixed `"2026-06-21"`.
 ///
 /// Sequence:
 /// 1. Validate `new_char` is exactly one character (H1) and decode it to a `char`.
@@ -684,14 +713,26 @@ pub fn process_pending_actions(conn: &Connection, vault_root: &Path) -> Result<(
 ///    Plus a guard (ADR-0005 §4): if `action.expected_char != row.raw_checkbox_char`
 ///    (the checkbox was changed in Obsidian between enqueue and execute, and the
 ///    re-scan updated the row), refuse with `TaskLineMismatch`.
-/// 7. Flip exactly that one char (byte-level surgery — preserves every other byte,
-///    including line endings).
+/// 7. **Compose the ADR-0012 `✅` stamp into the same splice as the flip.**
+///    Build the post-flip line (checkbox char already flipped) and run the pure
+///    [`taski_core::rewrite_done_date`] oracle on it when the transition warrants:
+///    - `new_char` is a `Status::Done` char (`x`/`X`) → stamp `Some(today)`;
+///    - `new_char == ' '` (open) → clear `None` (symmetry — un-complete);
+///    - anything else (e.g. InProgress `/`) → skip the oracle; only the flip is
+///      written (`✅` left untouched — ambiguous, do not guess).
+///
+///    If the oracle returns `Unparseable`, refuse the WHOLE action with
+///    [`ApplyOutcome::DoneDateUnparseable`] — no flip, no stamp, vault untouched.
+///    CR-trim the line range exactly as [`process_metadata_action`] does so the
+///    stamp is spliced over `[line_range.start, content_end)` and the `\r\n` lives
+///    outside the spliced region (the CRLF hazard, ADR-0012 Consequences).
 /// 8. Atomic write (temp file in same dir → fsync → re-verify hash → rename) with a
-///    final TOCTOU check (C1).
-pub fn process_action(
+///    final TOCTOU check (C1). Exactly ONE `atomic_write` — never two.
+pub fn process_action_at(
     conn: &Connection,
     vault_root: &Path,
     action: &PendingAction,
+    today: &str,
 ) -> Result<ApplyOutcome> {
     // 1. Validate new_char: it must be exactly one Unicode scalar value (H1). Decode
     //    it once here so every later step can use a `char` directly.
@@ -751,12 +792,69 @@ pub fn process_action(
         return Ok(ApplyOutcome::TaskLineMismatch);
     }
 
-    // 7. Flip exactly the single checkbox char. Byte-level surgery means nothing else
-    //    (whitespace, line endings, other lines) can change.
-    let mut new_bytes = Vec::with_capacity(bytes.len() + 4);
-    new_bytes.extend_from_slice(&bytes[..char_range.start]);
-    new_bytes.extend_from_slice(new_c.encode_utf8(&mut [0u8; 4]).as_bytes());
-    new_bytes.extend_from_slice(&bytes[char_range.end..]);
+    // 7. Compose the ADR-0012 `✅` stamp into the same splice as the flip.
+    //    This is the first time `process_action` decodes the target line to `&str`;
+    //    until now it operated purely on byte ranges via `find_checkbox_char_any`.
+    //    Mirror `process_metadata_action`'s CRLF discipline exactly: `line_byte_range`
+    //    delimits lines on `\n` only, so a trailing `\r` (CRLF notes) is INCLUDED in
+    //    `line_range`. Compute `content_end` so the oracle operates on the
+    //    CR-trimmed content and the stamp is spliced over `[line_range.start,
+    //    content_end)`, leaving `bytes[content_end..]` (the `\r\n`) untouched. Without
+    //    this, `✅` would be written between the CR and LF, the next `parse_tasks`
+    //    would fold the CR into the task body, and `text_hash` would be polluted.
+    let content_end = if line_range.end > line_range.start && bytes[line_range.end - 1] == b'\r' {
+        line_range.end - 1
+    } else {
+        line_range.end
+    };
+    let line_str = match std::str::from_utf8(&bytes[line_range.start..content_end]) {
+        Ok(s) => s,
+        Err(_) => return Ok(ApplyOutcome::TaskLineMismatch),
+    };
+
+    // Build the post-flip line (checkbox char already swapped for `new_c`). The
+    // oracle sees the FLIPPED line, not the original. `char_range` is absolute in
+    // `bytes`; convert to line-relative offsets for the &str splice.
+    let char_rel_start = char_range.start - line_range.start;
+    let char_rel_end = char_range.end - line_range.start;
+    let mut flipped = String::with_capacity(line_str.len() + 4);
+    flipped.push_str(&line_str[..char_rel_start]);
+    flipped.push(new_c);
+    flipped.push_str(&line_str[char_rel_end..]);
+
+    // Decide the done-date delta from `new_c` (ADR-0012 Decision):
+    //   - Done char (x/X per `Status::Done`) → stamp `Some(today)`
+    //   - Open char (` `)                    → clear `None` (un-complete symmetry)
+    //   - anything else (InProgress `/`, …)  → skip the oracle entirely; only the
+    //                                           flip is written (`✅` left untouched)
+    let final_line: String = if is_done_char(new_c) || new_c == ' ' {
+        let desired_done: Option<&str> = if is_done_char(new_c) {
+            Some(today)
+        } else {
+            None
+        };
+        match rewrite_done_date(&flipped, desired_done) {
+            // Malformed existing ✅ → refuse the WHOLE toggle. No flip, no stamp,
+            // vault untouched.
+            RewriteResult::Unparseable => return Ok(ApplyOutcome::DoneDateUnparseable),
+            RewriteResult::Rewritten(s) => s,
+            // Idempotent (e.g. ✅ already equals today, or clearing a line with no ✅):
+            // only the flip changed; `flipped` is the final line.
+            RewriteResult::Unchanged => flipped,
+        }
+    } else {
+        // Non-done/non-open flip (e.g. →[/]): ambiguous, leave ✅ untouched.
+        flipped
+    };
+
+    // Splice the final line into the full note buffer over `[line_range.start,
+    // content_end)` (every other byte and ALL line endings — including the `\r` in
+    // a CRLF note — preserved, since they live in `bytes[content_end..]`). ONE
+    // `atomic_write` follows — never two.
+    let mut new_bytes = Vec::with_capacity(bytes.len() + final_line.len());
+    new_bytes.extend_from_slice(&bytes[..line_range.start]);
+    new_bytes.extend_from_slice(final_line.as_bytes());
+    new_bytes.extend_from_slice(&bytes[content_end..]);
 
     // 8. Atomic write with a final TOCTOU check (C1): right before the rename, re-read
     //    the target and re-hash; if it no longer matches `snapshot_hash`, refuse rather
@@ -765,6 +863,16 @@ pub fn process_action(
         WriteResult::Written => Ok(ApplyOutcome::Applied),
         WriteResult::Conflict => Ok(ApplyOutcome::ConflictNoteChanged),
     }
+}
+
+/// True iff `ch` is a checkbox char the codebase maps to
+/// [`taski_core::Status::Done`]. ADR-0012's `✅` stamp keys off this: a flip TO
+/// one of these chars stamps `✅ <today>`. Sourced from
+/// `taski_core::Status::from_checkbox_char`'s `Done` arm (`"x" | "X"`); mirrored
+/// here (rather than allocating a `Status`) so the hot path stays allocation-free.
+/// Keep in sync with that mapping if it ever widens.
+fn is_done_char(ch: char) -> bool {
+    matches!(ch, 'x' | 'X')
 }
 
 /// Execute one pending `set_scheduled` write (ADR-0009 Phase 2) — structurally

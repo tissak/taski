@@ -5,7 +5,8 @@
 use std::fs;
 
 use taski_daemon::{
-    ApplyOutcome, process_action, process_bullet_action, process_pending_actions, scan_vault,
+    ApplyOutcome, process_action, process_action_at, process_bullet_action,
+    process_pending_actions, scan_vault,
 };
 use taski_db as db;
 
@@ -26,7 +27,8 @@ fn flip_open_to_done_applied_unchanged_elsewhere() {
         .find(|t| t.text == "task one")
         .expect("task one indexed");
 
-    // Enqueue open -> done, then apply.
+    // Enqueue open -> done, then apply. ADR-0012: the done-date stamp composes
+    // into the same write as the flip, so ` ✅ 2026-06-21` is appended.
     db::enqueue_action(
         &conn,
         t1.id,
@@ -37,15 +39,16 @@ fn flip_open_to_done_applied_unchanged_elsewhere() {
     )
     .expect("enqueue");
     let action = &db::pending_actions(&conn).expect("pending")[0];
-    let outcome = process_action(&conn, root, action).expect("process");
+    let outcome = process_action_at(&conn, root, action, "2026-06-21").expect("process");
     assert_eq!(outcome, ApplyOutcome::Applied);
 
-    // Exactly one byte changed: the checkbox on line 3 went ` ` -> `x`. Everything
-    // else — including task two and the prose — is byte-identical.
+    // Exactly one line changed: the checkbox on line 3 went ` ` -> `x` AND a
+    // ` ✅ 2026-06-21` stamp was appended. Everything else — including task two
+    // and the prose — is byte-identical.
     let after = fs::read_to_string(&note).unwrap();
     assert_eq!(
         after,
-        "# Day\n\n- [x] task one\n- [x] task two\nsome prose\n"
+        "# Day\n\n- [x] task one ✅ 2026-06-21\n- [x] task two\nsome prose\n"
     );
 
     // Resolving marks the action done and drops it from the pending view.
@@ -118,15 +121,18 @@ fn flip_targets_row_line_number_not_stale_action_line_number() {
     // audit-only). process_action targets the ROW's current line_number (1), not 99.
     db::enqueue_action(&conn, t.id, &t.note_path, 99, " ", "x").expect("enqueue");
     let action = &db::pending_actions(&conn).expect("pending")[0];
-    let outcome = process_action(&conn, root, action).expect("process");
+    let outcome = process_action_at(&conn, root, action, "2026-06-21").expect("process");
     assert_eq!(
         outcome,
         ApplyOutcome::Applied,
         "process_action must use the row's line_number, not the stale action.line_number"
     );
 
-    // The flip landed on line 1 (the task's actual location).
-    assert_eq!(fs::read_to_string(&note).unwrap(), "- [x] task one\n");
+    // The flip landed on line 1 (the task's actual location); ADR-0012 stamps `✅`.
+    assert_eq!(
+        fs::read_to_string(&note).unwrap(),
+        "- [x] task one ✅ 2026-06-21\n"
+    );
 }
 
 #[test]
@@ -203,9 +209,18 @@ fn two_flips_same_note_both_applied_m1() {
 
     process_pending_actions(&conn, root).expect("process pending");
 
+    // ADR-0012: each `[ ]→[x]` flip also stamps `✅ <today>` (wall-clock). The M1
+    // invariant under test — both flips apply despite sharing the note — is
+    // orthogonal to the stamp; we just account for it in the expected bytes.
+    let today = taski_core::ymd_from_unix(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64,
+    );
     assert_eq!(
         fs::read_to_string(&note).unwrap(),
-        "- [x] a\n- [x] b\n",
+        format!("- [x] a ✅ {today}\n- [x] b ✅ {today}\n"),
         "both flips must apply; M1 re-index lets the second through"
     );
     assert!(
@@ -229,19 +244,25 @@ fn re_processing_after_apply_is_idempotent_m2() {
     scan_vault(&conn, root, &[]).expect("scan");
     let t = db::all_tasks(&conn).expect("all_tasks")[0].clone();
 
-    // First apply: open -> done.
-    db::enqueue_action(&conn, t.id, &t.note_path, t.line_number, " ", "x").expect("enqueue");
+    // First apply: open -> in-progress. ADR-0012: flips to Status::InProgress
+    // skip the done-date oracle entirely (ambiguous; only the flip is written),
+    // so the body text — and thus text_hash — is unchanged. This lets the task's
+    // surrogate id survive the re-scan below, which is what the M2 idempotency
+    // invariant requires. (A `[ ]→[x]` flip would stamp `✅`, churn text_hash,
+    // and the old action.task_id would be TaskNotFound after re-scan — the
+    // documented id-churn behavior, not an idempotency regression.)
+    db::enqueue_action(&conn, t.id, &t.note_path, t.line_number, " ", "/").expect("enqueue");
     let action = db::pending_actions(&conn).expect("pending")[0].clone();
-    let outcome = process_action(&conn, root, &action).expect("process");
+    let outcome = process_action_at(&conn, root, &action, "2026-06-21").expect("process");
     assert_eq!(outcome, ApplyOutcome::Applied);
-    assert_eq!(fs::read_to_string(&note).unwrap(), "- [x] task one\n");
+    assert_eq!(fs::read_to_string(&note).unwrap(), "- [/] task one\n");
 
     // Simulate crash+restart: the re-scan refreshes the stored note_hash to the
     // post-flip content. The unresolved action is then re-processed.
     scan_vault(&conn, root, &[]).expect("re-scan");
 
     let mtime_before = fs::metadata(&note).unwrap().modified().unwrap();
-    let outcome2 = process_action(&conn, root, &action).expect("re-process");
+    let outcome2 = process_action_at(&conn, root, &action, "2026-06-21").expect("re-process");
     assert_eq!(
         outcome2,
         ApplyOutcome::Applied,
@@ -249,7 +270,7 @@ fn re_processing_after_apply_is_idempotent_m2() {
     );
     assert_eq!(
         fs::read_to_string(&note).unwrap(),
-        "- [x] task one\n",
+        "- [/] task one\n",
         "file must not change on idempotent re-process"
     );
     let _ = mtime_before; // (content equality above is the strong guarantee)
@@ -336,12 +357,13 @@ fn flip_lands_on_current_line_after_line_shift_adr0005() {
 
     // Process the action. It must target the ROW's current line (2), not the
     // stale action.line_number (1). The flip must land on line 2.
-    let outcome = process_action(&conn, root, &action).expect("process");
+    let outcome = process_action_at(&conn, root, &action, "2026-06-21").expect("process");
     assert_eq!(outcome, ApplyOutcome::Applied);
 
-    // Line 1 (the heading) is untouched; line 2 (the task) is flipped to done.
+    // Line 1 (the heading) is untouched; line 2 (the task) is flipped to done
+    // and stamped `✅ 2026-06-21` (ADR-0012).
     let after = fs::read_to_string(&note).unwrap();
-    assert_eq!(after, "# New heading\n- [x] task one\n");
+    assert_eq!(after, "# New heading\n- [x] task one ✅ 2026-06-21\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -475,4 +497,319 @@ fn bullet_toggle_refused_on_concurrent_edit_leaves_file_unchanged() {
         after, before_process,
         "on conflict the file must be untouched by Taski"
     );
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0012: the `✅` done-date stamp composes into the same byte buffer as the
+// checkbox flip. These tests pin the composed behaviour on every edge of the
+// Decision table. All use `process_action_at` with the fixed date "2026-06-21"
+// (the deterministic-date seam) except the end-to-end test which exercises the
+// wall-clock `process_pending_actions` drain path.
+// ---------------------------------------------------------------------------
+
+/// 6.1 — flip `[ ]→[x]` on a bare task appends ` ✅ <today>` at logical line end.
+#[test]
+fn done_date_stamped_on_flip_open_to_done() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let conn = db::open(&tmp.path().join("dd1.db").to_string_lossy()).expect("open db");
+    let note = root.join("day.md");
+    fs::write(&note, "- [ ] task one\n").unwrap();
+    scan_vault(&conn, root, &[]).expect("scan");
+    let t = db::all_tasks(&conn).expect("all_tasks")[0].clone();
+
+    db::enqueue_action(&conn, t.id, &t.note_path, t.line_number, " ", "x").expect("enqueue");
+    let action = &db::pending_actions(&conn).expect("pending")[0];
+    let outcome = process_action_at(&conn, root, action, "2026-06-21").expect("process");
+    assert_eq!(outcome, ApplyOutcome::Applied);
+
+    assert_eq!(
+        fs::read_to_string(&note).unwrap(),
+        "- [x] task one ✅ 2026-06-21\n",
+        "open→done flip must stamp ✅ <today> at line end"
+    );
+}
+
+/// 6.2 — on a multi-line note, ONLY the target line changes; the `✅` is appended
+/// AFTER any trailing tags.
+#[test]
+fn done_date_stamped_preserves_other_lines_and_tags() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let conn = db::open(&tmp.path().join("dd2.db").to_string_lossy()).expect("open db");
+    let note = root.join("day.md");
+    let original = "# Day\n\n- [ ] ship 📅 2026-07-01 #urgent\n- [x] other task\nsome prose\n";
+    fs::write(&note, original).unwrap();
+    scan_vault(&conn, root, &[]).expect("scan");
+    let t = db::all_tasks(&conn)
+        .expect("all_tasks")
+        .iter()
+        .find(|t| t.text.starts_with("ship"))
+        .cloned()
+        .expect("ship task indexed");
+
+    db::enqueue_action(&conn, t.id, &t.note_path, t.line_number, " ", "x").expect("enqueue");
+    let action = &db::pending_actions(&conn).expect("pending")[0];
+    let outcome = process_action_at(&conn, root, action, "2026-06-21").expect("process");
+    assert_eq!(outcome, ApplyOutcome::Applied);
+
+    // Only line 3 changed: checkbox flipped + ` ✅ 2026-06-21` appended after #urgent.
+    // The 📅 due date and #urgent tag are preserved; every other line is untouched.
+    assert_eq!(
+        fs::read_to_string(&note).unwrap(),
+        "# Day\n\n- [x] ship 📅 2026-07-01 #urgent ✅ 2026-06-21\n- [x] other task\nsome prose\n",
+        "only the target line changed; ✅ appended after trailing tags"
+    );
+}
+
+/// 6.3 — re-done: an existing `✅ <other>` is REPLACED with today (canonical Tasks
+/// behavior), not duplicated.
+#[test]
+fn done_date_replaced_on_redone_with_different_date() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let conn = db::open(&tmp.path().join("dd3.db").to_string_lossy()).expect("open db");
+    let note = root.join("day.md");
+    fs::write(&note, "- [ ] ship ✅ 2026-06-19\n").unwrap();
+    scan_vault(&conn, root, &[]).expect("scan");
+    let t = db::all_tasks(&conn).expect("all_tasks")[0].clone();
+
+    db::enqueue_action(&conn, t.id, &t.note_path, t.line_number, " ", "x").expect("enqueue");
+    let action = &db::pending_actions(&conn).expect("pending")[0];
+    let outcome = process_action_at(&conn, root, action, "2026-06-21").expect("process");
+    assert_eq!(outcome, ApplyOutcome::Applied);
+
+    assert_eq!(
+        fs::read_to_string(&note).unwrap(),
+        "- [x] ship ✅ 2026-06-21\n",
+        "existing ✅ date must be replaced, not duplicated"
+    );
+}
+
+/// 6.4 — idempotent: if `✅ <today>` is already present, the oracle returns
+/// `Unchanged` for the stamp; only the checkbox char flips.
+#[test]
+fn done_date_idempotent_when_already_today() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let conn = db::open(&tmp.path().join("dd4.db").to_string_lossy()).expect("open db");
+    let note = root.join("day.md");
+    // The task is open but already carries today's ✅ (e.g. user stamped it
+    // manually and then un-checked the box). Flipping to done must not duplicate.
+    fs::write(&note, "- [ ] ship ✅ 2026-06-21\n").unwrap();
+    scan_vault(&conn, root, &[]).expect("scan");
+    let t = db::all_tasks(&conn).expect("all_tasks")[0].clone();
+
+    db::enqueue_action(&conn, t.id, &t.note_path, t.line_number, " ", "x").expect("enqueue");
+    let action = &db::pending_actions(&conn).expect("pending")[0];
+    let outcome = process_action_at(&conn, root, action, "2026-06-21").expect("process");
+    assert_eq!(outcome, ApplyOutcome::Applied);
+
+    assert_eq!(
+        fs::read_to_string(&note).unwrap(),
+        "- [x] ship ✅ 2026-06-21\n",
+        "idempotent stamp — only the checkbox char changed, ✅ untouched"
+    );
+}
+
+/// 6.5 — un-complete: flip `[x]→[ ]` REMOVES an existing `✅` (symmetry — an open
+/// task cannot carry a done date).
+#[test]
+fn done_date_cleared_on_flip_done_to_open() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let conn = db::open(&tmp.path().join("dd5.db").to_string_lossy()).expect("open db");
+    let note = root.join("day.md");
+    fs::write(&note, "- [x] ship ✅ 2026-06-20\n").unwrap();
+    scan_vault(&conn, root, &[]).expect("scan");
+    let t = db::all_tasks(&conn).expect("all_tasks")[0].clone();
+
+    db::enqueue_action(&conn, t.id, &t.note_path, t.line_number, "x", " ").expect("enqueue");
+    let action = &db::pending_actions(&conn).expect("pending")[0];
+    let outcome = process_action_at(&conn, root, action, "2026-06-21").expect("process");
+    assert_eq!(outcome, ApplyOutcome::Applied);
+
+    assert_eq!(
+        fs::read_to_string(&note).unwrap(),
+        "- [ ] ship\n",
+        "done→open flip must remove the ✅ token and its preceding space"
+    );
+}
+
+/// 6.6 — ambiguous transition: flip `[x]→[/]` (in-progress) leaves `✅` UNTOUCHED.
+/// Only the checkbox char flips (ADR-0012 edge table: "Flips involving
+/// Status::InProgress (/) ... leave ✅ untouched").
+#[test]
+fn done_date_not_cleared_on_flip_to_in_progress() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let conn = db::open(&tmp.path().join("dd6.db").to_string_lossy()).expect("open db");
+    let note = root.join("day.md");
+    fs::write(&note, "- [x] ship ✅ 2026-06-20\n").unwrap();
+    scan_vault(&conn, root, &[]).expect("scan");
+    let t = db::all_tasks(&conn).expect("all_tasks")[0].clone();
+
+    db::enqueue_action(&conn, t.id, &t.note_path, t.line_number, "x", "/").expect("enqueue");
+    let action = &db::pending_actions(&conn).expect("pending")[0];
+    let outcome = process_action_at(&conn, root, action, "2026-06-21").expect("process");
+    assert_eq!(outcome, ApplyOutcome::Applied);
+
+    assert_eq!(
+        fs::read_to_string(&note).unwrap(),
+        "- [/] ship ✅ 2026-06-20\n",
+        "flip to in-progress must leave ✅ untouched (ambiguous; do not guess)"
+    );
+}
+
+/// 6.7 — refusal: a malformed existing `✅` refuses the WHOLE toggle (no flip, no
+/// stamp). The vault is byte-identical to the original.
+#[test]
+fn done_date_unparseable_refuses_whole_toggle_no_write() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let conn = db::open(&tmp.path().join("dd7.db").to_string_lossy()).expect("open db");
+    let note = root.join("day.md");
+    let original = "- [ ] ship ✅ not-a-date\n";
+    fs::write(&note, original).unwrap();
+    scan_vault(&conn, root, &[]).expect("scan");
+    let t = db::all_tasks(&conn).expect("all_tasks")[0].clone();
+
+    db::enqueue_action(&conn, t.id, &t.note_path, t.line_number, " ", "x").expect("enqueue");
+    let action = &db::pending_actions(&conn).expect("pending")[0];
+    let outcome = process_action_at(&conn, root, action, "2026-06-21").expect("process");
+    assert_eq!(
+        outcome,
+        ApplyOutcome::DoneDateUnparseable,
+        "malformed ✅ must refuse the whole toggle (no flip, no stamp)"
+    );
+
+    // The vault is untouched — no flip landed, no stamp landed.
+    assert_eq!(
+        fs::read_to_string(&note).unwrap(),
+        original,
+        "DoneDateUnparseable must leave the vault byte-identical"
+    );
+}
+
+/// 6.8 — concurrent-edit refusal prevents BOTH the flip AND the stamp from landing.
+/// Clone of `flip_refused_on_concurrent_edit_leaves_file_unchanged`, on a
+/// `[ ]→[x]` flip where the stamp would otherwise compose.
+#[test]
+fn done_date_toggle_refused_on_concurrent_edit_leaves_file_unchanged() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let conn = db::open(&tmp.path().join("dd8.db").to_string_lossy()).expect("open db");
+    let note = root.join("day.md");
+    fs::write(&note, "# Day\n\n- [ ] task one\n- [x] task two\n").unwrap();
+    scan_vault(&conn, root, &[]).expect("scan");
+    let t1 = db::all_tasks(&conn)
+        .expect("all_tasks")
+        .iter()
+        .find(|t| t.text == "task one")
+        .cloned()
+        .expect("task one indexed");
+
+    db::enqueue_action(&conn, t1.id, &t1.note_path, t1.line_number, " ", "x").expect("enqueue");
+
+    // Simulate Obsidian editing the note AFTER the scan.
+    let edited = "# Day\n\n- [ ] task one\n- [x] task two\nUSER EDITED ME\n";
+    fs::write(&note, edited).unwrap();
+    let before_process = fs::read(&note).unwrap();
+
+    let action = &db::pending_actions(&conn).expect("pending")[0];
+    let outcome = process_action_at(&conn, root, action, "2026-06-21").expect("process");
+    assert_eq!(
+        outcome,
+        ApplyOutcome::ConflictNoteChanged,
+        "concurrent edit must be refused — neither flip nor stamp lands"
+    );
+
+    let after = fs::read(&note).unwrap();
+    assert_eq!(
+        after, before_process,
+        "on conflict the file must be untouched (no flip, no stamp)"
+    );
+}
+
+/// 6.9 — 🔑 CRLF-hazard guard. The stamp must be spliced over `[line_range.start,
+/// content_end)` where `content_end` EXCLUDES the trailing `\r`. Without the
+/// CR-trim, `✅` would land BETWEEN the CR and LF, and the next `parse_tasks`
+/// would fold the CR into the task body, permanently polluting `text_hash`.
+#[test]
+fn done_date_crlf_preserved_on_stamp() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let conn = db::open(&tmp.path().join("dd9.db").to_string_lossy()).expect("open db");
+    let note = root.join("day.md");
+    fs::write(&note, "- [ ] task\r\n").unwrap();
+    scan_vault(&conn, root, &[]).expect("scan");
+    let t = db::all_tasks(&conn).expect("all_tasks")[0].clone();
+
+    db::enqueue_action(&conn, t.id, &t.note_path, t.line_number, " ", "x").expect("enqueue");
+    let action = &db::pending_actions(&conn).expect("pending")[0];
+    let outcome = process_action_at(&conn, root, action, "2026-06-21").expect("process");
+    assert_eq!(outcome, ApplyOutcome::Applied);
+
+    // The ✅ is BEFORE the \r\n (NOT between \r and \n). The \r\n terminator is
+    // preserved outside the spliced region.
+    assert_eq!(
+        fs::read_to_string(&note).unwrap(),
+        "- [x] task ✅ 2026-06-21\r\n",
+        "CRLF must be preserved; ✅ stamp goes BEFORE the \\r"
+    );
+
+    // Independent cross-check via `str::lines()` (the read path's line splitter,
+    // which strips a `\r` adjacent to `\n`): the anchor line must contain NO
+    // interior `\r`, and the done date must parse back to the stamped date.
+    let on_disk = fs::read_to_string(&note).unwrap();
+    let anchor = on_disk
+        .lines()
+        .find(|l| l.contains("task"))
+        .expect("anchor");
+    assert!(
+        !anchor.contains('\r'),
+        "anchor line must have NO interior CR (CRLF-hazard check): {anchor:?}"
+    );
+    assert_eq!(
+        taski_core::extract_done_date(anchor).as_deref(),
+        Some("2026-06-21"),
+        "the stamped ✅ date must parse back correctly"
+    );
+}
+
+/// 6.10 — end-to-end through the wall-clock `process_pending_actions` drain path.
+/// Enqueue via `db::enqueue_action`, call `process_pending_actions`, assert the
+/// `✅` date parses to today (the real wall-clock date, whatever it is).
+#[test]
+fn done_date_stamped_via_process_pending_actions_end_to_end() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let conn = db::open(&tmp.path().join("dd10.db").to_string_lossy()).expect("open db");
+    let note = root.join("day.md");
+    fs::write(&note, "- [ ] ship it\n").unwrap();
+    scan_vault(&conn, root, &[]).expect("scan");
+    let t = db::all_tasks(&conn).expect("all_tasks")[0].clone();
+
+    db::enqueue_action(&conn, t.id, &t.note_path, t.line_number, " ", "x").expect("enqueue");
+    process_pending_actions(&conn, root).expect("drain");
+
+    // The real wall-clock today (whatever date the test runs on).
+    let today = taski_core::ymd_from_unix(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64,
+    );
+
+    let on_disk = fs::read_to_string(&note).unwrap();
+    assert!(
+        on_disk.contains(&format!("✅ {today}")),
+        "end-to-end drain must stamp ✅ <today>: got {on_disk:?}"
+    );
+
+    // The read path now sees the done date.
+    let reparsed = taski_core::parse_tasks(&on_disk, &t.note_path);
+    assert_eq!(reparsed.len(), 1);
+    assert_eq!(reparsed[0].status, taski_core::Status::Done);
+    assert_eq!(reparsed[0].done_date.as_deref(), Some(today.as_str()));
 }

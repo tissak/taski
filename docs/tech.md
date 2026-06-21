@@ -1,6 +1,6 @@
 # Tech — Taski
 
-*Last updated: 2026-06-20*
+*Last updated: 2026-06-21*
 
 Authoritative record of technology choices for Taski. Each entry has a one-line rationale and a link to the deciding ADR where applicable. Update this file whenever a choice is made or revised.
 
@@ -30,7 +30,7 @@ Authoritative record of technology choices for Taski. Each entry has a one-line 
 | **`fs2`** | `flock`-based single-writer lock (`daemon.lock`) preventing two daemons from racing on `atomic_write` / `reconcile_note`. Auto-released on crash. See ADR-0008. | 2026-06-20 |
 | **Line-based parser** (in `taski-core`) | Current Markdown checkbox parser — fence-aware (backtick + tilde), tolerates leading blockquote markers, extracts Obsidian Tasks-plugin `📅`/`📆`/`🗓` due dates and `⏳` scheduled dates (ADR-0009). Chosen over `pulldown-cmark` for now (YAGNI; checkboxes are line-oriented). | 2026-06-20 |
 
-> **Write-back scope (ADR-0003, amended by ADR-0009):** the daemon may mutate the vault by (a) checkbox-state flips, and (b) Obsidian-standard date-emoji metadata (`⏳` scheduled). Task-text edits, creates/deletes, and arbitrary metadata remain rejected. Each new write token requires a pure, proptested line-rewrite ("never corrupts") and its own ADR. The `⏳` write reuses `atomic_write` unchanged — its TOCTOU guard is whole-file-hash and byte-count-agnostic.
+> **Write-back scope (ADR-0003, amended by ADR-0009 and ADR-0012):** the daemon may mutate the vault by (a) checkbox-state flips, (b) Obsidian-standard date-emoji metadata (`⏳` scheduled, ADR-0009), and (c) `✅` done-date stamping composed into the checkbox flip itself (ADR-0012 — `[ ]`→`[x]` stamps `✅ <today>`, `[x]`→`[ ]` clears it, no new action type). Task-text edits, creates/deletes, and arbitrary metadata remain rejected. Each new write token requires a pure, proptested line-rewrite ("never corrupts") and its own ADR. Both `rewrite_scheduled` and `rewrite_done_date` share a generalized `rewrite_emoji_date` core. All write paths reuse `atomic_write` unchanged — its TOCTOU guard is whole-file-hash and byte-count-agnostic.
 
 > **Deferred (revisit when needed):** `pulldown-cmark` (adopt when real edge cases — tasks in nested lists / inline code / callouts — exceed the line parser).
 
