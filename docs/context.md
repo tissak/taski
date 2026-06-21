@@ -1,6 +1,6 @@
 # Taski — Engineering Context & Onboarding
 
-*Onboarding guide for new engineers. Last updated: 2026-06-21 (post-v0.4 — adds Tier 1 metadata parsing [tags, priority, start/created/done/cancelled dates, schema v6], Tier 2 views [overdue `O`, group-by cycling `G`], the `✅` done-date stamp on toggle [ADR-0012], the `❌` cancelled-date stamp on cancel [ADR-0013], the `➕` quick-add inbox creation [ADR-0014], the `o` open-in-Obsidian deep-link gesture [ADR-0015], and the `i` in-progress toggle gesture [ADR-0016]; 323 tests across 6 crates).*
+*Onboarding guide for new engineers. Last updated: 2026-06-21 (post-v0.4 — adds Tier 1 metadata parsing [tags, priority, start/created/done/cancelled dates], Tier 2 views [overdue `O`, group-by cycling `G`], the `✅` done-date stamp on toggle [ADR-0012], the `❌` cancelled-date stamp on cancel [ADR-0013], the `➕` quick-add inbox creation [ADR-0014], the `o` open-in-Obsidian deep-link gesture [ADR-0015], and the `i` in-progress toggle gesture [ADR-0016]; 329 tests across 6 crates).*
 
 This document is the "operating manual" for working on Taski: what it is, how it's
 built, the decisions that are load-bearing (and must not be casually undone), and the
@@ -253,7 +253,7 @@ filter predicates within each bucket and emits `Header` + `Task` rows.
 |---|---|
 | `j` / `k` or `↑` / `↓` | Move selection up/down |
 | `Space` | Toggle selected task open ↔ done |
-| `Enter` | Toggle group expand/collapse on header; fold sub-tasks on task |
+| `Enter` | Toggle group expand/collapse on header |
 | `←` / `→` | Collapse / expand group at cursor |
 | `Tab` / `⇧Tab` | Expand all / collapse all groups |
 | `f` | Cycle status filter: All → Open → Done → All (`Open` shows active/not-done tasks — both `Open` and `InProgress`) |
@@ -285,7 +285,7 @@ swallowed until dismissed; `Ctrl-C` remains the always-available emergency exit.
 
 ---
 
-## Data Model (schema v6)
+## Data Model (schema v7)
 
 Defined in `taski-db::SCHEMA`. `PRAGMA user_version` tracks the version; older DBs are
 dropped and recreated (pre-MVP, no data to preserve). v3 added the `note_contents` cache
@@ -293,9 +293,11 @@ that backs the read-only TUI context pane ([ADR-0006](./adr/0006-note-content-ca
 v4 added `tasks.scheduled_date` (`⏳`) backing the "Today" view
 ([ADR-0009](./adr/0009-scheduled-date-today.md), Phase 1); v5 added
 `pending_actions.action_type` + `payload` for the `⏳` write gesture (ADR-0009, Phase 2);
-**v6 added six read-only metadata columns to `tasks`** (Tier 1: `tags`, `priority`,
-`start_date`, `created_date`, `done_date`, `cancelled_date`). The v6 bump is destructive —
-existing dev DBs are dropped+recreated and the index rebuilds from the vault.
+v6 added six read-only metadata columns to `tasks` (Tier 1: `tags`, `priority`,
+`start_date`, `created_date`, `done_date`, `cancelled_date`); **v7 added `tasks.indent`** —
+the leading-whitespace column of the source line, capturing subtask nesting depth for
+visual indentation in the TUI. Each bump is destructive — existing dev DBs are
+dropped+recreated and the index rebuilds from the vault.
 
 **`tasks`** — one row per checkbox task found in the vault:
 
@@ -303,6 +305,7 @@ existing dev DBs are dropped+recreated and the index rebuilds from the vault.
 |---|---|
 | `id` | `INTEGER PRIMARY KEY AUTOINCREMENT` — **surrogate identity**, never reused (ADR-0005). NOT path+line. |
 | `note_path`, `line_number` | **Write-time location only**, re-verified against file bytes before any mutation. Not trusted as identity. |
+| `indent` *(v7)* | Leading-whitespace column of the source line (spaces 1:1, tabs expanded to 4-column tab stops). Captures subtask nesting depth for visual indentation in the TUI. Zero for top-level tasks. Read-only (parsed, not written). |
 | `text`, `text_hash` | Body + its hash; `text_hash` drives reconciliation and the write-back TOCTOU check. |
 | `status` | `open` / `done` / `in_progress` (+ other Obsidian chars). Reconstructed from `raw_checkbox_char` on read (`all_tasks`); the stored column is never consulted, so the two can't drift. |
 | `raw_checkbox_char` | The exact checkbox char seen at scan; re-verified before flipping. |

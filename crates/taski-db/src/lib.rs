@@ -16,21 +16,24 @@ use rusqlite::Connection;
 // TUI's "today" derivation (ADR-0009 Phase 1).
 pub use taski_core::{Priority, Status, Task, ymd_from_unix};
 
-/// The canonical schema v6. v2 added surrogate rowid identity + content-hash
+/// The canonical schema v7. v2 added surrogate rowid identity + content-hash
 /// reconciliation (ADR-0005); v3 added the `note_contents` cache that backs the
 /// read-only TUI context pane (ADR-0006); v4 added `tasks.scheduled_date` for the
 /// Obsidian Tasks-plugin `⏳` read path (ADR-0009 Phase 1); v5 extended
 /// `pending_actions` with `action_type`/`payload` so the same queue carries both
-/// checkbox flips and `set_scheduled` writes (ADR-0009 Phase 2); v6 adds the
+/// checkbox flips and `set_scheduled` writes (ADR-0009 Phase 2); v6 added the
 /// Tier 1 read-only metadata columns to `tasks` — `tags`, `priority`,
 /// `start_date`, `created_date`, `done_date`, `cancelled_date` — parsed from
-/// Obsidian Tasks-plugin inline syntax (no vault writes; read path only).
+/// Obsidian Tasks-plugin inline syntax (no vault writes; read path only);
+/// v7 added `tasks.indent` — the leading-whitespace column of the source line,
+/// capturing subtask nesting depth for visual indentation in the TUI.
 /// Created with `IF NOT EXISTS` so [`ensure_schema`] is idempotent.
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS tasks (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
   note_path         TEXT NOT NULL,
   line_number       INTEGER NOT NULL,
+  indent            INTEGER NOT NULL DEFAULT 0,
   text              TEXT NOT NULL,
   text_hash         TEXT NOT NULL,
   status            TEXT NOT NULL,
@@ -83,7 +86,7 @@ CREATE TABLE IF NOT EXISTS note_contents (
 
 /// Schema version tag stored in `PRAGMA user_version`. Increment when the schema
 /// changes in a backward-incompatible way.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Ensure the database schema exists and is at the current version. If the DB predates
 /// the current version, the old tables are dropped and recreated (pre-MVP: no data to
@@ -133,15 +136,16 @@ pub fn open(path: &str) -> anyhow::Result<Connection> {
 pub fn upsert_task(conn: &Connection, task: &Task) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO tasks (
-            id, note_path, line_number, text, text_hash, status,
+            id, note_path, line_number, indent, text, text_hash, status,
             raw_checkbox_char, note_hash, note_mtime, due_date, scheduled_date,
             tags, priority, start_date, created_date, done_date, cancelled_date,
             updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         rusqlite::params![
             task.id,
             task.note_path,
             task.line_number as i64,
+            task.indent as i64,
             task.text,
             task.text_hash,
             task.status.to_checkbox_char(),
@@ -361,15 +365,16 @@ pub fn reconcile_note(
             {
                 conn.execute(
                     "UPDATE tasks SET
-                        line_number = ?2, text = ?3, status = ?4,
-                        raw_checkbox_char = ?5, note_hash = ?6, note_mtime = ?7,
-                        due_date = ?8, scheduled_date = ?9, tags = ?10,
-                        priority = ?11, start_date = ?12, created_date = ?13,
-                        done_date = ?14, cancelled_date = ?15, updated_at = ?16
+                        line_number = ?2, indent = ?3, text = ?4, status = ?5,
+                        raw_checkbox_char = ?6, note_hash = ?7, note_mtime = ?8,
+                        due_date = ?9, scheduled_date = ?10, tags = ?11,
+                        priority = ?12, start_date = ?13, created_date = ?14,
+                        done_date = ?15, cancelled_date = ?16, updated_at = ?17
                      WHERE id = ?1",
                     rusqlite::params![
                         old_id,
                         task.line_number as i64,
+                        task.indent as i64,
                         task.text,
                         task.status.to_checkbox_char(),
                         task.raw_checkbox_char,
@@ -392,14 +397,15 @@ pub fn reconcile_note(
             // No match — INSERT. The DB assigns the surrogate rowid.
             conn.execute(
                 "INSERT INTO tasks (
-                    note_path, line_number, text, text_hash, status,
+                    note_path, line_number, indent, text, text_hash, status,
                     raw_checkbox_char, note_hash, note_mtime, due_date, scheduled_date,
                     tags, priority, start_date, created_date, done_date, cancelled_date,
                     updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
                 rusqlite::params![
                     note_path,
                     task.line_number as i64,
+                    task.indent as i64,
                     task.text,
                     task.text_hash,
                     task.status.to_checkbox_char(),
@@ -700,7 +706,7 @@ fn unix_now() -> i64 {
 /// [`Status::from_checkbox_char`].
 pub fn all_tasks(conn: &Connection) -> rusqlite::Result<Vec<Task>> {
     let mut stmt = conn.prepare(
-        "SELECT id, note_path, line_number, text, text_hash, status,
+        "SELECT id, note_path, line_number, indent, text, text_hash, status,
                 raw_checkbox_char, note_hash, note_mtime, due_date, scheduled_date,
                 tags, priority, start_date, created_date, done_date, cancelled_date,
                 updated_at
@@ -709,39 +715,40 @@ pub fn all_tasks(conn: &Connection) -> rusqlite::Result<Vec<Task>> {
     )?;
     let rows = stmt.query_map([], |row| {
         // Column → index map (verify every index when adding/removing columns):
-        //  0: id              7: note_hash        14: created_date
-        //  1: note_path       8: note_mtime       15: done_date
-        //  2: line_number     9: due_date         16: cancelled_date
-        //  3: text           10: scheduled_date   17: updated_at
-        //  4: text_hash      11: tags
-        //  5: status         12: priority
-        //  6: raw_checkbox_  13: start_date
-        //    char
-        let raw_checkbox_char: String = row.get(6)?;
+        //  0: id              7: raw_checkbox_    14: created_date
+        //  1: note_path         char              15: done_date
+        //  2: line_number     8: note_hash        16: cancelled_date
+        //  3: indent          9: note_mtime       17: updated_at
+        //  4: text           10: due_date
+        //  5: text_hash      11: scheduled_date
+        //  6: status         12: tags
+        //                   13: priority
+        let raw_checkbox_char: String = row.get(7)?;
         let status = Status::from_checkbox_char(&raw_checkbox_char);
-        let tags_text: String = row.get(11)?;
-        let priority_text: Option<String> = row.get(12)?;
+        let tags_text: String = row.get(12)?;
+        let priority_text: Option<String> = row.get(13)?;
         Ok(Task {
             id: row.get::<_, i64>(0)?,
             note_path: row.get(1)?,
             line_number: row.get::<_, i64>(2)? as usize,
-            text: row.get(3)?,
-            text_hash: row.get(4)?,
-            // Column 5 (stored status) is intentionally unused on read; status is
+            indent: row.get::<_, i64>(3)? as usize,
+            text: row.get(4)?,
+            text_hash: row.get(5)?,
+            // Column 6 (stored status) is intentionally unused on read; status is
             // reconstructed from raw_checkbox_char so the two never drift.
             status,
             raw_checkbox_char,
-            note_hash: row.get(7)?,
-            note_mtime: row.get(8)?,
-            due_date: row.get(9)?,
-            scheduled_date: row.get(10)?,
+            note_hash: row.get(8)?,
+            note_mtime: row.get(9)?,
+            due_date: row.get(10)?,
+            scheduled_date: row.get(11)?,
             tags: decode_tags(&tags_text),
             priority: priority_text.and_then(|s| Priority::from_emoji_str(&s)),
-            start_date: row.get(13)?,
-            created_date: row.get(14)?,
-            done_date: row.get(15)?,
-            cancelled_date: row.get(16)?,
-            updated_at: row.get(17)?,
+            start_date: row.get(14)?,
+            created_date: row.get(15)?,
+            done_date: row.get(16)?,
+            cancelled_date: row.get(17)?,
+            updated_at: row.get(18)?,
         })
     })?;
     rows.collect()
@@ -757,6 +764,7 @@ mod tests {
             id,
             note_path: "n.md".to_string(),
             line_number: line,
+            indent: 0,
             text: format!("task {id}"),
             text_hash: format!("h{id}"),
             status: Status::from_checkbox_char(raw),
@@ -802,6 +810,25 @@ mod tests {
         assert_eq!(a.text, "changed");
         assert_eq!(a.line_number, 9);
         assert_eq!(a.status, Status::InProgress);
+    }
+
+    /// The `indent` column round-trips through upsert/read.
+    #[test]
+    fn indent_round_trips() {
+        let conn = open(":memory:").unwrap();
+        let mut t = sample_task(1, " ", 1);
+        t.indent = 4;
+        upsert_task(&conn, &t).unwrap();
+        let got = all_tasks(&conn).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].indent, 4, "indent should round-trip");
+
+        // Update via replace-on-id changes indent too.
+        let mut updated = sample_task(1, " ", 1);
+        updated.indent = 2;
+        upsert_task(&conn, &updated).unwrap();
+        let got2 = all_tasks(&conn).unwrap();
+        assert_eq!(got2[0].indent, 2, "indent should update on replace");
     }
 
     #[test]
@@ -1078,6 +1105,37 @@ mod tests {
             "a None scheduled_date must round-trip as None"
         );
         assert_eq!(b.due_date.as_deref(), Some("2026-07-01"));
+    }
+
+    /// `reconcile_note` carries `indent` through both its INSERT and UPDATE paths.
+    /// This is the production write path (the daemon calls `reconcile_note`, not
+    /// `upsert_task`), so a missing column here would mean indent is never persisted.
+    #[test]
+    fn reconcile_note_carries_indent_through_insert_and_update() {
+        let conn = open(":memory:").unwrap();
+
+        // INSERT path: a nested task is first-seen.
+        let initial = taski_core::parse_tasks("  - [ ] nested\n", "n.md");
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].indent, 2);
+        reconcile_note(&conn, "n.md", &initial, Some("h1"), None).unwrap();
+        let got = all_tasks(&conn).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].indent, 2, "indent must persist through INSERT path");
+        let preserved_id = got[0].id;
+
+        // UPDATE path: same body text, deeper indentation. Same text_hash → the row
+        // is matched and UPDATEd in place (id preserved), indent refreshed.
+        let reindented = taski_core::parse_tasks("    - [ ] nested\n", "n.md");
+        assert_eq!(reindented[0].indent, 4);
+        reconcile_note(&conn, "n.md", &reindented, Some("h2"), None).unwrap();
+        let got2 = all_tasks(&conn).unwrap();
+        assert_eq!(got2.len(), 1);
+        assert_eq!(
+            got2[0].id, preserved_id,
+            "identity preserved across a matched UPDATE"
+        );
+        assert_eq!(got2[0].indent, 4, "indent must refresh through UPDATE path");
     }
 
     /// ADR-0009 Phase 1: `reconcile_note` carries `scheduled_date` through its

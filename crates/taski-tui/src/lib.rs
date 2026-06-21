@@ -2020,7 +2020,9 @@ fn row_to_item(row: &DisplayRow, today: &str) -> ListItem<'static> {
         DisplayRow::Task { task } => {
             let checkbox = format!("[{}]", task.raw_checkbox_char);
             let mut spans: Vec<Span> = Vec::with_capacity(8);
-            spans.push(Span::raw("    ")); // indent under the header marker
+            // Conventional 4-space list indent under the header marker + the task's
+            // source-line indentation, so subtasks render at proportional depth.
+            spans.push(Span::raw(" ".repeat(4 + task.indent)));
             spans.push(Span::styled(checkbox, checkbox_style(&task.status)));
             spans.push(Span::raw(format!(" {}", task.text)));
             if let Some(due) = &task.due_date {
@@ -2113,6 +2115,28 @@ fn context_view(
     (start, count, highlight)
 }
 
+/// Expand tab characters to spaces using 4-column tab stops (matching
+/// [`taski_core`]'s `count_indent` convention). Ratatui writes each character to a
+/// single buffer cell, so a raw `\t` would occupy one invisible cell instead of
+/// advancing to the next tab stop. Expanding before rendering makes tab-indented
+/// subtasks visible in the context pane.
+fn expand_tabs(s: &str) -> String {
+    const TAB_WIDTH: usize = 4;
+    let mut result = String::with_capacity(s.len());
+    let mut col = 0usize;
+    for c in s.chars() {
+        if c == '\t' {
+            let spaces = TAB_WIDTH - (col % TAB_WIDTH);
+            result.push_str(&" ".repeat(spaces));
+            col += spaces;
+        } else {
+            result.push(c);
+            col += 1;
+        }
+    }
+    result
+}
+
 /// Render the context pane into `area`: a bordered block titled with the note path,
 /// showing a window of the note's content centered on `target_line` (or the top of the
 /// note when the cursor is on a header), with a line-number gutter and the target line
@@ -2184,7 +2208,7 @@ fn draw_context_pane(
                                 Style::default().fg(Color::DarkGray),
                             ),
                             Span::styled(if is_target { "▶ " } else { "  " }, style),
-                            Span::styled(raw.to_string(), style),
+                            Span::styled(expand_tabs(raw), style),
                         ])
                     })
                     .collect()
@@ -2263,7 +2287,7 @@ fn help_popup() -> Paragraph<'static> {
     let lines = vec![
         head("Navigation"),
         row("j/k ↑/↓", "Move selection up/down"),
-        row("Enter", "Fold group / fold sub-tasks"),
+        row("Enter", "Fold group"),
         row("←/→", "Collapse / expand group"),
         row("Tab / ⇧Tab", "Expand all / collapse all groups"),
         row("J / K", "Scroll context pane"),
@@ -2316,6 +2340,7 @@ mod tests {
             id,
             note_path: note.to_string(),
             line_number: line,
+            indent: 0,
             text: format!("task {id}"),
             text_hash: format!("h{id}"),
             status: Status::from_checkbox_char(raw),
@@ -3667,6 +3692,26 @@ mod tests {
     fn context_view_empty_degenerates() {
         assert_eq!(context_view(0, Some(1), 5), (1, 0, None));
         assert_eq!(context_view(5, Some(1), 0), (1, 0, None));
+    }
+
+    /// `expand_tabs` advances to the next 4-column tab stop, matching
+    /// `count_indent`'s convention. Leading tabs (the common case for subtask
+    /// indentation) expand to 4 spaces; mid-line tabs advance relative to the
+    /// current column.
+    #[test]
+    fn expand_tabs_advances_to_tab_stops() {
+        // No tabs — unchanged.
+        assert_eq!(expand_tabs("- [ ] plain task"), "- [ ] plain task");
+        // Leading tab → 4 spaces (column 0 → next stop at 4).
+        assert_eq!(expand_tabs("\t- [ ] subtask"), "    - [ ] subtask");
+        // Two leading tabs → 8 spaces.
+        assert_eq!(expand_tabs("\t\t- [ ] deep"), "        - [ ] deep");
+        // Column 2 + tab → advances to column 4 (2 spaces).
+        assert_eq!(expand_tabs("  \t- [ ] mixed"), "    - [ ] mixed");
+        // Column 5 + tab → advances to column 8 (3 spaces).
+        assert_eq!(expand_tabs("text1\trest"), "text1   rest");
+        // Empty string.
+        assert_eq!(expand_tabs(""), "");
     }
 
     /// `sync_context` loads the selected note's cached content and `refresh` keeps it
@@ -5240,6 +5285,41 @@ mod tests {
         assert_eq!(rows.len(), 2, "header + only the open task");
         assert_eq!(header(&rows[0]).0, "projects");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
+    }
+
+    /// Tasks with different `indent` values flow through `build_view` unchanged so
+    /// `row_to_item` can render proportional subtask indentation.
+    #[test]
+    fn build_view_preserves_task_indent() {
+        let mut t1 = task(1, " ", 1, "a.md");
+        t1.indent = 0;
+        let mut t2 = task(2, " ", 2, "a.md");
+        t2.indent = 2;
+        let mut t3 = task(3, " ", 3, "a.md");
+        t3.indent = 4;
+        let tasks = vec![t1, t2, t3];
+        let expanded = HashSet::from(["a.md".to_string()]);
+
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            false,
+            "",
+            "",
+            "",
+            false,
+            GroupBy::Note,
+        );
+        assert_eq!(rows.len(), 4, "header + three tasks");
+        let indents: Vec<usize> = rows
+            .iter()
+            .filter_map(|r| match r {
+                DisplayRow::Task { task } => Some(task.indent),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(indents, vec![0, 2, 4]);
     }
 
     /// Priority axis composes with the search filter.

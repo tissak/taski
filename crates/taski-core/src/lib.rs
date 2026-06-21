@@ -139,6 +139,10 @@ pub struct Task {
     pub note_path: String,
     /// 1-based line number within the note. Location, not identity.
     pub line_number: usize,
+    /// Leading whitespace column of the source line (spaces 1:1, tabs expanded to
+    /// 4-column tab stops). Captures subtask nesting depth for visual indentation in
+    /// the TUI. Zero for top-level tasks. Blockquote markers (`>`) are not counted.
+    pub indent: usize,
     /// Task body text (trimmed).
     pub text: String,
     /// Hash of the task text — the per-note reconciliation key (ADR-0005 §2). Two
@@ -217,11 +221,13 @@ fn parse_task_line(raw_line: &str, note_path: &str, line_number: usize, now: i64
     let body = body.trim();
     let status = Status::from_checkbox_char(checkbox_char);
     let text_hash = hash_str(body);
+    let indent = count_indent(raw_line);
 
     Some(Task {
         id: 0, // placeholder — the DB assigns the surrogate rowid on INSERT (ADR-0005).
         note_path: note_path.to_string(),
         line_number,
+        indent,
         text: body.to_string(),
         text_hash,
         status,
@@ -748,6 +754,23 @@ fn task_captures(line: &str) -> Option<(&str, &str)> {
     Some((checkbox_str, body))
 }
 
+/// Count the leading whitespace of a line as a visual column offset. Spaces count
+/// 1:1; a tab advances to the next multiple of 4 (the common Obsidian tab width).
+/// Stops at the first non-whitespace character. Returns 0 for lines with no leading
+/// whitespace (including blockquote-prefixed lines like `> - [ ] task`, where the
+/// `>` is not nesting indentation).
+fn count_indent(line: &str) -> usize {
+    let mut col = 0usize;
+    for c in line.chars() {
+        match c {
+            ' ' => col += 1,
+            '\t' => col = (col / 4 + 1) * 4,
+            _ => break,
+        }
+    }
+    col
+}
+
 /// Advance `i` past leading ASCII whitespace and any run of `>` blockquote markers
 /// (each optionally followed by more whitespace). Stops at the first byte that is
 /// neither whitespace nor part of a leading `>` run.
@@ -939,6 +962,10 @@ plain text
         // star, plus, indented = 3 tasks; indented-with-no-space-after-`]` is rejected
         assert_eq!(tasks.len(), 3);
         assert!(tasks.iter().all(|t| t.status == Status::Open));
+        // Indent is captured: star/plus at column 0, the indented one at column 2.
+        assert_eq!(tasks[0].indent, 0); // `* [ ]  star bullet works`
+        assert_eq!(tasks[1].indent, 0); // `+ [ ] plus bullet works`
+        assert_eq!(tasks[2].indent, 2); // `  - [ ] indented works`
     }
 
     #[test]
@@ -1815,6 +1842,42 @@ plain text
             toggle_bullet("  - indented bullet"),
             RewriteResult::Rewritten("  - [ ] indented bullet".to_string())
         );
+    }
+
+    #[test]
+    fn count_indent_spaces_tabs_and_mixed() {
+        // No leading whitespace.
+        assert_eq!(count_indent("- [ ] top"), 0);
+        // Spaces count 1:1.
+        assert_eq!(count_indent("  - [ ] nested"), 2);
+        assert_eq!(count_indent("    - [ ] deep"), 4);
+        // A tab advances to the next multiple of 4.
+        assert_eq!(count_indent("\t- [ ] tabbed"), 4);
+        // Column 2 + tab → next multiple of 4 = 4.
+        assert_eq!(count_indent("  \t- [ ] mixed"), 4);
+        // Column 5 + tab → next multiple of 4 = 8.
+        assert_eq!(count_indent("     \t- [ ] mixed2"), 8);
+        // Blockquote marker is not whitespace — indent is 0.
+        assert_eq!(count_indent("> - [ ] quoted"), 0);
+        // Indented blockquote: 2 spaces of whitespace, then `>`.
+        assert_eq!(count_indent("  > - [ ] quoted"), 2);
+        // Empty / all-whitespace lines.
+        assert_eq!(count_indent(""), 0);
+        assert_eq!(count_indent("   "), 3);
+    }
+
+    #[test]
+    fn parse_tasks_captures_indent_for_nested_subtasks() {
+        let md = "\
+- [ ] parent
+  - [ ] child
+    - [ ] grandchild
+";
+        let tasks = parse_tasks(md, "nest.md");
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks[0].indent, 0, "parent at column 0");
+        assert_eq!(tasks[1].indent, 2, "child at column 2");
+        assert_eq!(tasks[2].indent, 4, "grandchild at column 4");
     }
 
     #[test]
