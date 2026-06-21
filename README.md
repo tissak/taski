@@ -109,4 +109,4 @@ cargo fmt --all --check && cargo clippy --all-targets -- -D warnings && cargo te
 
 ---
 
-*Taski is a personal tool built for one workflow. It's not currently licensed for reuse — see the repository if that changes.*
+*Taski is a personal tool built for one workflow, released under the [MIT License](./LICENSE).*

@@ -13,6 +13,7 @@ members = [
 edition = "2024"
 version = "0.1.0"
 rust-version = "1.93"
+license = "MIT"
 
 [workspace.dependencies]
 # Internal crates

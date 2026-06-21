@@ -3,6 +3,7 @@ name = "taski-db"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 taski-core.workspace = true
