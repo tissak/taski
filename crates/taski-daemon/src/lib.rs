@@ -742,8 +742,24 @@ pub fn process_action_at(
     };
 
     // 2. Current task row (the DB row is a *claim*, not truth — bytes are re-verified).
-    let Some(row) = lookup_task_for_action(conn, action.task_id)? else {
-        return Ok(ApplyOutcome::TaskNotFound);
+    let row = match lookup_task_for_action(conn, action.task_id)? {
+        Some(row) => row,
+        None => {
+            // ADR-0012: the ✅ stamp on a done-flip changes text_hash, causing
+            // reconcile_note to assign a new surrogate id. Pending actions
+            // referencing the old id (e.g. undo) would fail with TaskNotFound.
+            // Fall back to the recorded (note_path, line_number) location.
+            tracing::debug!(
+                task_id = action.task_id,
+                note_path = %action.note_path,
+                line_number = action.line_number,
+                "task_id not found; trying location fallback"
+            );
+            match lookup_task_by_location(conn, &action.note_path, action.line_number)? {
+                Some(row) => row,
+                None => return Ok(ApplyOutcome::TaskNotFound),
+            }
+        }
     };
 
     // 3. Read the note fresh from the vault.
@@ -906,8 +922,25 @@ pub fn process_metadata_action(
     action: &PendingAction,
 ) -> Result<ApplyOutcome> {
     // 1. Current task row (the DB row is a *claim*, not truth — bytes are re-verified).
-    let Some(row) = lookup_task_for_action(conn, action.task_id)? else {
-        return Ok(ApplyOutcome::TaskNotFound);
+    let row = match lookup_task_for_action(conn, action.task_id)? {
+        Some(row) => row,
+        None => {
+            // ADR-0009: a prior ⏳ write changed text_hash, causing reconcile_note
+            // to assign a new surrogate id. Pending actions referencing the old
+            // id would fail with TaskNotFound. Fall back to the recorded
+            // (note_path, line_number) location. (Symmetric to the ADR-0012 ✅
+            // fallback in `process_action_at`.)
+            tracing::debug!(
+                task_id = action.task_id,
+                note_path = %action.note_path,
+                line_number = action.line_number,
+                "task_id not found; trying location fallback"
+            );
+            match lookup_task_by_location(conn, &action.note_path, action.line_number)? {
+                Some(row) => row,
+                None => return Ok(ApplyOutcome::TaskNotFound),
+            }
+        }
     };
 
     // 2. Read the note fresh from the vault.
@@ -1091,6 +1124,38 @@ fn lookup_task_for_action(conn: &Connection, task_id: i64) -> Result<Option<Task
         Ok(r) => Ok(Some(r)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(e).with_context(|| format!("looking up task {task_id}")),
+    }
+}
+
+/// Look up a task by its recorded `(note_path, line_number)` location.
+/// Used as a fallback when `lookup_task_for_action(task_id)` returns `None`
+/// because the task's surrogate id churned — the ✅ stamp (ADR-0012) or ⏳
+/// write (ADR-0009) changes `text_hash`, causing `reconcile_note` to assign
+/// a new id. The `PendingAction` carries `note_path` and `line_number` from
+/// enqueue time; for same-line edits (which metadata stamps are), this
+/// location is still valid after re-index.
+fn lookup_task_by_location(
+    conn: &Connection,
+    note_path: &str,
+    line_number: usize,
+) -> Result<Option<TaskRow>> {
+    let row = conn.query_row(
+        "SELECT note_path, line_number, raw_checkbox_char, note_hash
+         FROM tasks WHERE note_path = ?1 AND line_number = ?2",
+        rusqlite::params![note_path, line_number as i64],
+        |row| {
+            Ok(TaskRow {
+                note_path: row.get(0)?,
+                line_number: row.get::<_, i64>(1)? as usize,
+                raw_checkbox_char: row.get(2)?,
+                note_hash: row.get(3)?,
+            })
+        },
+    );
+    match row {
+        Ok(r) => Ok(Some(r)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("looking up task at {note_path}:{line_number}")),
     }
 }
 

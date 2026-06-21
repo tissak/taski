@@ -5,8 +5,8 @@
 use std::fs;
 
 use taski_daemon::{
-    ApplyOutcome, process_action, process_action_at, process_bullet_action,
-    process_pending_actions, scan_vault,
+    ApplyOutcome, index_note, process_action, process_action_at, process_bullet_action,
+    process_metadata_action, process_pending_actions, scan_vault,
 };
 use taski_db as db;
 
@@ -143,8 +143,13 @@ fn flip_refused_when_task_gone_from_index() {
     fs::write(root.join("day.md"), "- [ ] task one\n").unwrap();
     scan_vault(&conn, root, &[]).expect("scan");
 
-    // An action for a task id that isn't (or is no longer) indexed.
-    db::enqueue_action(&conn, 99999, "day.md", 1, " ", "x").expect("enqueue");
+    // An action for a task id that isn't (or is no longer) indexed, AND whose
+    // recorded (note_path, line_number) also holds no task. The ADR-0012
+    // location fallback (undo after a ✅ stamp) resolves a stale task_id by
+    // (note_path, line_number); for "genuinely gone" to surface as
+    // TaskNotFound, the recorded location must have no task. Line 99 has no
+    // task, so both the id lookup and the fallback location lookup fail.
+    db::enqueue_action(&conn, 99999, "day.md", 99, " ", "x").expect("enqueue");
     let action = &db::pending_actions(&conn).expect("pending")[0];
     let outcome = process_action(&conn, root, action).expect("process");
     assert_eq!(outcome, ApplyOutcome::TaskNotFound);
@@ -406,8 +411,13 @@ fn autoincrement_never_reuses_deleted_id() {
     assert!(id_c > id_b, "new id must be higher than all prior ids");
 
     // A pending action referencing the deleted id → TaskNotFound (not some other
-    // task that accidentally reused the id).
-    db::enqueue_action(&conn, id_a, "day.md", 1, " ", "x").expect("enqueue");
+    // task that accidentally reused the id). The recorded line_number (99) has
+    // no task: the ADR-0012 location fallback (undo after a ✅ stamp) resolves
+    // a stale task_id by (note_path, line_number); for "genuinely deleted" to
+    // surface as TaskNotFound, the recorded location must have no task. (The
+    // AUTOINCREMENT-no-reuse invariant itself is already pinned by the
+    // `id_c > id_a`/`id_c > id_b` assertions above.)
+    db::enqueue_action(&conn, id_a, "day.md", 99, " ", "x").expect("enqueue");
     let action = &db::pending_actions(&conn).expect("pending")[0];
     let outcome = process_action(&conn, root, action).expect("process");
     assert_eq!(
@@ -812,4 +822,185 @@ fn done_date_stamped_via_process_pending_actions_end_to_end() {
     assert_eq!(reparsed.len(), 1);
     assert_eq!(reparsed[0].status, taski_core::Status::Done);
     assert_eq!(reparsed[0].done_date.as_deref(), Some(today.as_str()));
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0012 regression: the ✅ done-date stamp is appended to the task body,
+// changing `text_hash`. Reconciliation then DELETEs the old row + INSERTs a
+// new one with a new surrogate id. A pending action referencing the OLD id
+// (e.g. an undo enqueued right after the forward flip) would fail with
+// TaskNotFound. The fix: when `lookup_task_for_action(task_id)` returns None,
+// fall back to the recorded `(note_path, line_number)` from the PendingAction
+// row. For same-line metadata stamps the line_number is stable, so the
+// location lookup finds the task at its new id.
+//
+// Symmetric coverage for the ⏳ write path in `process_metadata_action`
+// (same id-churn hazard — `⏳` is also appended to the body).
+// ---------------------------------------------------------------------------
+
+/// Regression: undoing a `[ ]→[x]` flip after the drain loop has re-indexed the
+/// note must NOT fail with `TaskNotFound`. The forward flip stamped `✅`, the
+/// re-index churned the task's surrogate id, and the undo action still
+/// references the stale id. The location fallback `(note_path, line_number)`
+/// finds the task at its new id and the undo applies.
+#[test]
+fn undo_after_done_flip_uses_location_fallback() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let conn = db::open(&tmp.path().join("u.db").to_string_lossy()).expect("open db");
+    let note = root.join("day.md");
+    fs::write(&note, "- [ ] task one\n").unwrap();
+    scan_vault(&conn, root, &[]).expect("scan");
+    let t1 = db::all_tasks(&conn).expect("all_tasks")[0].clone();
+    let stale_id = t1.id;
+    assert_eq!(t1.line_number, 1);
+
+    // Forward flip: [ ] -> [x] with the original task_id. ADR-0012 stamps ✅.
+    db::enqueue_action(&conn, t1.id, &t1.note_path, t1.line_number, " ", "x").expect("enqueue fwd");
+    let fwd = db::pending_actions(&conn).expect("pending")[0].clone();
+    let outcome = process_action_at(&conn, root, &fwd, "2026-06-21").expect("process fwd");
+    assert_eq!(outcome, ApplyOutcome::Applied);
+    assert_eq!(
+        fs::read_to_string(&note).unwrap(),
+        "- [x] task one ✅ 2026-06-21\n"
+    );
+    db::resolve_action(&conn, fwd.id, "done", None).unwrap();
+
+    // Re-index — exactly what the drain loop does after every Applied. The ✅
+    // stamp changed the body, so text_hash differs and reconcile_note DELETEs
+    // the old row + INSERTs a new one (new surrogate id).
+    index_note(&conn, &note, root).expect("re-index");
+
+    // The stale task_id no longer resolves — this is the regression condition.
+    let after = db::all_tasks(&conn).expect("all_tasks after re-index");
+    assert_eq!(after.len(), 1);
+    assert!(
+        !after.iter().any(|t| t.id == stale_id),
+        "stale id must be gone after the ✅ stamp churned text_hash"
+    );
+    let new_id = after[0].id;
+    assert_ne!(
+        new_id, stale_id,
+        "reconciliation must have assigned a new id"
+    );
+
+    // Undo flip: [x] -> [ ] enqueued with the STALE task_id. Without the
+    // location fallback this returns TaskNotFound; with it, it returns Applied.
+    db::enqueue_action(&conn, stale_id, &t1.note_path, t1.line_number, "x", " ")
+        .expect("enqueue undo");
+    let undo = db::pending_actions(&conn).expect("pending")[0].clone();
+    let outcome = process_action_at(&conn, root, &undo, "2026-06-21").expect("process undo");
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Applied,
+        "undo with a stale task_id must succeed via the location fallback"
+    );
+
+    // ✅ cleared (un-complete symmetry), checkbox open. Byte-identical to the
+    // original.
+    assert_eq!(
+        fs::read_to_string(&note).unwrap(),
+        "- [ ] task one\n",
+        "undo must clear the ✅ stamp and re-open the checkbox"
+    );
+}
+
+/// Regression guard: the location fallback must STILL return `TaskNotFound`
+/// when the task is genuinely gone (note deleted, row pruned). Otherwise the
+/// fallback would mask real disappearances as apply-time id churn. Mirrors the
+/// existing `flip_refused_when_task_gone_from_index` test, but exercises the
+/// location-fallback code path explicitly.
+#[test]
+fn location_fallback_returns_tasknotfound_when_task_genuinely_deleted() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let conn = db::open(&tmp.path().join("d.db").to_string_lossy()).expect("open db");
+    let note = root.join("day.md");
+    fs::write(&note, "- [ ] task one\n").unwrap();
+    scan_vault(&conn, root, &[]).expect("scan");
+    let t1 = db::all_tasks(&conn).expect("all_tasks")[0].clone();
+    let stale_id = t1.id;
+
+    // Genuinely delete the task: remove the note file AND prune the row (the
+    // watch loop does both — `handle_debounced_event` calls
+    // `db::delete_tasks_for_note` on file removal; `index_note` alone would
+    // just no-op on a missing file).
+    fs::remove_file(&note).unwrap();
+    db::delete_tasks_for_note(&conn, &t1.note_path).expect("delete tasks for note");
+    assert!(db::all_tasks(&conn).unwrap().is_empty());
+
+    // Enqueue a flip with the stale id. Neither the id lookup nor the location
+    // lookup finds anything → TaskNotFound (not Applied, not some other outcome).
+    db::enqueue_action(&conn, stale_id, &t1.note_path, t1.line_number, " ", "x").expect("enqueue");
+    let action = db::pending_actions(&conn).expect("pending")[0].clone();
+    let outcome = process_action_at(&conn, root, &action, "2026-06-21").expect("process");
+    assert_eq!(
+        outcome,
+        ApplyOutcome::TaskNotFound,
+        "genuine deletion must surface as TaskNotFound even with the location fallback"
+    );
+}
+
+/// Regression (metadata path): a second `set_scheduled` write — enqueued after
+/// the first one's re-index churned the id — must succeed via the location
+/// fallback. Symmetric to `undo_after_done_flip_uses_location_fallback` but
+/// for the `⏳` stamp (ADR-0009) in `process_metadata_action`.
+#[test]
+fn double_set_scheduled_uses_location_fallback() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let conn = db::open(&tmp.path().join("ms.db").to_string_lossy()).expect("open db");
+    let note = root.join("day.md");
+    fs::write(&note, "- [ ] task one\n").unwrap();
+    scan_vault(&conn, root, &[]).expect("scan");
+    let t1 = db::all_tasks(&conn).expect("all_tasks")[0].clone();
+    let stale_id = t1.id;
+
+    // First ⏳ write: stamp `⏳ 2026-06-21`.
+    db::enqueue_set_scheduled(
+        &conn,
+        t1.id,
+        &t1.note_path,
+        t1.line_number,
+        Some("2026-06-21"),
+    )
+    .expect("enqueue mark");
+    let mark = db::pending_actions(&conn).expect("pending")[0].clone();
+    let outcome = process_metadata_action(&conn, root, &mark).expect("process mark");
+    assert_eq!(outcome, ApplyOutcome::Applied);
+    assert_eq!(
+        fs::read_to_string(&note).unwrap(),
+        "- [ ] task one ⏳ 2026-06-21\n"
+    );
+    db::resolve_action(&conn, mark.id, "done", None).unwrap();
+
+    // Re-index — the ⏳ stamp changed the body, so text_hash differs and the
+    // surrogate id churns (DELETE + INSERT).
+    index_note(&conn, &note, root).expect("re-index");
+    let after = db::all_tasks(&conn).expect("all_tasks after re-index");
+    assert_eq!(after.len(), 1);
+    assert!(
+        !after.iter().any(|t| t.id == stale_id),
+        "stale id must be gone after the ⏳ stamp churned text_hash"
+    );
+
+    // Second ⏳ write: unmark (`payload = None`) enqueued with the STALE task_id.
+    // Without the location fallback this returns TaskNotFound; with it, Applied.
+    db::enqueue_set_scheduled(&conn, stale_id, &t1.note_path, t1.line_number, None)
+        .expect("enqueue unmark");
+    let unmark = db::pending_actions(&conn).expect("pending")[0].clone();
+    let outcome = process_metadata_action(&conn, root, &unmark).expect("process unmark");
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Applied,
+        "second ⏳ write with a stale task_id must succeed via the location fallback"
+    );
+
+    // The ⏳ token (and its preceding space) is gone — byte-identical to the
+    // original.
+    assert_eq!(
+        fs::read_to_string(&note).unwrap(),
+        "- [ ] task one\n",
+        "unmark must remove the ⏳ token"
+    );
 }
