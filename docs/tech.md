@@ -34,6 +34,8 @@ Authoritative record of technology choices for Taski. Each entry has a one-line 
 
 > **Deferred (revisit when needed):** `pulldown-cmark` (adopt when real edge cases — tasks in nested lists / inline code / callouts — exceed the line parser).
 
+> **Frontmatter `taski-skip` opt-out (ADR-0017):** a note whose first-line YAML frontmatter carries `taski-skip: true` contributes **no tasks** to the index. The pure `taski_skip_enabled(markdown)` detector lives in `taski-core` (no new dep, manual string parsing); the daemon's `index_note` guards on it — reconciling with an empty list (which **evicts** any previously-indexed rows via `reconcile_note`'s unmatched-row delete) and skipping the `note_contents` cache. Read-path only: no schema bump, no `pending_actions`, no vault mutation, no write-back ADR touched. Only the literal boolean `true` (case-insensitive) or its quoted `"true"`/`'true'` variants are honored — YAML-1.1 spellings (`yes`/`on`) are deliberately rejected. The per-file, content-local complement to `exclude_dirs`.
+
 ## UI / TUI
 | Choice | Rationale | Decided |
 |---|---|---|

@@ -1,6 +1,6 @@
 # Taski — Engineering Context & Onboarding
 
-*Onboarding guide for new engineers. Last updated: 2026-06-21 (post-v0.4 — adds Tier 1 metadata parsing [tags, priority, start/created/done/cancelled dates], Tier 2 views [overdue `O`, group-by cycling `G`], the `✅` done-date stamp on toggle [ADR-0012], the `❌` cancelled-date stamp on cancel [ADR-0013], the `➕` quick-add inbox creation [ADR-0014], the `o` open-in-Obsidian deep-link gesture [ADR-0015], and the `i` in-progress toggle gesture [ADR-0016]; 329 tests across 6 crates).*
+*Onboarding guide for new engineers. Last updated: 2026-06-22 (post-v0.4 — adds Tier 1 metadata parsing [tags, priority, start/created/done/cancelled dates], Tier 2 views [overdue `O`, group-by cycling `G`], the `✅` done-date stamp on toggle [ADR-0012], the `❌` cancelled-date stamp on cancel [ADR-0013], the `➕` quick-add inbox creation [ADR-0014], the `o` open-in-Obsidian deep-link gesture [ADR-0015], the `i` in-progress toggle gesture [ADR-0016], and the `taski-skip` frontmatter opt-out [ADR-0017]; 350 tests across 6 crates).*
 
 This document is the "operating manual" for working on Taski: what it is, how it's
 built, the decisions that are load-bearing (and must not be casually undone), and the
@@ -484,6 +484,19 @@ understanding the failure mode it prevents.**
     in-progress keeps its `✅` — accepted as coherent, not a bug). Undo is free (`u` already reverses checkbox flips). No
     new proptest — the existing `writeback_proptest` already exercises arbitrary-`new_char` flips.
 
+17. **Frontmatter `taski-skip` per-note opt-out** ([ADR-0017](./adr/0017-frontmatter-taski-skip-opt-out.md)) —
+    A note whose first-line YAML frontmatter carries `taski-skip: true` contributes **no tasks** to the index. The pure
+    `taski_core::taski_skip_enabled(markdown)` detector (no new dep) is consulted by a single guard in the daemon's
+    `index_note` — the chokepoint both the initial `scan_vault` and the live watcher pass through — so adding/removing
+    the flag takes effect on the next scan (~1s). When set, the note is reconciled with an **empty** task list, which
+    **evicts** any previously-indexed rows for it (`reconcile_note`'s unmatched-row delete); the `note_contents` cache is
+    skipped. This is an **index/read-path** feature: no `pending_actions`, no vault mutation, no schema bump, and no
+    write-back ADR is touched (a skipped note has no task rows, so the TUI can never enqueue an action against it). Only
+    the literal boolean `true` (case-insensitive) or its quoted `"true"`/`'true'` variants are honored — `false`, `yes`,
+    `on`, empty, or a malformed/unclosed frontmatter block are all treated as "not set." The per-file, content-local
+    complement to `exclude_dirs` (#11, directory-level). Notably `exclude_dirs` lacks its own ADR; ADR-0017 exists because
+    the frontmatter grammar is a load-bearing contract future parsing must respect.
+
 ---
 
 ## Gotchas & Landmines (read this before you change anything)
@@ -580,6 +593,14 @@ These are the things that aren't obvious from reading the code and will cost you
   literal directory path (and SQL's single-char `_` wildcard makes it hairier). If purge
   silently does nothing, check that the bind value ends with `/%`.
 
+- **`taski-skip: true` is strict about the value (ADR-0017).** Only the literal boolean
+  `true` (case-insensitive) or its quoted `"true"`/`'true'` variants suppress indexing.
+  `yes`/`on`/`1`/empty are **not** honored (deliberate — explicit opt-in only), so
+  "I set the flag but tasks still show" usually means a YAML-1.1 spelling. The flag must
+  also be a **top-level** frontmatter key on a well-formed first-line `---`…`---` block
+  (an unclosed block or an indented/nested key is ignored). Toggling the flag evicts/rehydrates
+  rows on the next scan (~1s) via the normal reconciliation path — no manual purge.
+
 - **Undo scope covers checkbox flips (`Space`, `d`, `i`), bullet toggles (`b`), and quick-add (`a` — removes the appended line). Not `t` (mark-for-today).** `u` undoes the
   last checkbox flip (cancel is a flip to `-` and in-progress to `/`, so both are covered), bullet toggle, or quick-add — not `t`
   (mark-for-today). The `t` gesture is already idempotent (pressing `t` again removes the
@@ -646,10 +667,10 @@ These are the things that aren't obvious from reading the code and will cost you
 
 | Location | What it guards |
 |---|---|
-| `taski-core` unit tests + `proptest` + `rewrite_scheduled_proptest` + `tag_extraction_proptest` + `inbox_line_proptest` | Parser correctness on a synthetic corpus; never-panics on arbitrary input; due/scheduled/start/created/done/cancelled date extraction; `extract_priority` (incl. the `⏫`=High / `🔺`=Highest mapping); `extract_tags` grammar + dedup; pure `rewrite_scheduled` oracle (256-case ADR-0009 Phase 2); tag-extraction grammar + dedup proptest (256 cases); `inbox_line_for` construction oracle (256-case ADR-0014). |
+| `taski-core` unit tests + `proptest` + `rewrite_scheduled_proptest` + `tag_extraction_proptest` + `inbox_line_proptest` | Parser correctness on a synthetic corpus; never-panics on arbitrary input; due/scheduled/start/created/done/cancelled date extraction; `extract_priority` (incl. the `⏫`=High / `🔺`=Highest mapping); `extract_tags` grammar + dedup; pure `rewrite_scheduled` oracle (256-case ADR-0009 Phase 2); tag-extraction grammar + dedup proptest (256 cases); `inbox_line_for` construction oracle (256-case ADR-0014); `taski_skip_enabled` frontmatter opt-out detector grammar (ADR-0017 — first-line `---` block, top-level key only, literal `true` truthiness, CRLF, unclosed-block, nested-key, prefix-key, fenced-decoy cases). |
 | `taski-config` unit tests | TOML parsing, precedence (CLI→config→default), env override, `template()` round-trips, `obsidian_vault`/`use_advanced_uri` deserialize + default-absent (ADR-0015). |
 | `taski-db` unit tests | Schema, `reconcile_note` identity retention, upsert/read round-trips (incl. Tier 1 metadata + the tag sentinel storage format), action pruning, `open()` creates missing dirs. |
-| `taski-daemon/tests/scan.rs` | End-to-end scan of a fake vault → correct task rows. |
+| `taski-daemon/tests/scan.rs` | End-to-end scan of a fake vault → correct task rows; `taski-skip` frontmatter suppresses indexing and **evicts** tasks when the flag is toggled onto an already-indexed note (ADR-0017). |
 | `taski-daemon/tests/reconcile.rs` | Content-hash reconciliation: identity survives edits, deletes, reorders. |
 | `taski-daemon/tests/writeback.rs` + `writeback_proptest.rs` + `metadata_writeback_proptest.rs` + `done_date_writeback_proptest.rs` + `cancelled_date_writeback_proptest.rs` + `quick_add_writeback_proptest.rs` | The safety contract: atomic_write commits on match, refuses on conflict, never corrupts; `⏳` metadata write-back "never corrupts" (256-case ADR-0009 Phase 2, oracle = `rewrite_scheduled`); `✅` done-date-on-toggle stamp "never corrupts" (256-case ADR-0012, oracle = `rewrite_done_date`, CRLF assertion, VS16 guards); `❌` cancelled-date-on-cancel stamp "never corrupts" (256-case ADR-0013, oracle = `rewrite_cancelled_date`; also exercises cross-state `✅`-clearing); quick-add append/create "never corrupts" (256-case ADR-0014, oracle = `inbox_line_for`; also covers first-creation and undo removal). Also covers `toggle_bullet` and `undo` action types (ADR-0011). |
 | `taski-daemon/src/lock.rs` unit tests | The `flock` single-writer lock: acquire/refuse outcome, lock-path derivation. |
@@ -677,6 +698,7 @@ exercised only at runtime (its `taski.db` is gitignored).
 | Change context-pane keybindings/behavior | `taski-tui/src/lib.rs` key match in `run_loop` (`J`/`K` scroll, `p` toggle) + `MIN_SPLIT_WIDTH` auto-hide; `sync_context` for the read path |
 | Change open-in-Obsidian behavior | `crates/taski-tui/src/lib.rs`: `obsidian_url`/`percent_encode_query` (pure URL builder + encoder), `open_in_obsidian` (spawn helper), `run_loop` `o` key; `crates/taski-config/src/lib.rs`: `obsidian_vault`/`use_advanced_uri` fields; ADR-0015 |
 | Add/change vault directory exclusions | Add `exclude_dirs` to `~/.config/taski/config.toml`; restart daemon. Purge happens on startup — see `delete_tasks_for_excluded_dirs` in `taski-db`, `should_exclude_entry`/`path_matches_exclude` in `taski-daemon` |
+| Suppress a single note's tasks via frontmatter | `taski-core::taski_skip_enabled` (pure first-line-frontmatter detector); the `index_note` guard in `taski-daemon` reconciles with an empty list to evict. Set `taski-skip: true` in the note's YAML frontmatter; ADR-0017 |
 | Change undo behavior | `taski-tui/src/lib.rs` `submit_undo` (enqueues the reverse via `db::enqueue_action` for checkbox undo, `db::enqueue_bullet_toggle` for bullet undo, or `db::enqueue_quick_add_undo` for quick-add undo — `LastAction::QuickAdd` arm); daemon dispatches to `process_action` / `process_bullet_action` / `process_quick_add_undo` like other action types |
 | Change quick-add behavior | `crates/taski-tui/src/lib.rs`: `start_quick_add`/`submit_quick_add`/`clear_quick_add`, `run_loop` `a` key + `quick_adding` branch; `crates/taski-daemon/src/lib.rs`: `process_quick_add`/`process_quick_add_undo`; ADR-0014 |
 | Change launcher behavior (combined/daemon/tui dispatch, attach-or-spawn, shutdown handshake) | `crates/taski/src/main.rs` (`run_combined`/`run_combined_spawn`/`run_daemon_only`); ADR-0007 |

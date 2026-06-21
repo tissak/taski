@@ -165,3 +165,82 @@ fn index_note_populates_note_hash_and_mtime() {
         .unwrap();
     assert_ne!(h3, h1, "content hash must change when bytes change");
 }
+
+/// ADR-0017: a note whose frontmatter carries `taski-skip: true` contributes zero
+/// tasks, even though its body has real `- [ ]` checkbox lines.
+#[test]
+fn index_note_skips_taski_skip_frontmatter() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let conn = db::open(&tmp.path().join("skip.db").to_string_lossy()).expect("open db");
+    let note = root.join("game.md");
+
+    // Frontmatter with the opt-out flag set, plus real checkbox bodies below it.
+    fs::write(
+        &note,
+        "---\ntaski-skip: true\n---\n\n- [ ] slay the dragon\n- [x] collect 10 coins\n",
+    )
+    .unwrap();
+
+    let n = index_note(&conn, &note, root).expect("index skipped note");
+    assert_eq!(n, 0, "a taski-skip note contributes 0 tasks");
+    let tasks = db::all_tasks(&conn).expect("all_tasks");
+    assert!(
+        tasks.iter().all(|t| t.note_path != "game.md"),
+        "no tasks should be indexed for the skipped note: {tasks:?}"
+    );
+    assert!(
+        tasks.is_empty(),
+        "the skipped note's checkboxes never reach the index: {tasks:?}"
+    );
+    // ADR-0017 contract: a skipped note's body is NOT cached in `note_contents` (its
+    // tasks never surface in the context pane, so caching would be dead weight). This
+    // pins the contract explicitly — `upsert_note_content` is never reached on the
+    // skip path (it lives below the guard), and this assertion catches a silent
+    // regression if the calls are ever reordered.
+    assert!(
+        db::note_content(&conn, "game.md")
+            .expect("note_content query")
+            .is_none(),
+        "a taski-skip note's body must not be cached in note_contents"
+    );
+}
+
+/// ADR-0017: adding `taski-skip: true` to an already-indexed note evicts its
+/// previously-indexed tasks on the next `index_note` pass (self-healing via
+/// `reconcile_note` with an empty task list).
+#[test]
+fn index_note_evicts_tasks_when_skip_flag_added() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let conn = db::open(&tmp.path().join("evict.db").to_string_lossy()).expect("open db");
+    let note = root.join("habit.md");
+
+    // First: a normal note with two real tasks (no frontmatter). Both index.
+    let body = "- [ ] drink water\n- [ ] stretch\n";
+    fs::write(&note, body).unwrap();
+    assert_eq!(index_note(&conn, &note, root).expect("index v1"), 2);
+    let after_v1 = db::all_tasks(&conn).expect("all_tasks");
+    assert_eq!(after_v1.len(), 2, "normal note indexes its tasks");
+
+    // Now rewrite the note to PREPEND frontmatter with the skip flag, keeping
+    // the same task bodies verbatim below the frontmatter.
+    let frontmatter = "---\ntaski-skip: true\n---\n";
+    let with_flag = format!("{frontmatter}\n{body}");
+    fs::write(&note, &with_flag).unwrap();
+
+    assert_eq!(
+        index_note(&conn, &note, root).expect("index v2 (skip added)"),
+        0,
+        "after the flag is added, the note contributes 0 tasks"
+    );
+    let after_v2 = db::all_tasks(&conn).expect("all_tasks");
+    assert!(
+        after_v2.iter().all(|t| t.note_path != "habit.md"),
+        "previously-indexed tasks for the now-skipped note must be evicted: {after_v2:?}"
+    );
+    assert!(
+        after_v2.is_empty(),
+        "eviction leaves the note with no rows: {after_v2:?}"
+    );
+}

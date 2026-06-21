@@ -215,6 +215,61 @@ fn is_fence(trimmed_line: &str) -> bool {
     trimmed_line.starts_with("```") || trimmed_line.starts_with("~~~")
 }
 
+/// True iff the note's YAML frontmatter carries a top-level `taski-skip: true` flag.
+///
+/// Only the first frontmatter block is honored: the note's very first line must be `---`
+/// (trailing whitespace/`\r` trimmed), and only lines up to the first closing `---` are
+/// examined. A `---` elsewhere in the body is not frontmatter. If no closing `---` is
+/// found, the note is treated as having no frontmatter at all (the flag is absent, even
+/// if the key appears below the opener). Only a top-level (column-0) `taski-skip` key is
+/// matched (nested/indented keys are ignored). The first such key wins; its value is
+/// truthy iff it case-insensitively equals `true`, or equals the quoted variants
+/// `"true"` / `'true'`. All other spellings (`false`, `yes`, `on`, empty, …) are NOT
+/// truthy. See ADR-0017.
+pub fn taski_skip_enabled(markdown: &str) -> bool {
+    let mut lines = markdown.lines();
+    // Opener must be the very first line.
+    let first = match lines.next() {
+        Some(l) => l,
+        None => return false,
+    };
+    if first.trim_end() != "---" {
+        return false;
+    }
+    // First-key-wins value, deferred until a closing fence confirms a well-formed
+    // block. If the loop ends with no closer, the note has no frontmatter (ADR-0017).
+    let mut pending: Option<bool> = None;
+    for line in lines {
+        if line.trim_end() == "---" {
+            return pending.unwrap_or(false);
+        }
+        if pending.is_none()
+            && let Some(raw_value) = frontmatter_value_for_key(line, "taski-skip")
+        {
+            pending = Some(is_taski_skip_truthy(raw_value));
+        }
+    }
+    false
+}
+
+/// If `line` is a top-level (no leading whitespace) YAML mapping line for `key`, return the
+/// raw value text after the colon (may be empty). Otherwise `None`.
+fn frontmatter_value_for_key<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    if !line.starts_with(key) {
+        return None;
+    }
+    let rest = line[key.len()..].trim_start();
+    let after_colon = rest.strip_prefix(':')?;
+    Some(after_colon)
+}
+
+/// Truthiness for the `taski-skip` value: literal `true` (case-insensitive) or the quoted
+/// `"true"` / `'true'` variants. Anything else (including `yes`/`on`/empty) is not truthy.
+fn is_taski_skip_truthy(raw_value: &str) -> bool {
+    let v = raw_value.trim();
+    v.eq_ignore_ascii_case("true") || v == "\"true\"" || v == "'true'"
+}
+
 /// Try to interpret a single line as a task checkbox line.
 fn parse_task_line(raw_line: &str, note_path: &str, line_number: usize, now: i64) -> Option<Task> {
     let (checkbox_char, body) = task_captures(raw_line)?;
@@ -1961,5 +2016,170 @@ plain text
         ] {
             let _ = toggle_bullet(line);
         }
+    }
+
+    // ── taski_skip_enabled unit tests (ADR-0017) ────────────────────────
+    //
+    // The frontmatter `taski-skip: true` opt-out. Pure detector — exercises
+    // every grammar arm: truthy values, non-truthy spellings, missing/misplaced
+    // frontmatter, nested keys, CRLF, and first-key-wins.
+
+    #[test]
+    fn taski_skip_enabled_true() {
+        let md = "---\ntaski-skip: true\n---\n\n- [ ] body task\n";
+        assert!(taski_skip_enabled(md));
+    }
+
+    #[test]
+    fn taski_skip_enabled_false_value() {
+        let md = "---\ntaski-skip: false\n---\n\n- [ ] body task\n";
+        assert!(!taski_skip_enabled(md));
+    }
+
+    #[test]
+    fn taski_skip_enabled_yes_not_honored() {
+        // Deliberately rejects YAML-1.1 truthy spellings (yes/on/1) — only
+        // literal `true` is honored so the opt-in is explicit.
+        assert!(!taski_skip_enabled("---\ntaski-skip: yes\n---\n"));
+        assert!(!taski_skip_enabled("---\ntaski-skip: on\n---\n"));
+        assert!(!taski_skip_enabled("---\ntaski-skip: 1\n---\n"));
+    }
+
+    #[test]
+    fn taski_skip_enabled_empty_value() {
+        // `taski-skip:` with no value → not truthy.
+        assert!(!taski_skip_enabled("---\ntaski-skip:\n---\n"));
+    }
+
+    #[test]
+    fn taski_skip_enabled_quoted_true() {
+        // Both single- and double-quoted `"true"` are truthy.
+        assert!(taski_skip_enabled("---\ntaski-skip: \"true\"\n---\n"));
+        assert!(taski_skip_enabled("---\ntaski-skip: 'true'\n---\n"));
+        // Quoted non-true is not truthy.
+        assert!(!taski_skip_enabled("---\ntaski-skip: \"false\"\n---\n"));
+        assert!(!taski_skip_enabled("---\ntaski-skip: 'yes'\n---\n"));
+    }
+
+    #[test]
+    fn taski_skip_enabled_case_insensitive_true() {
+        // `True` / `TRUE` / `tRuE` all match (case-insensitive literal `true`).
+        assert!(taski_skip_enabled("---\ntaski-skip: True\n---\n"));
+        assert!(taski_skip_enabled("---\ntaski-skip: TRUE\n---\n"));
+        assert!(taski_skip_enabled("---\ntaski-skip: tRuE\n---\n"));
+    }
+
+    #[test]
+    fn taski_skip_enabled_no_frontmatter() {
+        // Plain note with no `---` opener at all.
+        let md = "# Title\n\n- [ ] task\n";
+        assert!(!taski_skip_enabled(md));
+    }
+
+    #[test]
+    fn taski_skip_enabled_hr_not_frontmatter() {
+        // A `---` horizontal rule NOT on line 1 (a blank line first) is not a
+        // frontmatter opener, so the flag is not honored.
+        let md = "\n---\ntaski-skip: true\n---\n\n- [ ] task\n";
+        assert!(!taski_skip_enabled(md));
+    }
+
+    #[test]
+    fn taski_skip_enabled_fenced_block_not_frontmatter() {
+        // `taski-skip: true` inside a fenced code block at the very top of the
+        // file: line 1 is ``` not `---`, so this is not frontmatter.
+        let md = "```\ntaski-skip: true\n```\n\n- [ ] real task\n";
+        assert!(!taski_skip_enabled(md));
+    }
+
+    #[test]
+    fn taski_skip_enabled_nested_key_ignored() {
+        // An indented `  taski-skip: true` nested under another key is ignored
+        // (top-level / column-0 key only). The note is NOT skipped.
+        let md = "---\nmeta:\n  taski-skip: true\n---\n\n- [ ] task\n";
+        assert!(!taski_skip_enabled(md));
+    }
+
+    #[test]
+    fn taski_skip_enabled_first_key_wins() {
+        // Two `taski-skip:` lines: the first one wins. First `false`, second
+        // `true` → the note is NOT skipped (first value wins).
+        let md_false_then_true = "---\ntaski-skip: false\ntaski-skip: true\n---\n";
+        assert!(!taski_skip_enabled(md_false_then_true));
+        // And the reverse: first `true`, second `false` → skipped.
+        let md_true_then_false = "---\ntaski-skip: true\ntaski-skip: false\n---\n";
+        assert!(taski_skip_enabled(md_true_then_false));
+    }
+
+    #[test]
+    fn taski_skip_enabled_crlf() {
+        // CRLF line endings: `markdown.lines()` strips the trailing `\r`, and
+        // the fence comparison also `.trim_end()`s it. The flag is honored.
+        let md = "---\r\ntaski-skip: true\r\n---\r\n\r\n- [ ] body\r\n";
+        assert!(taski_skip_enabled(md));
+    }
+
+    #[test]
+    fn taski_skip_enabled_no_closing_fence() {
+        // Opener `---` present but never closed → treated as no frontmatter;
+        // the flag is absent even though the key appears below the opener.
+        let md = "---\ntaski-skip: true\n\n- [ ] no closing fence\n";
+        assert!(!taski_skip_enabled(md));
+    }
+
+    #[test]
+    fn taski_skip_enabled_prefix_key_rejected() {
+        // `taski-skipper: true` is a different key (the char after `taski-skip`
+        // is `p`, not whitespace/`:`), so it is rejected.
+        let md = "---\ntaski-skipper: true\n---\n\n- [ ] task\n";
+        assert!(!taski_skip_enabled(md));
+    }
+
+    #[test]
+    fn taski_skip_enabled_extra_keys_around() {
+        // Other keys before and after the flag don't affect detection; the
+        // flag is still honored when it is present and truthy.
+        let md = "---\ntitle: My Note\ntags: [game]\ntaski-skip: true\ncreated: 2026-06-22\n---\n\n- [ ] task\n";
+        assert!(taski_skip_enabled(md));
+    }
+
+    #[test]
+    fn taski_skip_enabled_tolerates_whitespace_around_colon() {
+        // Optional whitespace around the colon is accepted per the grammar
+        // (`taski-skip : true` and `taski-skip:   true` both truthy).
+        assert!(taski_skip_enabled("---\ntaski-skip : true\n---\n"));
+        assert!(taski_skip_enabled("---\ntaski-skip:   true\n---\n"));
+    }
+
+    #[test]
+    fn taski_skip_enabled_grammar_edge_pins() {
+        // No space after the colon is fine — the grammar is `:\s*`, so the value
+        // parser does `trim_start` then `strip_prefix(':')`; `taski-skip:true` →
+        // `Some("true")` → truthy.
+        assert!(taski_skip_enabled("---\ntaski-skip:true\n---\n"));
+        // Trailing whitespace on the value is trimmed by `is_taski_skip_truthy`.
+        assert!(taski_skip_enabled("---\ntaski-skip: true   \n---\n"));
+        // An indented `  ---` does NOT close the block: the closer comparison
+        // (`line.trim_end() == "---"`) only strips TRAILING whitespace, so the
+        // leading spaces make `"  ---"` != `"---"`. With no real closer anywhere,
+        // the block is unclosed → no frontmatter → the flag does not take effect.
+        assert!(!taski_skip_enabled("---\ntaski-skip: true\n  ---\n"));
+        // And when a real `---` closer follows the indented one, the indented line
+        // is ignored (it doesn't end the block) and the flag IS honored.
+        assert!(taski_skip_enabled(
+            "---\ntaski-skip: true\n  ---\nbody\n---\n"
+        ));
+    }
+
+    #[test]
+    fn taski_skip_enabled_empty_markdown() {
+        assert!(!taski_skip_enabled(""));
+    }
+
+    #[test]
+    fn taski_skip_enabled_only_opener() {
+        // Just `---` with nothing else: no closing fence and no key → false.
+        assert!(!taski_skip_enabled("---"));
+        assert!(!taski_skip_enabled("---\n"));
     }
 }

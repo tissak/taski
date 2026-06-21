@@ -306,6 +306,18 @@ pub fn index_note(conn: &Connection, abs_path: &Path, vault_root: &Path) -> Resu
     let hash = content_hash(&bytes);
     let mtime = note_mtime(abs_path);
 
+    // ADR-0017: a note whose frontmatter carries `taski-skip: true` contributes no tasks.
+    // Reconcile with an empty list evicts any previously-indexed rows (reconcile_note deletes
+    // unmatched old rows), so toggling the flag is self-healing on the next scan. The note's
+    // body is not cached (its tasks never surface in the context pane). Read-path only: no
+    // pending_actions, no vault mutation, no write-back ADR touched.
+    if taski_core::taski_skip_enabled(markdown) {
+        tracing::debug!(?rel, "taski-skip frontmatter set; suppressing tasks");
+        db::reconcile_note(conn, &rel, &[], Some(&hash), mtime)
+            .with_context(|| format!("reconciling tasks for {rel:?}"))?;
+        return Ok(0);
+    }
+
     let tasks = parse_tasks(markdown, &rel);
     let summary = db::reconcile_note(conn, &rel, &tasks, Some(&hash), mtime)
         .with_context(|| format!("reconciling tasks for {rel:?}"))?;
