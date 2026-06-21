@@ -441,6 +441,12 @@ const SCHEDULED_EMOJI: char = '⏳';
 /// The check-mark button emoji `✅` (U+2705) — the Obsidian Tasks "done" marker.
 const DONE_EMOJI: char = '✅';
 
+/// The cross-mark emoji `❌` (U+274C) — the Obsidian Tasks "cancelled" marker.
+/// ADR-0013: stamped on a `- [-]` cancel flip, the `❌` sibling of the ADR-0012
+/// `✅` done-date stamp. Read by the pre-existing [`extract_cancelled_date`]
+/// (Tier 1, schema v6); this const backs the write-path oracle.
+const CANCELLED_EMOJI: char = '❌';
+
 /// Pure line-rewrite for the ADR-0009 Phase 2 "mark/unmark for today" gesture.
 /// Given a full task line (including the `- [ ] ` prefix, WITHOUT its trailing
 /// `\n` — the caller handles line terminators) and a desired scheduled state:
@@ -487,6 +493,27 @@ pub fn rewrite_scheduled(line: &str, desired: Option<&str>) -> RewriteResult {
 /// refusal, byte-for-byte preservation of unrelated content) carries over.
 pub fn rewrite_done_date(line: &str, desired: Option<&str>) -> RewriteResult {
     rewrite_emoji_date(line, desired, DONE_EMOJI)
+}
+
+/// Pure line-rewrite for the ADR-0013 cancelled-date stamp (the `❌` stamp
+/// composed into a cancel checkbox flip, `- [ ]` → `- [-]`). The direct sibling
+/// of [`rewrite_done_date`] (ADR-0012) on the `❌` axis. Given a full task line
+/// (WITHOUT its trailing `\n` — the caller handles line terminators) and a
+/// desired cancelled-date state:
+///
+/// - `desired = Some("YYYY-MM-DD")` (stamp on cancel): if a parseable `❌`
+///   token already exists, **replace** its date bytes with `desired` (canonical
+///   re-cancel behaviour); otherwise **append** ` ❌ YYYY-MM-DD` at the end of
+///   the line.
+/// - `desired = None` (clear on un-cancel): if a parseable `❌` token exists,
+///   **remove** it and its single preceding ASCII space; otherwise return
+///   [`RewriteResult::Unchanged`].
+///
+/// Identical grammar + splice to [`rewrite_done_date`] / [`rewrite_scheduled`];
+/// only the leading emoji differs (`❌` U+274C). See [`rewrite_done_date`]'s docs
+/// for the full "never guesses" contract — every guarantee carries over.
+pub fn rewrite_cancelled_date(line: &str, desired: Option<&str>) -> RewriteResult {
+    rewrite_emoji_date(line, desired, CANCELLED_EMOJI)
 }
 
 /// Shared core behind [`rewrite_scheduled`] (ADR-0009) and [`rewrite_done_date`]

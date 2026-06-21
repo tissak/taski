@@ -975,7 +975,37 @@ impl App {
         if result.is_ok() {
             self.last_action = last_action;
         }
-        self.track_enqueued(result, "toggle");
+        self.track_enqueued(result);
+    }
+
+    /// `d` (ADR-0013): toggle the selected task's cancelled state — the `❌`
+    /// sibling of the ADR-0012 `✅` done-date stamp. Reuses the `checkbox`
+    /// action_type and the [`LastAction::CheckboxToggle`] variant (cancel IS a
+    /// checkbox flip with `new_char = "-"`), so undo-of-cancel is free: `u`
+    /// already reverses checkbox flips, and the composed stamp logic restores
+    /// `✅`/clears `❌` as appropriate on the reverse flip. The actual vault
+    /// write (flip + `❌` stamp composed into one byte splice) is the daemon's
+    /// job via [`enqueue_cancel`]; the TUI never touches files directly.
+    fn submit_cancel(&mut self, conn: &Connection) {
+        let (result, last_action) = {
+            let Some(task) = self.selected_task() else {
+                return;
+            };
+            let new_char = cancel_target_char(&task.raw_checkbox_char);
+            let action = LastAction::CheckboxToggle {
+                task_id: task.id,
+                note_path: task.note_path.clone(),
+                line_number: task.line_number,
+                expected_char: task.raw_checkbox_char.clone(),
+                new_char: new_char.to_string(),
+            };
+            (enqueue_cancel(conn, task), Some(action))
+        };
+        // S4: only record an undoable action if the enqueue actually succeeded.
+        if result.is_ok() {
+            self.last_action = last_action;
+        }
+        self.track_enqueued(result);
     }
 
     /// `b` (ADR-0011): toggle the selected task between checkbox and bullet format.
@@ -998,7 +1028,7 @@ impl App {
         if result.is_ok() {
             self.last_action = last_action;
         }
-        self.track_enqueued(result, "bullet toggle");
+        self.track_enqueued(result);
     }
 
     /// `u` (ADR-0011): undo the last write action. If the last action was a checkbox
@@ -1037,7 +1067,7 @@ impl App {
                 .context("enqueuing undo bullet toggle"),
         };
         // Don't update last_action (undo doesn't get its own undo).
-        self.track_enqueued(result, "undo");
+        self.track_enqueued(result);
     }
 
     /// Record the outcome of an enqueue ([`submit_toggle`] /
@@ -1047,7 +1077,7 @@ impl App {
     /// alternate screen, so writing to stderr would garble it; failures surface via
     /// the pending_actions resolution on the next refresh). Shared so both write
     /// gestures stay consistent.
-    fn track_enqueued(&mut self, result: Result<i64>, _label: &str) {
+    fn track_enqueued(&mut self, result: Result<i64>) {
         // S1: the Err arm is intentionally a no-op (see the doc comment above).
         if let Ok(id) = result {
             self.notice = None;
@@ -1079,7 +1109,7 @@ impl App {
             };
             enqueue_set_scheduled(conn, task, desired.as_deref())
         };
-        self.track_enqueued(result, "set scheduled date");
+        self.track_enqueued(result);
     }
 }
 
@@ -1181,6 +1211,13 @@ fn run_loop(
                 // ADR-0011: `b` toggles checkbox ↔ bullet; `u` undoes last write.
                 KeyCode::Char('b') => app.submit_bullet_toggle(conn),
                 KeyCode::Char('u') => app.submit_undo(conn),
+                // ADR-0013: `d` cancels the selected task (`- [ ]` → `- [-]`), the
+                // `❌` sibling of ADR-0012's `✅` done-date stamp. Reuses the
+                // checkbox action_type; the daemon composes the `❌ <today>` stamp
+                // into the same byte splice. Suppressed during a search prompt —
+                // `d` falls through to `push_search_char` in the search arms above,
+                // exactly like `b`.
+                KeyCode::Char('d') => app.submit_cancel(conn),
                 // ADR-0010 text search: `/` opens the search prompt.
                 KeyCode::Char('/') => app.start_search(),
                 // ADR-0010 file search: `F` opens the file/path search prompt.
@@ -1212,6 +1249,18 @@ fn toggle_target_char(raw: &str) -> &'static str {
     }
 }
 
+/// Decide the desired checkbox char for a CANCEL gesture (ADR-0013) of `raw`:
+/// cancelled (`"-"`) -> open (`" "`); anything else (open, done, in-progress,
+/// forwarded, …) -> cancelled (`"-"`). This is the cancel sibling of
+/// [`toggle_target_char`]: pressing `d` always targets the cancelled state
+/// unless the task is already cancelled, in which case `d` re-opens it.
+fn cancel_target_char(raw: &str) -> &'static str {
+    match raw {
+        "-" => " ",
+        _ => "-",
+    }
+}
+
 /// Enqueue a checkbox-flip request for `task` into the shared `pending_actions`
 /// table. Non-blocking: just inserts a row; the daemon applies it. Returns the new
 /// row id so the caller can track its resolution across refreshes.
@@ -1226,6 +1275,27 @@ fn enqueue_toggle(conn: &Connection, task: &Task) -> Result<i64> {
         new_char,
     )
     .context("enqueuing toggle action")?;
+    Ok(id)
+}
+
+/// Enqueue a cancel-flip request (ADR-0013) for `task` into the shared
+/// `pending_actions` table. This reuses the existing `checkbox` action type —
+/// cancel IS a checkbox flip with `new_char = "-"` (the Obsidian cancelled char).
+/// No new action_type, no schema change. The daemon's `process_action_at` stamps
+/// `❌ <today>` (or clears it) as part of the same splice. Non-blocking: just
+/// inserts a row; the daemon applies it. Returns the new row id so the caller can
+/// track its resolution across refreshes.
+fn enqueue_cancel(conn: &Connection, task: &Task) -> Result<i64> {
+    let new_char = cancel_target_char(&task.raw_checkbox_char);
+    let id = db::enqueue_action(
+        conn,
+        task.id,
+        &task.note_path,
+        task.line_number,
+        &task.raw_checkbox_char,
+        new_char,
+    )
+    .context("enqueuing cancel action")?;
     Ok(id)
 }
 
@@ -1283,7 +1353,17 @@ fn friendly_failure_reason(error: &str) -> String {
         "the checkbox line changed".to_string()
     } else if e.contains("invalid new_char") {
         "the request was not valid".to_string()
+    } else if e.contains('✅') {
+        // ADR-0012: the done-date unparseable phrase ("existing ✅ is malformed
+        // or unparseable ..."). Distinguish from the scheduled/cancelled phrases
+        // by the distinctive ✅ glyph — all three share "malformed or unparseable".
+        "the done date on this line couldn't be parsed".to_string()
+    } else if e.contains('❌') {
+        // ADR-0013: the cancelled-date unparseable phrase ("existing ❌ is
+        // malformed or unparseable ..."). Distinguished by the ❌ glyph.
+        "the cancelled date on this line couldn't be parsed".to_string()
     } else if e.contains("malformed or unparseable") {
+        // ADR-0009 Phase 2: the set_scheduled unparseable phrase (no emoji).
         "the scheduled date on this line couldn't be parsed".to_string()
     } else if e.contains("could not be converted to a bullet") {
         "this line has no checkbox or bullet to toggle".to_string()
@@ -1306,7 +1386,13 @@ fn render_failure_notice(action: &PendingAction) -> String {
     let (verb, retry_key) = match action.action_type.as_str() {
         "set_scheduled" => ("Mark", "t"),
         "toggle_bullet" => ("Bullet", "b"),
-        // The default/checkbox path.
+        // The checkbox path covers two gestures that share `action_type = "checkbox"`:
+        // the `Space` done-toggle (ADR-0003/0012) and the `d` cancel gesture
+        // (ADR-0013). Distinguish them by `new_char`: a cancel flip targets `-`,
+        // so a failed cancel's retry key is `d`, not `Space`. No new action_type
+        // or LastAction variant is introduced for this (per ADR-0013).
+        _ if action.new_char == "-" => ("Cancel", "d"),
+        // The default/checkbox path (done-toggle).
         _ => ("Toggle", "Space"),
     };
     format!(
@@ -2319,6 +2405,34 @@ mod tests {
     }
 
     #[test]
+    fn cancel_target_char_maps_others_to_cancelled_and_reopens_cancelled() {
+        // ADR-0013: `d` targets the cancelled char (`-`) from any non-cancelled
+        // state, and re-opens (` `) a cancelled task. The mirror of
+        // `toggle_target_char` on the cancel axis.
+        assert_eq!(cancel_target_char(" "), "-"); // open -> cancelled
+        assert_eq!(cancel_target_char("x"), "-"); // done -> cancelled
+        assert_eq!(cancel_target_char("X"), "-"); // done -> cancelled
+        assert_eq!(cancel_target_char("/"), "-"); // in-progress -> cancelled
+        assert_eq!(cancel_target_char(">"), "-"); // forwarded -> cancelled
+        assert_eq!(cancel_target_char("-"), " "); // cancelled -> re-open
+
+        // Document the invariant that makes `render_failure_notice`'s
+        // `new_char == "-"` seam robust: `toggle_target_char` (the `Space`
+        // done-toggle path) NEVER produces `"-"`. So a failed checkbox action
+        // with `new_char == "-"` is unambiguously a cancel gesture, never a
+        // done-toggle. If this invariant ever breaks, the failure-notice retry
+        // key for a refused done-toggle would wrongly say "Press d".
+        for raw in [" ", "x", "X", "/", ">", "-", "!", "_"] {
+            assert_ne!(
+                toggle_target_char(raw),
+                "-",
+                "toggle_target_char must never target the cancel char (would break \
+                 render_failure_notice's new_char == \"-\" seam); raw={raw:?}"
+            );
+        }
+    }
+
+    #[test]
     fn enqueue_toggle_inserts_pending_action_with_expected_bytes() {
         let conn = db::open(":memory:").unwrap();
         assert!(db::pending_actions(&conn).unwrap().is_empty());
@@ -2378,6 +2492,20 @@ mod tests {
                 "scheduled date is malformed or unparseable; action not applied"
             ),
             "the scheduled date on this line couldn't be parsed",
+        );
+        // ADR-0012: the done-date unparseable phrase shares "malformed or
+        // unparseable" with the scheduled/cancelled phrases — distinguish by the
+        // ✅ glyph. (Without Issue 1's fix this would wrongly map to the scheduled
+        // wording.)
+        assert_eq!(
+            friendly_failure_reason("existing ✅ is malformed or unparseable; toggle not applied"),
+            "the done date on this line couldn't be parsed",
+        );
+        // ADR-0013: the cancelled-date unparseable phrase — distinguish by the ❌
+        // glyph.
+        assert_eq!(
+            friendly_failure_reason("existing ❌ is malformed or unparseable; cancel not applied"),
+            "the cancelled date on this line couldn't be parsed",
         );
         // Unknown -> trimmed copy.
         assert_eq!(
@@ -2485,6 +2613,68 @@ mod tests {
         assert!(
             !notice.contains("Space"),
             "set_scheduled notice must NOT hint the checkbox retry key: {notice}"
+        );
+    }
+
+    /// ADR-0013: a refused cancel action (a `checkbox` row with `new_char='-'`)
+    /// surfaces a notice worded for the cancel gesture ("Cancel not applied")
+    /// that hints the `d` retry key (not `Space`), carrying the plain cancelled-
+    /// date reason and the note name. This locks down (a) `render_failure_notice`'s
+    /// `new_char == "-"` → `("Cancel", "d")` seam and (b) Issue 1's fix that the
+    /// ❌ unparseable phrase maps to the cancelled-date wording (not the scheduled
+    /// wording the old substring collision produced).
+    #[test]
+    fn failed_cancel_surfaces_cancel_notice() {
+        let conn = db::open(":memory:").unwrap();
+        db::upsert_task(&conn, &task(1, " ", 1, "alpha.md")).unwrap();
+
+        let mut app = App::new();
+        app.filter = StatusFilter::All;
+        app.refresh(&conn).unwrap();
+        app.expanded.insert("alpha.md".to_string());
+        app.rebuild();
+        app.state.select(Some(1)); // on the task
+        app.submit_cancel(&conn);
+        let pending = db::pending_actions(&conn).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].action_type, "checkbox");
+        assert_eq!(pending[0].new_char, "-", "cancel enqueues a flip to '-'");
+
+        // Daemon refuses it: the line's existing ❌ is malformed/unparseable.
+        db::resolve_action(
+            &conn,
+            pending[0].id,
+            "failed",
+            Some("existing ❌ is malformed or unparseable; cancel not applied"),
+        )
+        .unwrap();
+        app.refresh(&conn).unwrap();
+
+        let notice = app
+            .notice
+            .as_deref()
+            .expect("cancel failure should surface a notice");
+        assert!(
+            notice.starts_with("Cancel not applied"),
+            "cancel notice should be worded for the cancel gesture: {notice}"
+        );
+        assert!(notice.contains("alpha.md"), "notice should name the note");
+        assert!(
+            notice.contains("the cancelled date on this line couldn't be parsed"),
+            "notice should carry the cancelled-date reason (Issue 1 fix): {notice}"
+        );
+        assert!(
+            !notice.contains("the scheduled date"),
+            "cancel notice must NOT carry the scheduled-date wording (the old \
+             substring-collision bug): {notice}"
+        );
+        assert!(
+            notice.contains("Press d"),
+            "notice should hint the `d` retry key, not Space: {notice}"
+        );
+        assert!(
+            !notice.contains("Space"),
+            "cancel notice must NOT hint the done-toggle retry key: {notice}"
         );
     }
 

@@ -1088,3 +1088,171 @@ fn bullet_undo_refused_on_concurrent_edit_via_note_contents_fallback() {
     // File is untouched (still the edited version).
     assert_eq!(fs::read_to_string(&note).unwrap(), "- task one EDITED\n");
 }
+
+// ---------------------------------------------------------------------------
+// ADR-0013: cross-state transitions of the three-state stamp decision.
+// `cancelled_date_writeback_proptest` only exercises ` `→`-`; these deterministic
+// tests cover the remaining cross-state cells (`x`→`-`, `-`→`x`, `-`→` `) where
+// BOTH oracles fire (one stamps, the other clears). Each uses the fixed-date seam
+// `process_action_at(.., "2026-06-21")` and cross-checks via the pure extractors.
+// ---------------------------------------------------------------------------
+
+/// 7.1 — done→cancelled (`x`→`-`): the `✅` done-date is CLEARED and the `❌`
+/// cancelled-date is STAMPED with today (a task cannot be both done and cancelled).
+/// Both oracles fire on this transition.
+#[test]
+fn cancelled_date_stamped_and_done_cleared_on_flip_done_to_cancelled() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let conn = db::open(&tmp.path().join("cd1.db").to_string_lossy()).expect("open db");
+    let note = root.join("day.md");
+    fs::write(&note, "- [x] ship ✅ 2026-06-19\n").unwrap();
+    scan_vault(&conn, root, &[]).expect("scan");
+    let t = db::all_tasks(&conn).expect("all_tasks")[0].clone();
+
+    db::enqueue_action(&conn, t.id, &t.note_path, t.line_number, "x", "-").expect("enqueue");
+    let action = &db::pending_actions(&conn).expect("pending")[0];
+    let outcome = process_action_at(&conn, root, action, "2026-06-21").expect("process");
+    assert_eq!(outcome, ApplyOutcome::Applied);
+
+    assert_eq!(
+        fs::read_to_string(&note).unwrap(),
+        "- [-] ship ❌ 2026-06-21\n",
+        "done→cancelled flip must clear ✅ and stamp ❌ <today>"
+    );
+
+    // Independent cross-check via the pure extractors (the read path's view).
+    let on_disk = fs::read_to_string(&note).unwrap();
+    let anchor = on_disk.lines().next().expect("anchor");
+    assert_eq!(
+        taski_core::extract_cancelled_date(anchor).as_deref(),
+        Some("2026-06-21"),
+        "cancelled date must parse back to today"
+    );
+    assert_eq!(
+        taski_core::extract_done_date(anchor),
+        None,
+        "done date must be gone after the cancel transition"
+    );
+}
+
+/// 7.2 — cancelled→done (`-`→`x`): the `❌` cancelled-date is CLEARED and the
+/// `✅` done-date is STAMPED with today. The mirror of 7.1; both oracles fire.
+#[test]
+fn cancelled_date_cleared_and_done_stamped_on_flip_cancelled_to_done() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let conn = db::open(&tmp.path().join("cd2.db").to_string_lossy()).expect("open db");
+    let note = root.join("day.md");
+    fs::write(&note, "- [-] ship ❌ 2026-06-19\n").unwrap();
+    scan_vault(&conn, root, &[]).expect("scan");
+    let t = db::all_tasks(&conn).expect("all_tasks")[0].clone();
+
+    db::enqueue_action(&conn, t.id, &t.note_path, t.line_number, "-", "x").expect("enqueue");
+    let action = &db::pending_actions(&conn).expect("pending")[0];
+    let outcome = process_action_at(&conn, root, action, "2026-06-21").expect("process");
+    assert_eq!(outcome, ApplyOutcome::Applied);
+
+    assert_eq!(
+        fs::read_to_string(&note).unwrap(),
+        "- [x] ship ✅ 2026-06-21\n",
+        "cancelled→done flip must clear ❌ and stamp ✅ <today>"
+    );
+
+    let on_disk = fs::read_to_string(&note).unwrap();
+    let anchor = on_disk.lines().next().expect("anchor");
+    assert_eq!(
+        taski_core::extract_done_date(anchor).as_deref(),
+        Some("2026-06-21"),
+        "done date must parse back to today"
+    );
+    assert_eq!(
+        taski_core::extract_cancelled_date(anchor),
+        None,
+        "cancelled date must be gone after the done transition"
+    );
+}
+
+/// 7.3 — cancelled→open (`-`→` `): the `❌` cancelled-date is CLEARED (an open
+/// task has neither a done nor a cancelled date). Only the ❌ oracle fires (the
+/// ✅ oracle is a no-op: there is no ✅ to clear).
+#[test]
+fn cancelled_date_cleared_on_flip_cancelled_to_open() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let conn = db::open(&tmp.path().join("cd3.db").to_string_lossy()).expect("open db");
+    let note = root.join("day.md");
+    fs::write(&note, "- [-] ship ❌ 2026-06-19\n").unwrap();
+    scan_vault(&conn, root, &[]).expect("scan");
+    let t = db::all_tasks(&conn).expect("all_tasks")[0].clone();
+
+    db::enqueue_action(&conn, t.id, &t.note_path, t.line_number, "-", " ").expect("enqueue");
+    let action = &db::pending_actions(&conn).expect("pending")[0];
+    let outcome = process_action_at(&conn, root, action, "2026-06-21").expect("process");
+    assert_eq!(outcome, ApplyOutcome::Applied);
+
+    assert_eq!(
+        fs::read_to_string(&note).unwrap(),
+        "- [ ] ship\n",
+        "cancelled→open flip must remove the ❌ token and its preceding space"
+    );
+
+    let on_disk = fs::read_to_string(&note).unwrap();
+    let anchor = on_disk.lines().next().expect("anchor");
+    assert_eq!(
+        taski_core::extract_cancelled_date(anchor),
+        None,
+        "cancelled date must be gone after un-cancel"
+    );
+}
+
+/// 7.4 — CRLF guard for the done→cancelled cross-state transition: the `❌` stamp
+/// is written BEFORE the `\r\n` (not between `\r` and `\n`), and the cleared `✅`
+/// leaves no interior CR. Guards the ADR-0012/0013 CRLF discipline on a transition
+/// where both oracles fire (one clears, one appends).
+#[test]
+fn cancelled_date_crlf_preserved_on_done_to_cancelled() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let conn = db::open(&tmp.path().join("cd4.db").to_string_lossy()).expect("open db");
+    let note = root.join("day.md");
+    fs::write(&note, "- [x] ship ✅ 2026-06-19\r\n").unwrap();
+    scan_vault(&conn, root, &[]).expect("scan");
+    let t = db::all_tasks(&conn).expect("all_tasks")[0].clone();
+
+    db::enqueue_action(&conn, t.id, &t.note_path, t.line_number, "x", "-").expect("enqueue");
+    let action = &db::pending_actions(&conn).expect("pending")[0];
+    let outcome = process_action_at(&conn, root, action, "2026-06-21").expect("process");
+    assert_eq!(outcome, ApplyOutcome::Applied);
+
+    // The ❌ is BEFORE the \r\n (NOT between \r and \n); the ✅ is gone. The
+    // \r\n terminator is preserved outside the spliced region.
+    assert_eq!(
+        fs::read_to_string(&note).unwrap(),
+        "- [-] ship ❌ 2026-06-21\r\n",
+        "CRLF must be preserved; ❌ stamp goes BEFORE the \\r; ✅ cleared"
+    );
+
+    // Independent cross-check via `str::lines()` (strips a `\r` adjacent to `\n`):
+    // the anchor line must contain NO interior `\r`, and the cancelled date must
+    // parse back to the stamped date.
+    let on_disk = fs::read_to_string(&note).unwrap();
+    let anchor = on_disk
+        .lines()
+        .find(|l| l.contains("ship"))
+        .expect("anchor");
+    assert!(
+        !anchor.contains('\r'),
+        "anchor line must have NO interior CR (CRLF-hazard check): {anchor:?}"
+    );
+    assert_eq!(
+        taski_core::extract_cancelled_date(anchor).as_deref(),
+        Some("2026-06-21"),
+        "the stamped ❌ date must parse back correctly"
+    );
+    assert_eq!(
+        taski_core::extract_done_date(anchor),
+        None,
+        "the ✅ must be gone after the cancel transition"
+    );
+}

@@ -29,7 +29,10 @@ use clap::Parser;
 use notify::RecursiveMode;
 use notify_debouncer_mini::{DebounceEventResult, new_debouncer};
 use rusqlite::Connection;
-use taski_core::{RewriteResult, parse_tasks, rewrite_done_date, rewrite_scheduled, toggle_bullet};
+use taski_core::{
+    RewriteResult, parse_tasks, rewrite_cancelled_date, rewrite_done_date, rewrite_scheduled,
+    toggle_bullet,
+};
 use taski_db as db;
 use taski_db::PendingAction;
 use walkdir::WalkDir;
@@ -570,6 +573,12 @@ pub enum ApplyOutcome {
     /// is untouched. Parallel to [`ApplyOutcome::MetadataUnparseable`] on the
     /// `✅` axis.
     DoneDateUnparseable,
+    /// ADR-0013: an existing `❌` on the line is malformed (bad date, NBSP,
+    /// stray variation selectors, more than one `❌`), so
+    /// `rewrite_cancelled_date` refused to guess — the whole cancel flip
+    /// (flip + stamp) is refused, the vault is untouched. Parallel to
+    /// [`ApplyOutcome::DoneDateUnparseable`] on the `❌` axis.
+    CancelledDateUnparseable,
 }
 
 /// Process every currently-pending action to completion, resolving each (`done` on
@@ -655,6 +664,9 @@ pub fn process_pending_actions(conn: &Connection, vault_root: &Path) -> Result<(
                         }
                         ApplyOutcome::DoneDateUnparseable => {
                             "existing ✅ is malformed or unparseable; toggle not applied"
+                        }
+                        ApplyOutcome::CancelledDateUnparseable => {
+                            "existing ❌ is malformed or unparseable; cancel not applied"
                         }
                         ApplyOutcome::Applied => unreachable!(),
                     };
@@ -838,28 +850,54 @@ pub fn process_action_at(
     flipped.push(new_c);
     flipped.push_str(&line_str[char_rel_end..]);
 
-    // Decide the done-date delta from `new_c` (ADR-0012 Decision):
-    //   - Done char (x/X per `Status::Done`) → stamp `Some(today)`
-    //   - Open char (` `)                    → clear `None` (un-complete symmetry)
-    //   - anything else (InProgress `/`, …)  → skip the oracle entirely; only the
-    //                                           flip is written (`✅` left untouched)
-    let final_line: String = if is_done_char(new_c) || new_c == ' ' {
+    // Decide the done/cancelled date deltas from `new_c` (ADR-0013 Decision — a
+    // three-state widening of ADR-0012's two-state done/open model):
+    //   - Done char (x/X per `Status::Done`) → stamp `✅ <today>`, CLEAR any `❌`
+    //     (a task cannot be both done and cancelled)
+    //   - Cancelled char (`-`)                → stamp `❌ <today>`, CLEAR any `✅`
+    //   - Open char (` `)                     → CLEAR both `✅` and `❌`
+    //   - anything else (InProgress `/`, …)   → skip both oracles; only the flip
+    //                                            is written (both stamps untouched)
+    //
+    // Regression guard (ADR-0012): the done/open branches must drive the `✅`
+    // oracle EXACTLY as before, so `done_date_writeback_proptest` stays byte-for-
+    // byte green. The only additions on those branches are `❌`-oracle calls,
+    // which return `RewriteResult::Unchanged` (no-op) on notes without a `❌`
+    // token. The `✅` oracle runs first; the `❌` oracle runs on its result.
+    let final_line: String = if is_done_char(new_c) || is_cancelled_char(new_c) || new_c == ' ' {
         let desired_done: Option<&str> = if is_done_char(new_c) {
             Some(today)
         } else {
             None
         };
-        match rewrite_done_date(&flipped, desired_done) {
-            // Malformed existing ✅ → refuse the WHOLE toggle. No flip, no stamp,
-            // vault untouched.
+        let desired_cancelled: Option<&str> = if is_cancelled_char(new_c) {
+            Some(today)
+        } else {
+            None
+        };
+        // Run the ✅ oracle first. Malformed existing ✅ → refuse the WHOLE
+        // action (no flip, no stamp, vault untouched).
+        let after_done = match rewrite_done_date(&flipped, desired_done) {
             RewriteResult::Unparseable => return Ok(ApplyOutcome::DoneDateUnparseable),
             RewriteResult::Rewritten(s) => s,
-            // Idempotent (e.g. ✅ already equals today, or clearing a line with no ✅):
-            // only the flip changed; `flipped` is the final line.
-            RewriteResult::Unchanged => flipped,
+            // Idempotent on the ✅ axis (e.g. ✅ already equals today, or
+            // clearing a line with no ✅): carry `flipped` forward to the ❌
+            // oracle. Clone because `flipped` is also the fallback below if the
+            // ❌ oracle is itself a no-op.
+            RewriteResult::Unchanged => flipped.clone(),
+        };
+        // Run the ❌ oracle on the ✅-oracle result. Malformed existing ❌ →
+        // refuse the WHOLE action (no flip, no stamp, vault untouched).
+        match rewrite_cancelled_date(&after_done, desired_cancelled) {
+            RewriteResult::Unparseable => return Ok(ApplyOutcome::CancelledDateUnparseable),
+            RewriteResult::Rewritten(s) => s,
+            // Idempotent on the ❌ axis: `after_done` (which already encodes any
+            // ✅ change) is the final line.
+            RewriteResult::Unchanged => after_done,
         }
     } else {
-        // Non-done/non-open flip (e.g. →[/]): ambiguous, leave ✅ untouched.
+        // Non-done/non-cancelled/non-open flip (e.g. →[/]): ambiguous, leave
+        // both `✅` and `❌` untouched. Only the flip is written.
         flipped
     };
 
@@ -889,6 +927,15 @@ pub fn process_action_at(
 /// Keep in sync with that mapping if it ever widens.
 fn is_done_char(ch: char) -> bool {
     matches!(ch, 'x' | 'X')
+}
+
+/// True iff `ch` is the checkbox char the codebase treats as **cancelled**
+/// (`- [-]`, the Obsidian Tasks cancelled marker). ADR-0013's `❌` stamp keys off
+/// this: a flip TO `-` stamps `❌ <today>`, and a flip FROM `-` clears it.
+/// Mirrors [`is_done_char`] so the hot path stays allocation-free. Keep in sync
+/// with `taski_core::Status::from_checkbox_char` if its cancelled mapping widens.
+fn is_cancelled_char(ch: char) -> bool {
+    matches!(ch, '-')
 }
 
 /// Execute one pending `set_scheduled` write (ADR-0009 Phase 2) — structurally

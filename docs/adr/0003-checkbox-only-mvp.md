@@ -1,6 +1,6 @@
 # ADR-0003: MVP write-back is checkbox-state flips only
 
-- **Status:** Accepted (amended 2026-06-20 by [ADR-0009](./0009-scheduled-date-today.md), 2026-06-21 by [ADR-0012](./0012-done-date-on-toggle.md))
+- **Status:** Accepted (amended 2026-06-20 by [ADR-0009](./0009-scheduled-date-today.md), 2026-06-21 by [ADR-0012](./0012-done-date-on-toggle.md), 2026-06-21 by [ADR-0013](./0013-delete-task.md))
 - **Date:** 2026-06-20
 - **Decides:** PRD §10.2 — MVP write-back scope
 
@@ -84,5 +84,36 @@ checkbox `pending_action`. `rewrite_done_date` is a one-line wrapper over a gene
 See ADR-0012 for the full design, the compose-vs-split rationale, the CRLF-hazard analysis,
 and the alternatives.
 
+## Amendment — ADR-0013 (2026-06-21): write-back scope widened to `❌` cancelled-on-cancel
+
+[ADR-0013](./0013-cancelled-date-on-cancel.md) stamps `❌ <today>` on the same byte-buffer
+splice that flips the checkbox `[ ]`→`[-]` (the new `d` "cancel" gesture) — the cancelled-date
+stamp is **composed into `process_action`**, not a new action type, exactly parallel to how
+ADR-0012 composes `✅` on `[ ]`→`[x]`. It also clears `✅`/`❌` symmetrically on cross-state
+flips (done→cancelled clears `✅`; cancelled→done clears `❌`; either→open clears both). The
+ADR-0009 principled boundary is **unchanged**; `❌` is the third token admitted under it:
+
+> The write-back scope is widened from **checkbox-state flips + `⏳` scheduled + `✅` done
+> (stamped on flip)** to **checkbox-state flips + `⏳` scheduled + `✅` done + `❌` cancelled
+> (stamped on cancel flip)**. The ADR-0009 principled boundary is **unchanged**: Taski may
+> write tokens that (i) are standard Obsidian Tasks syntax, (ii) have a single unambiguous
+> insertion grammar, and (iii) are produced by a pure, proptested line-rewrite with a
+> "never-corrupts" contract. Free-text edits, creates/deletes, and arbitrary metadata
+> remain explicitly rejected. Each subsequent token type still requires its own ADR.
+
+Like ADR-0012, this amendment does **not** add a new action type or schema change — the
+stamp rides inside the existing checkbox `pending_action`, dispatched by the existing `d`
+→ checkbox-flip-with-`new_char='-'` enqueue. `rewrite_cancelled_date` is a one-line wrapper
+over the same generalized `rewrite_emoji_date` core that backs `rewrite_scheduled` (ADR-0009)
+and `rewrite_done_date` (ADR-0012), guarded by its own 256-case proptest. Undo is free:
+`u` already reverses checkbox flips (ADR-0011), and cancel *is* a checkbox flip.
+
+`❌` is the third (and likely final) dated token admitted under the gate; the gate itself is
+not widened. This closes the documented roadmap gap (*"`❌` cancelled-date is the next
+candidate but depends on a cancel gesture that doesn't exist yet"*) — ADR-0013 is that gesture.
+
+See ADR-0013 for the full design, the three-state stamp decision table, the hard-delete
+alternative that was considered and rejected, and the edge cases.
+
 ## References
-- [`docs/tech.md`](../tech.md), [ADR-0002](./0002-write-back-through-daemon.md), [ADR-0004](./0004-refuse-on-conflict.md), [ADR-0009](./0009-scheduled-date-today.md) *(amendment)*, [ADR-0012](./0012-done-date-on-toggle.md) *(amendment)*
+- [`docs/tech.md`](../tech.md), [ADR-0002](./0002-write-back-through-daemon.md), [ADR-0004](./0004-refuse-on-conflict.md), [ADR-0009](./0009-scheduled-date-today.md) *(amendment)*, [ADR-0012](./0012-done-date-on-toggle.md) *(amendment)*, [ADR-0013](./0013-cancelled-date-on-cancel.md) *(amendment)*

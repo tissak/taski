@@ -1,6 +1,6 @@
 # Taski — Engineering Context & Onboarding
 
-*Onboarding guide for new engineers. Last updated: 2026-06-21 (post-v0.4 — adds Tier 1 metadata parsing [tags, priority, start/created/done/cancelled dates, schema v6], Tier 2 views [overdue `O`, group-by cycling `G`], and `✅` done-date stamp on toggle [ADR-0012]; 283 tests across 6 crates).*
+*Onboarding guide for new engineers. Last updated: 2026-06-21 (post-v0.4 — adds Tier 1 metadata parsing [tags, priority, start/created/done/cancelled dates, schema v6], Tier 2 views [overdue `O`, group-by cycling `G`], the `✅` done-date stamp on toggle [ADR-0012], and the `❌` cancelled-date stamp on cancel [ADR-0013]; 291 tests across 6 crates).*
 
 This document is the "operating manual" for working on Taski: what it is, how it's
 built, the decisions that are load-bearing (and must not be casually undone), and the
@@ -262,7 +262,8 @@ filter predicates within each bucket and emits `Header` + `Task` rows.
 | `G` | Cycle grouping axis: note → tag → priority → folder → note |
 | `t` | Mark/unmark selected task for today (writes `⏳ <today>`) |
 | `b` | Toggle selected task between checkbox (`- [ ]`) and bullet (`-`) format |
-| `u` | Undo the last checkbox flip or bullet toggle action |
+| `d` | Cancel selected task (`- [ ]` → `- [-]`, stamps `❌ <today>`; press again to un-cancel) [ADR-0013] |
+| `u` | Undo the last checkbox flip (incl. cancel), or bullet toggle, action |
 | `/` | Open text search prompt (matches `task.text`, case-insensitive) |
 | `F` | Open file/path search prompt (matches `task.note_path`) |
 | `p` | Toggle the context pane (right-half note preview) |
@@ -304,7 +305,7 @@ existing dev DBs are dropped+recreated and the index rebuilds from the vault.
 | `start_date` *(v6)* | Parsed `🛫` start date (Obsidian Tasks syntax). |
 | `created_date` *(v6)* | Parsed `➕` created date. |
 | `done_date` *(v6)* | Parsed `✅` done date. **Stamped on toggle** by `process_action` (ADR-0012): `[ ]`→`[x]` stamps `✅ <today>`, `[x]`→`[ ]` clears it. |
-| `cancelled_date` *(v6)* | Parsed `❌` cancelled date. |
+| `cancelled_date` *(v6)* | Parsed `❌` cancelled date. **Stamped on cancel** by `process_action` (ADR-0013): `[ ]`→`[-]` stamps `❌ <today>`, `[-]`→`[ ]` clears it; cross-state flips clear the other stamp (done↔cancelled). |
 | `updated_at` | Last-seen timestamp. |
 
 **`pending_actions`** — the TUI→daemon command queue. Lifecycle `pending → done | failed`.
@@ -417,6 +418,21 @@ understanding the failure mode it prevents.**
     a generalized `rewrite_emoji_date` core; both backed by 256-case proptests. No new action
     type, schema change, or TUI key — `Space` already enqueues the flip.
 
+13. **`❌` cancelled-date stamp on cancel** ([ADR-0013](./adr/0013-cancelled-date-on-cancel.md)) —
+    The `d` key flips `[ ]`→`[-]` (Obsidian cancelled state) and composes a `❌ <today>` stamp
+    into the same byte buffer as the flip, exactly parallel to ADR-0012's `✅` on `[ ]`→`[x]`.
+    Cross-state flips clear the other stamp (done→cancelled clears `✅`; cancelled→done clears
+    `❌`; either→open clears both). No new action_type, no schema change — the cancel gesture
+    reuses the `checkbox` action with `new_char='-'`, so `u` undo is **free** (cancel *is* a
+    checkbox flip). Amends ADR-0003 a third time under the unchanged ADR-0009 grammar-
+    provability gate; `❌` is the third (likely final) dated token admitted. `process_action`'s
+    stamp decision widens from ADR-0012's two-state (done/open) model to a three-state
+    (done/cancelled/open) model. A hard-delete alternative was considered in depth and
+    rejected — it would have been Taski's first structural mutation (line-count change),
+    requiring a new "removal-only" boundary ADR, a `restore_task` action type, a schema bump,
+    and accepting a restart-data-loss edge; cancel delivers the same UX intent at a fraction
+    of the code with strictly better safety properties.
+
 ---
 
 ## Gotchas & Landmines (read this before you change anything)
@@ -511,10 +527,10 @@ These are the things that aren't obvious from reading the code and will cost you
   literal directory path (and SQL's single-char `_` wildcard makes it hairier). If purge
   silently does nothing, check that the bind value ends with `/%`.
 
-- **Undo scope is limited to `Space` and `b` only.** `u` undoes the last checkbox flip
-  or bullet toggle, not `t` (mark-for-today). The `t` gesture is already idempotent
-  (pressing `t` again removes the mark), so undo adds little value. This is intentional,
-  not a bug.
+- **Undo scope is limited to checkbox flips (`Space`, `d`) and `b` only.** `u` undoes the
+  last checkbox flip (cancel is a flip to `-`, so it's covered), or bullet toggle — not `t`
+  (mark-for-today). The `t` gesture is already idempotent (pressing `t` again removes the
+  mark), so undo adds little value. This is intentional, not a bug.
 
 - **Tags are local-only.** `v0.1` and all commits exist only in the local repo until
   pushed. There is currently no remote set up in this working tree — confirm before
@@ -570,7 +586,7 @@ These are the things that aren't obvious from reading the code and will cost you
 | `taski-db` unit tests | Schema, `reconcile_note` identity retention, upsert/read round-trips (incl. Tier 1 metadata + the tag sentinel storage format), action pruning, `open()` creates missing dirs. |
 | `taski-daemon/tests/scan.rs` | End-to-end scan of a fake vault → correct task rows. |
 | `taski-daemon/tests/reconcile.rs` | Content-hash reconciliation: identity survives edits, deletes, reorders. |
-| `taski-daemon/tests/writeback.rs` + `writeback_proptest.rs` + `metadata_writeback_proptest.rs` + `done_date_writeback_proptest.rs` | The safety contract: atomic_write commits on match, refuses on conflict, never corrupts; `⏳` metadata write-back "never corrupts" (256-case ADR-0009 Phase 2, oracle = `rewrite_scheduled`); `✅` done-date-on-toggle stamp "never corrupts" (256-case ADR-0012, oracle = `rewrite_done_date`, CRLF assertion, VS16 guards). Also covers `toggle_bullet` and `undo` action types (ADR-0011). |
+| `taski-daemon/tests/writeback.rs` + `writeback_proptest.rs` + `metadata_writeback_proptest.rs` + `done_date_writeback_proptest.rs` + `cancelled_date_writeback_proptest.rs` | The safety contract: atomic_write commits on match, refuses on conflict, never corrupts; `⏳` metadata write-back "never corrupts" (256-case ADR-0009 Phase 2, oracle = `rewrite_scheduled`); `✅` done-date-on-toggle stamp "never corrupts" (256-case ADR-0012, oracle = `rewrite_done_date`, CRLF assertion, VS16 guards); `❌` cancelled-date-on-cancel stamp "never corrupts" (256-case ADR-0013, oracle = `rewrite_cancelled_date`; also exercises cross-state `✅`-clearing). Also covers `toggle_bullet` and `undo` action types (ADR-0011). |
 | `taski-daemon/src/lock.rs` unit tests | The `flock` single-writer lock: acquire/refuse outcome, lock-path derivation. |
 | `taski-daemon` unit tests in `lib.rs` | `should_exclude_entry`, `path_matches_exclude`, `scan_vault_with_exclude_dirs_skips_matching_directory` — exclude-dir filtering in WalkDir and watcher events. |
 | `taski-tui` unit tests (in `lib.rs`) | View model: grouping (note/tag/priority/folder via `G`, incl. tag fan-out + group ordering), collapse, five-axis filter composition (status + today + overdue + text search + file search), display-index↔Task mapping, selection reconciliation (incl. duplicate task_ids under tag grouping), failure-notice surfacing, context-pane render/scroll/toggle + `context_view` centering (headless `TestBackend` smoke). |
@@ -592,7 +608,7 @@ exercised only at runtime (its `taski.db` is gitignored).
 | Change write-back behavior | `taski-daemon`: `process_action` (checkbox flips + `✅` stamp, ADR-0012) / `process_metadata_action` (`⏳` writes, ADR-0009), `atomic_write` (mind ADR-0004 TOCTOU); the drain loop dispatches on `pending_actions.action_type` |
 | Change how the TUI looks/behaves | `taski-tui/src/lib.rs`: `App`, `build_view` (filter pipeline), `context_view`/`draw_context_pane`, key handling in `run_loop` |
 | Change the TUI filter composition / grouping | `crates/taski-tui/src/lib.rs:build_view()` — ANDs five filter axes (status + today + overdue + text search + file search) and buckets survivors by the `G` grouping axis (note/tag/priority/folder; HashMap-based, tag fan-out). The 9-param function carries a documented `#[allow(clippy::too_many_arguments)]` (a parameter-struct refactor is deferred). |
-| Change keybindings (add/remove a key) | `crates/taski-tui/src/lib.rs:run_loop()` — handles three branches: `searching`, `file_searching`, and normal mode. `b` / `u` added in ADR-0011 |
+| Change keybindings (add/remove a key) | `crates/taski-tui/src/lib.rs:run_loop()` — handles three branches: `searching`, `file_searching`, and normal mode. `b` / `u` added in ADR-0011; `d` (cancel) added in ADR-0013 |
 | Change context-pane keybindings/behavior | `taski-tui/src/lib.rs` key match in `run_loop` (`J`/`K` scroll, `p` toggle) + `MIN_SPLIT_WIDTH` auto-hide; `sync_context` for the read path |
 | Add/change vault directory exclusions | Add `exclude_dirs` to `~/.config/taski/config.toml`; restart daemon. Purge happens on startup — see `delete_tasks_for_excluded_dirs` in `taski-db`, `should_exclude_entry`/`path_matches_exclude` in `taski-daemon` |
 | Change undo behavior | `taski-tui/src/lib.rs` `submit_undo` (enqueues the reverse via `db::enqueue_action` for checkbox undo or `db::enqueue_bullet_toggle` for bullet undo); daemon dispatches to `process_action` / `process_bullet_action` like other action types |
@@ -627,17 +643,16 @@ A holistic review triaged these as low-value for a personal single-user tool. Th
   only when real edge cases (nested lists, callouts, inline code) actually bite.
 - **Structured write-back reason-codes** between daemon and TUI — string matching + fallback.
 - **Real DB migration path** — schema bumps drop+recreate (pre-MVP).
-- **Additional write-back token types** — `⏳` (scheduled, ADR-0009 Phase 2) and `✅` (done,
-  ADR-0012 — stamped on `[ ]`→`[x]` toggle, cleared on `[x]`→`[ ]`) are the two metadata
-  *writes* admitted alongside checkbox flips per the ADR-0003 principled boundary.
-  Tier 1 added **read-only parsing** of six more tokens (`#tags`, priority, start/created/
-  done/cancelled dates — schema v6), but **writing** the remaining ones from the TUI remains
-  deferred. Each write would need its own ADR, pure rewrite oracle, proptest, and action-type
-  dispatch branch — the ADR-0009 pattern is the template. `❌` cancelled-date is the next
-  candidate but depends on a cancel gesture that doesn't exist yet.
-- **`❌` cancelled-date stamp on cancel** — Tier 1 parses `❌`, but there is no cancel
-  gesture in Taski yet, so `❌` is never written. When/iff cancel is added, it would follow
-  the ADR-0012 compose pattern (stamp rides inside the cancel action's byte buffer).
+- **Additional write-back token types** — `⏳` (scheduled, ADR-0009 Phase 2), `✅` (done,
+  ADR-0012 — stamped on `[ ]`→`[x]` toggle, cleared on `[x]`→`[ ]`), and `❌` (cancelled,
+  ADR-0013 — stamped on `[ ]`→`[-]` cancel, cleared on `[-]`→`[ ]`; cross-state flips clear
+  the other stamp) are the three metadata *writes* admitted alongside checkbox flips per
+  the ADR-0003 principled boundary. Tier 1 added **read-only parsing** of six more tokens
+  (`#tags`, priority, start/created/done/cancelled dates — schema v6). Writing the remaining
+  tokens (`🛫` start, `➕` created, priority emojis, `🔁` recurrence) from the TUI remains
+  deferred — each would need its own ADR, pure rewrite oracle, and proptest under the
+  ADR-0009 grammar-provability gate. The three dated tokens (`⏳`/`✅`/`❌`) likely exhaust
+  the admissible set under that gate.
 - **Case-sensitive search toggle** — search is case-insensitive; a future config toggle
   could make it case-sensitive. Not needed for MVP (ADR-0010).
 - **Search by date fields beyond Overdue/Today** — `O` (overdue: `due_date < today`) and
@@ -686,6 +701,15 @@ If you pick one up, record the decision and update this list.
   one-line wrapper over the same `rewrite_emoji_date` core as `rewrite_scheduled`, but on the
   `✅` token. Called by `process_action_at` when a checkbox flip transitions to/from Done;
   guarded by its own 256-case proptest.
+- **`rewrite_cancelled_date`** — the pure oracle for the `❌` cancelled-date stamp (ADR-0013).
+  A one-line wrapper over the same `rewrite_emoji_date` core as `rewrite_scheduled`/
+  `rewrite_done_date`, but on the `❌` token. Called by `process_action_at` when a checkbox
+  flip transitions to/from Cancelled (`-`); guarded by its own 256-case proptest.
+- **Cancel** — the `d` keybinding that flips the selected task to the Obsidian cancelled
+  state (`- [ ]` → `- [-]`), composing a `❌ <today>` stamp into the same byte buffer as the
+  flip. Press `d` again to un-cancel (`[-]` → `[ ]`, clears `❌`). Implemented as a `checkbox`
+  action with `new_char='-'` (no new action_type, no schema change), so `u` undo reuses the
+  existing checkbox-flip reversal path (ADR-0013).
 - **Bullet toggle** — the `b` keybinding that converts a checkbox task to a plain bullet
   (`- [ ] task` → `- task`) or back. Implemented as `toggle_bullet` action type, routed
   through the same daemon pipeline (ADR-0011).
