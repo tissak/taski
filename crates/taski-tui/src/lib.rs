@@ -24,12 +24,14 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use rusqlite::Connection;
 
 use taski_db as db;
 use taski_db::{NoteContent, PendingAction, Priority, Status, Task};
+
+pub mod theme;
 
 /// CLI configuration. `--db` is optional and overrides `db` in the config file
 /// (`~/.config/taski/config.toml`, overridable via `TASKI_CONFIG`); see
@@ -122,6 +124,14 @@ fn run_inner(db_override: Option<PathBuf>, quit_hook: Option<QuitHook>) -> Resul
         })
     };
     let use_advanced_uri = cfg.use_advanced_uri;
+    // ADR-0018 S2: resolve the TUI theme from the optional `[theme]` section.
+    // Bad colour values fall back per-role with a tracing::warn!; resolution
+    // happens before enter_terminal() so the alt screen is never garbled.
+    let theme = theme::Theme::resolve_from(cfg.theme.as_ref());
+    // ADR-0018 S3: resolve per-panel layout prefs from the optional `[ui]`
+    // section. Bad list_pane_percent clamps; bad list_density variant errors
+    // at config load (before alt screen).
+    let layout = theme::LayoutPrefs::resolve_from(cfg.ui.as_ref());
 
     // Restore the terminal even if a panic occurs mid-render.
     let original_hook = std::panic::take_hook();
@@ -142,6 +152,8 @@ fn run_inner(db_override: Option<PathBuf>, quit_hook: Option<QuitHook>) -> Resul
         &inbox_path,
         vault_name.as_deref(),
         use_advanced_uri,
+        theme,
+        layout,
     );
     restore_terminal()?;
     result
@@ -664,6 +676,13 @@ struct App {
     /// `Ctrl-C` still quits (the emergency exit), and every other key is
     /// swallowed so nothing fires while the user is reading.
     show_help: bool,
+    /// The active colour theme — 12 semantic roles used by every render call site.
+    /// Defaults reproduce the hardcoded palette (S1 refactor); config overrides
+    /// land in S2.
+    theme: theme::Theme,
+    /// Per-panel density preferences (pane split, spacing, wrapping).
+    /// Defaults match current behaviour; wired in S3.
+    layout: theme::LayoutPrefs,
 }
 
 /// ADR-0011: information needed to reverse the last write action.
@@ -718,6 +737,8 @@ impl App {
             last_action: None,
             group_by: GroupBy::Note,
             show_help: false,
+            theme: theme::Theme::default(),
+            layout: theme::LayoutPrefs::default(),
         }
     }
 
@@ -1320,6 +1341,7 @@ impl App {
 /// Main render+event loop. Holds one DB connection for the whole session and re-reads
 /// the index on a ~750ms cadence so daemon writes appear live without blocking input.
 /// Returns when the user requests to quit.
+#[allow(clippy::too_many_arguments)]
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     conn: &Connection,
@@ -1327,6 +1349,8 @@ fn run_loop(
     inbox_path: &str,
     vault_name: Option<&str>,
     use_advanced_uri: bool,
+    theme: theme::Theme,
+    layout: theme::LayoutPrefs,
 ) -> Result<()> {
     let mut app = App::new();
     // ADR-0014: thread the resolved inbox path from `run_inner` (which read
@@ -1336,6 +1360,11 @@ fn run_loop(
     // flag from `run_inner`. `App::new()` defaults to `None` / `false` for tests.
     app.vault_name = vault_name.map(|s| s.to_string());
     app.use_advanced_uri = use_advanced_uri;
+    // ADR-0018: override the default theme and layout with the config-resolved ones.
+    // `App::new()` uses `Theme::default()` / `LayoutPrefs::default()` for standalone
+    // test construction.
+    app.theme = theme;
+    app.layout = layout;
     // `None` => never refreshed yet, so the first iteration reads immediately.
     let mut last_refresh: Option<Instant> = None;
 
@@ -1743,6 +1772,17 @@ fn render_failure_notice(action: &PendingAction) -> String {
 /// to surface, so the list keeps its full height when there's nothing to report.
 fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    // ADR-0018 follow-on: paint the themed window background first, so every
+    // widget (which sets `.fg(...)` only — never `.bg`) renders on top of it and
+    // the background shows through. `Color::Reset` is the "use the terminal's own
+    // background" sentinel: while it's Reset we skip the paint entirely, keeping
+    // default rendering byte-identical.
+    if app.theme.background != Color::Reset {
+        frame.render_widget(
+            Block::default().style(Style::default().bg(app.theme.background)),
+            area,
+        );
+    }
     // The notice row is reserved only when a notice is present.
     let notice_present = app.notice.is_some();
     let constraints: Vec<Constraint> = if notice_present {
@@ -1764,8 +1804,11 @@ fn draw(frame: &mut Frame, app: &mut App) {
     // list keeps its title/counts block; the pane gets its own block (note-path title).
     let show_pane = app.pane_visible && list_area.width >= MIN_SPLIT_WIDTH;
     let (list_col, ctx_col) = if show_pane {
-        let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(list_area);
+        let cols = Layout::horizontal([
+            Constraint::Percentage(app.layout.list_pane_percent),
+            Constraint::Percentage(100 - app.layout.list_pane_percent),
+        ])
+        .split(list_area);
         (cols[0], Some(cols[1]))
     } else {
         (list_area, None)
@@ -1784,14 +1827,14 @@ fn draw(frame: &mut Frame, app: &mut App) {
         Span::styled(
             format!("filter: {}", app.filter.label()),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(app.theme.accent)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  ·  "),
         Span::styled(
             format!("group: {}", app.group_by.label()),
             Style::default()
-                .fg(Color::Magenta)
+                .fg(app.theme.group_accent)
                 .add_modifier(Modifier::BOLD),
         ),
     ];
@@ -1801,7 +1844,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         title_spans.push(Span::styled(
             "today",
             Style::default()
-                .fg(Color::LightCyan)
+                .fg(app.theme.accent_bright)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -1811,7 +1854,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         title_spans.push(Span::styled(
             format!("search: {}", app.search_query),
             Style::default()
-                .fg(Color::Green)
+                .fg(app.theme.success)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -1821,7 +1864,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         title_spans.push(Span::styled(
             format!("file: {}", app.file_query),
             Style::default()
-                .fg(Color::Green)
+                .fg(app.theme.success)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -1831,7 +1874,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         title_spans.push(Span::styled(
             "overdue",
             Style::default()
-                .fg(Color::LightRed)
+                .fg(app.theme.danger_bright)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -1860,10 +1903,23 @@ fn draw(frame: &mut Frame, app: &mut App) {
         };
         frame.render_widget(Paragraph::new(msg).block(block), list_col);
     } else {
+        // ADR-0018 S3: insert density blank-line separators between groups.
         let items: Vec<ListItem> = app
             .rows
             .iter()
-            .map(|r| row_to_item(r, &app.today))
+            .enumerate()
+            .flat_map(|(i, r)| {
+                let item = row_to_item(r, &app.today, &app.theme, app.group_by);
+                if matches!(r, DisplayRow::Header { .. }) && i > 0 {
+                    let mut gap: Vec<ListItem> = (0..app.layout.list_density)
+                        .map(|_| ListItem::new(""))
+                        .collect();
+                    gap.push(item);
+                    gap
+                } else {
+                    vec![item]
+                }
+            })
             .collect();
         let list = List::new(items)
             .block(block)
@@ -1876,9 +1932,11 @@ fn draw(frame: &mut Frame, app: &mut App) {
         let line = Line::from(vec![
             Span::styled(
                 " ⚠  ",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(app.theme.danger)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(msg.clone(), Style::default().fg(Color::Red)),
+            Span::styled(msg.clone(), Style::default().fg(app.theme.danger)),
         ]);
         frame.render_widget(Paragraph::new(line), area);
     }
@@ -1896,6 +1954,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
             app.ctx_content.as_ref(),
             target_line,
             app.ctx_scroll,
+            &app.theme,
+            &app.layout,
         );
     }
 
@@ -1909,7 +1969,10 @@ fn draw(frame: &mut Frame, app: &mut App) {
         };
         Paragraph::new(Line::from(vec![
             Span::raw(" /"),
-            Span::styled(app.search_query.clone(), Style::default().fg(Color::Green)),
+            Span::styled(
+                app.search_query.clone(),
+                Style::default().fg(app.theme.success),
+            ),
             Span::styled(cursor, Style::default().add_modifier(Modifier::SLOW_BLINK)),
         ]))
         .style(Style::new())
@@ -1921,7 +1984,10 @@ fn draw(frame: &mut Frame, app: &mut App) {
         };
         Paragraph::new(Line::from(vec![
             Span::raw(" File: /"),
-            Span::styled(app.file_query.clone(), Style::default().fg(Color::Green)),
+            Span::styled(
+                app.file_query.clone(),
+                Style::default().fg(app.theme.success),
+            ),
             Span::styled(cursor, Style::default().add_modifier(Modifier::SLOW_BLINK)),
         ]))
         .style(Style::new())
@@ -1937,11 +2003,11 @@ fn draw(frame: &mut Frame, app: &mut App) {
         Paragraph::new(Line::from(vec![
             Span::styled(
                 format!(" + to {}  ", app.inbox_path),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(app.theme.accent),
             ),
             Span::styled(
                 app.quick_add_query.clone(),
-                Style::default().fg(Color::Green),
+                Style::default().fg(app.theme.success),
             ),
             Span::styled(cursor, Style::default().add_modifier(Modifier::SLOW_BLINK)),
         ]))
@@ -1954,19 +2020,19 @@ fn draw(frame: &mut Frame, app: &mut App) {
         // discover `?`", not "full list".
         Paragraph::new(Line::from(vec![
             Span::raw(" "),
-            Span::styled("j/k", Style::default().fg(Color::Yellow)),
+            Span::styled("j/k", Style::default().fg(app.theme.warning)),
             Span::raw(" move  ·  "),
-            Span::styled("Space", Style::default().fg(Color::Yellow)),
+            Span::styled("Space", Style::default().fg(app.theme.warning)),
             Span::raw(" toggle  ·  "),
-            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::styled("Enter", Style::default().fg(app.theme.warning)),
             Span::raw(" fold  ·  "),
-            Span::styled("f", Style::default().fg(Color::Yellow)),
+            Span::styled("f", Style::default().fg(app.theme.warning)),
             Span::raw(" filter  ·  "),
-            Span::styled("/", Style::default().fg(Color::Yellow)),
+            Span::styled("/", Style::default().fg(app.theme.warning)),
             Span::raw(" search  ·  "),
-            Span::styled("?", Style::default().fg(Color::Yellow)),
+            Span::styled("?", Style::default().fg(app.theme.warning)),
             Span::raw(" help  ·  "),
-            Span::styled("q", Style::default().fg(Color::Yellow)),
+            Span::styled("q", Style::default().fg(app.theme.warning)),
             Span::raw(" quit "),
         ]))
         .style(Style::new().add_modifier(Modifier::DIM))
@@ -1979,7 +2045,28 @@ fn draw(frame: &mut Frame, app: &mut App) {
     if app.show_help {
         let popup = popup_area(area, 70, 90);
         frame.render_widget(Clear, popup);
-        frame.render_widget(help_popup(), popup);
+        // `Clear` resets the popup cells to the terminal default bg, so re-apply
+        // the themed background there before drawing the help text.
+        if app.theme.background != Color::Reset {
+            frame.render_widget(
+                Block::default().style(Style::default().bg(app.theme.background)),
+                popup,
+            );
+        }
+        frame.render_widget(help_popup(&app.theme), popup);
+    }
+}
+
+/// Split a note path into `(dir_prefix, filename)` for Note-header styling.
+///
+/// The prefix includes its trailing `/` (e.g. `("Projects/Work/", "standup.md")`)
+/// so the two parts concatenate back to the original. A root-level note with no
+/// `/` returns `(None, whole_key)`. Used only for `GroupBy::Note` headers, where
+/// the prefix is dimmed (`theme.path_prefix`) so the filename pops.
+fn split_note_header(key: &str) -> (Option<&str>, &str) {
+    match key.rfind('/') {
+        Some(i) => (Some(&key[..=i]), &key[i + 1..]),
+        None => (None, key),
     }
 }
 
@@ -1989,7 +2076,13 @@ fn draw(frame: &mut Frame, app: &mut App) {
 /// and a `⏳ <date>` scheduled-date suffix in cyan (bold/bright cyan when the
 /// scheduled date is "today" — the ADR-0009 "this is a today task" affordance).
 /// `today` is a `YYYY-MM-DD` string used only for the bold-today highlight.
-fn row_to_item(row: &DisplayRow, today: &str) -> ListItem<'static> {
+/// `group_by` lets the Note-axis header dim its directory prefix (ADR-0018).
+fn row_to_item(
+    row: &DisplayRow,
+    today: &str,
+    theme: &theme::Theme,
+    group_by: GroupBy,
+) -> ListItem<'static> {
     match row {
         DisplayRow::Header {
             group_key,
@@ -1998,24 +2091,37 @@ fn row_to_item(row: &DisplayRow, today: &str) -> ListItem<'static> {
             collapsed,
         } => {
             let marker = if *collapsed { "▸" } else { "▾" };
-            let line = Line::from(vec![
-                Span::styled(
-                    format!("{marker} "),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
+            let mut spans = vec![Span::styled(
+                format!("{marker} "),
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            )];
+            // ADR-0018: under Note grouping the key is a note path; dim the
+            // directory prefix so the filename (bold/default) pops at a glance.
+            // Other axes (Tag/Priority/Folder) render the key whole.
+            match (group_by, split_note_header(group_key)) {
+                (GroupBy::Note, (Some(prefix), filename)) => {
+                    spans.push(Span::styled(
+                        prefix.to_string(),
+                        Style::default().fg(theme.path_prefix),
+                    ));
+                    spans.push(Span::styled(
+                        filename.to_string(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ));
+                }
+                _ => spans.push(Span::styled(
                     group_key.clone(),
                     Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("   "),
-                Span::styled(
-                    format!("{open_count} open · {total_count} total"),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]);
-            ListItem::new(line)
+                )),
+            }
+            spans.push(Span::raw("   "));
+            spans.push(Span::styled(
+                format!("{open_count} open · {total_count} total"),
+                Style::default().fg(theme.muted),
+            ));
+            ListItem::new(Line::from(spans))
         }
         DisplayRow::Task { task } => {
             let checkbox = format!("[{}]", task.raw_checkbox_char);
@@ -2023,13 +2129,13 @@ fn row_to_item(row: &DisplayRow, today: &str) -> ListItem<'static> {
             // Conventional 4-space list indent under the header marker + the task's
             // source-line indentation, so subtasks render at proportional depth.
             spans.push(Span::raw(" ".repeat(4 + task.indent)));
-            spans.push(Span::styled(checkbox, checkbox_style(&task.status)));
+            spans.push(Span::styled(checkbox, checkbox_style(&task.status, theme)));
             spans.push(Span::raw(format!(" {}", task.text)));
             if let Some(due) = &task.due_date {
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(
                     format!("· {due}"),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(theme.warning),
                 ));
             }
             // ADR-0009 Phase 1: scheduled-date suffix. Parallel to (not replacing)
@@ -2038,10 +2144,10 @@ fn row_to_item(row: &DisplayRow, today: &str) -> ListItem<'static> {
                 let is_today = sched.as_str() == today;
                 let style = if is_today {
                     Style::default()
-                        .fg(Color::LightCyan)
+                        .fg(theme.accent_bright)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::Cyan)
+                    Style::default().fg(theme.scheduled)
                 };
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(format!("⏳ {sched}"), style));
@@ -2059,12 +2165,12 @@ fn row_to_item(row: &DisplayRow, today: &str) -> ListItem<'static> {
 
 /// Colour for the `[x]` checkbox, by status: open=amber (attention), done=green,
 /// in-progress=cyan, other=dim.
-fn checkbox_style(status: &Status) -> Style {
+fn checkbox_style(status: &Status, theme: &theme::Theme) -> Style {
     match status {
-        Status::Open => Style::default().fg(Color::Yellow),
-        Status::Done => Style::default().fg(Color::Green),
-        Status::InProgress => Style::default().fg(Color::Cyan),
-        Status::Other(_) => Style::default().fg(Color::DarkGray),
+        Status::Open => Style::default().fg(theme.warning),
+        Status::Done => Style::default().fg(theme.success),
+        Status::InProgress => Style::default().fg(theme.accent),
+        Status::Other(_) => Style::default().fg(theme.muted),
     }
 }
 
@@ -2142,6 +2248,7 @@ fn expand_tabs(s: &str) -> String {
 /// note when the cursor is on a header), with a line-number gutter and the target line
 /// highlighted. `scroll` shifts the window up/down from the auto-centered position.
 /// Shows a graceful placeholder when content is unavailable.
+#[allow(clippy::too_many_arguments)]
 fn draw_context_pane(
     frame: &mut Frame,
     area: Rect,
@@ -2149,13 +2256,15 @@ fn draw_context_pane(
     content: Option<&NoteContent>,
     target_line: Option<usize>,
     scroll: i32,
+    theme: &theme::Theme,
+    prefs: &theme::LayoutPrefs,
 ) {
     let title = Line::from(vec![
         Span::raw(" Context — "),
         Span::styled(
             note_path.unwrap_or("(no note selected)"),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
@@ -2197,7 +2306,7 @@ fn draw_context_pane(
                         let is_target = highlight == Some(i);
                         let style = if is_target {
                             Style::default()
-                                .fg(Color::Yellow)
+                                .fg(theme.context_target)
                                 .add_modifier(Modifier::BOLD)
                         } else {
                             Style::default()
@@ -2205,7 +2314,7 @@ fn draw_context_pane(
                         Line::from(vec![
                             Span::styled(
                                 format!("{:>width$} ", lineno, width = num_width),
-                                Style::default().fg(Color::DarkGray),
+                                Style::default().fg(theme.muted),
                             ),
                             Span::styled(if is_target { "▶ " } else { "  " }, style),
                             Span::styled(expand_tabs(raw), style),
@@ -2216,7 +2325,11 @@ fn draw_context_pane(
         }
     };
 
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let mut p = Paragraph::new(lines).block(block);
+    if prefs.context_wrap {
+        p = p.wrap(Wrap { trim: false });
+    }
+    frame.render_widget(p, area);
 }
 
 /// Whether `key` is one of the help-overlay dismissal keys (`?`, `Esc`, `q`).
@@ -2254,7 +2367,7 @@ fn popup_area(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
 /// language so the overlay feels native. A blank line separates groups, and a
 /// dim hint line at the bottom reminds the user how to dismiss. The keycap and
 /// description wording is fixed copy.
-fn help_popup() -> Paragraph<'static> {
+fn help_popup(theme: &theme::Theme) -> Paragraph<'static> {
     /// Fixed column width (in chars) the keycap is left-padded to so the
     /// descriptions align into a clean right column. Wide enough for the longest
     /// keycap (`q / Esc / Ctrl-C`). Note: padding is by char count, so
@@ -2262,20 +2375,20 @@ fn help_popup() -> Paragraph<'static> {
     /// render them 2-wide — acceptable for a personal TUI.
     const HELP_KEY_W: usize = 16;
 
-    // Yellow keycap, padded to the fixed column width (matches the footer).
+    // Keycap colour, padded to the fixed column width (matches the footer).
     let key = |k: &'static str| {
         Span::styled(
             format!("{k:<w$}", w = HELP_KEY_W),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme.warning),
         )
     };
-    // Bold cyan group header — a distinct color from the yellow keycaps so the
+    // Bold accent group header — a distinct color from the keycaps so the
     // eye can scan groups quickly.
     let head = |h: &'static str| {
         Line::from(vec![Span::styled(
             h,
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         )])
     };
@@ -4155,6 +4268,172 @@ mod tests {
         assert!(
             rendered.contains("2026-06-21"),
             "the other scheduled date must render"
+        );
+    }
+
+    // --- Note-header path/filename split (ADR-0018) ------------------------
+
+    /// `split_note_header` peels the directory prefix (with trailing `/`) from
+    /// the filename; a root-level note has no prefix.
+    #[test]
+    fn split_note_header_cases() {
+        assert_eq!(
+            split_note_header("Projects/Work/standup.md"),
+            (Some("Projects/Work/"), "standup.md")
+        );
+        assert_eq!(
+            split_note_header("inbox/today.md"),
+            (Some("inbox/"), "today.md")
+        );
+        // Root-level note: no prefix.
+        assert_eq!(split_note_header("standup.md"), (None, "standup.md"));
+        // Trailing slash (defensive): empty filename, whole thing is prefix.
+        assert_eq!(split_note_header("a/b/"), (Some("a/b/"), ""));
+    }
+
+    /// Under Note grouping, the directory prefix renders dimmed (`path_prefix`)
+    /// while the filename keeps the default fg + BOLD, so the filename pops.
+    /// Other axes are unaffected (covered implicitly — the split is Note-only).
+    #[test]
+    fn note_header_dims_dir_prefix() {
+        use ratatui::backend::TestBackend;
+        let conn = db::open(":memory:").unwrap();
+        db::upsert_task(&conn, &task(1, " ", 1, "inbox/today.md")).unwrap();
+
+        let mut app = App::new();
+        app.filter = StatusFilter::All;
+        app.refresh(&conn).unwrap();
+        // Hide the context pane so the note path appears exactly once (the list
+        // header) — the pane title also renders the path, in the same accent.
+        app.pane_visible = false;
+        app.rebuild();
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let cells: Vec<&ratatui::buffer::Cell> = buf.content.iter().collect();
+
+        // Locate the contiguous run of cells spelling the note path in the header.
+        let needle: Vec<char> = "inbox/today.md".chars().collect();
+        let start = (0..cells.len())
+            .find(|&i| {
+                needle.iter().enumerate().all(|(k, ch)| {
+                    cells
+                        .get(i + k)
+                        .is_some_and(|c| c.symbol() == ch.to_string())
+                })
+            })
+            .expect("list header must render");
+
+        // "inbox/" (6 chars) is the dimmed prefix; "today.md" is the filename.
+        use ratatui::style::Color;
+        let prefix_cell = cells[start]; // 'i'
+        let filename_cell = cells[start + 6]; // 't'
+        assert_eq!(
+            prefix_cell.fg,
+            Color::DarkGray,
+            "dir prefix must use path_prefix (DarkGray default)"
+        );
+        assert_ne!(
+            filename_cell.fg,
+            Color::DarkGray,
+            "filename must not be dimmed"
+        );
+        assert!(
+            filename_cell.modifier.contains(Modifier::BOLD),
+            "filename must stay bold"
+        );
+    }
+
+    /// End-to-end: a user-configured `[theme]` color must reach the actual
+    /// rendered cells. Exercises the full chain `ThemeConfig` →
+    /// `Theme::resolve_from` → `app.theme` → `draw`, then asserts the title-bar
+    /// filter label (an `accent`-styled surface) carries the custom color rather
+    /// than the compiled default (`Cyan`).
+    #[test]
+    fn custom_theme_color_reaches_rendered_cells() {
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Color;
+
+        // A distinctive accent unlikely to collide with any default named color.
+        let cfg = taski_config::ThemeConfig {
+            accent: Some("#ff00ff".into()),
+            ..taski_config::ThemeConfig::default()
+        };
+        let resolved = theme::Theme::resolve_from(Some(&cfg));
+        assert_eq!(
+            resolved.accent,
+            Color::Rgb(255, 0, 255),
+            "resolve must parse the configured hex"
+        );
+
+        let conn = db::open(":memory:").unwrap();
+        db::upsert_task(&conn, &task(1, " ", 1, "a.md")).unwrap();
+        let mut app = App::new();
+        app.filter = StatusFilter::All;
+        app.refresh(&conn).unwrap();
+        app.theme = resolved; // what run_loop does with the config-resolved theme
+        app.rebuild();
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let cells: Vec<&ratatui::buffer::Cell> = buf.content.iter().collect();
+
+        // The title bar renders `filter: <label>` styled with theme.accent.
+        let needle: Vec<char> = "filter:".chars().collect();
+        let start = (0..cells.len())
+            .find(|&i| {
+                needle.iter().enumerate().all(|(k, ch)| {
+                    cells
+                        .get(i + k)
+                        .is_some_and(|c| c.symbol() == ch.to_string())
+                })
+            })
+            .expect("title bar filter label must render");
+        assert_eq!(
+            cells[start].fg,
+            Color::Rgb(255, 0, 255),
+            "the configured accent color must reach the rendered cell"
+        );
+    }
+
+    /// A configured `background` must fill every cell — including cells no widget
+    /// writes text into — while foreground colors are untouched. With the default
+    /// (`Reset`) background, `draw` must paint nothing (cells keep `Reset` bg).
+    #[test]
+    fn theme_background_fills_the_screen() {
+        use ratatui::backend::TestBackend;
+
+        let render_bg = |bg: Color| {
+            let conn = db::open(":memory:").unwrap();
+            db::upsert_task(&conn, &task(1, " ", 1, "a.md")).unwrap();
+            let mut app = App::new();
+            app.filter = StatusFilter::All;
+            app.refresh(&conn).unwrap();
+            app.theme.background = bg;
+            app.rebuild();
+            let backend = TestBackend::new(80, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            terminal.backend().buffer().clone()
+        };
+
+        // Custom background: every cell's bg is the configured color.
+        let nord_bg = Color::Rgb(0x2e, 0x34, 0x40);
+        let buf = render_bg(nord_bg);
+        assert!(
+            buf.content.iter().all(|c| c.bg == nord_bg),
+            "a configured background must fill all cells (incl. blank ones)"
+        );
+
+        // Default (Reset) background: draw paints no bg, so cells stay Reset.
+        let buf_default = render_bg(Color::Reset);
+        assert!(
+            buf_default.content.iter().all(|c| c.bg == Color::Reset),
+            "default (Reset) background must leave cells unpainted"
         );
     }
 

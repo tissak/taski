@@ -13,6 +13,98 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+// ---------------------------------------------------------------------------
+// Theme config types (ADR-0018 S2).
+// ---------------------------------------------------------------------------
+
+/// A color specification from user config.
+///
+/// Stored as a raw `String` at deserialization time; parsed into a ratatui
+/// `Color` during resolution in `taski-tui`. This keeps `taski-config` free
+/// of the `ratatui` dependency and defers error handling to the resolve step
+/// (per-role fallback + `tracing::warn!`, never a hard error).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColorSpec {
+    /// A ratatui named color, e.g. `"cyan"`, `"light_red"`, `"dark_gray"`.
+    Named(String),
+    /// A hex truecolor, e.g. `"#ff0000"`.
+    Hex(String),
+    /// The terminal's default foreground (`Color::Reset`).
+    TerminalDefault,
+}
+
+/// User-configured theme — 12 optional color strings.
+///
+/// All fields are optional. An absent field (or a `[theme]` section with that
+/// key missing) falls back to the compiled default in
+/// `taski_tui::theme::Theme::default()`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default)]
+pub struct ThemeConfig {
+    pub accent: Option<String>,
+    pub accent_bright: Option<String>,
+    pub group_accent: Option<String>,
+    pub success: Option<String>,
+    pub warning: Option<String>,
+    pub danger: Option<String>,
+    pub danger_bright: Option<String>,
+    pub muted: Option<String>,
+    pub context_target: Option<String>,
+    pub scheduled: Option<String>,
+    /// Directory-prefix color in Note-group headers (ADR-0018). The filename
+    /// stays bold/default; the leading path is dimmed so the filename pops.
+    pub path_prefix: Option<String>,
+    /// Window background color (ADR-0018 follow-on). Absent / `"default"` means
+    /// "use the terminal's background" (Taski paints nothing) — preserving the
+    /// byte-identical default. Set it (named or hex) to make Taski own its
+    /// background independent of the terminal theme.
+    pub background: Option<String>,
+}
+
+/// Per-panel density preset (how many blank lines between groups).
+///
+/// Used as a serde enum so a bad variant errors at config load (before the alt
+/// screen is entered — ADR-0018).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DensityPreset {
+    /// No blank lines between groups (today's default behaviour).
+    #[default]
+    Compact,
+    /// One blank line between groups.
+    Comfortable,
+    /// Two blank lines between groups.
+    Spacious,
+}
+
+impl DensityPreset {
+    /// How many blank lines to insert between groups.
+    pub const fn blank_lines(self) -> u8 {
+        match self {
+            Self::Compact => 0,
+            Self::Comfortable => 1,
+            Self::Spacious => 2,
+        }
+    }
+}
+
+/// Per-panel layout configuration.
+///
+/// All fields are optional.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    pub list_pane_percent: Option<u16>,
+    /// Density preset: "compact" (0), "comfortable" (1), or "spacious" (2).
+    #[serde(default)]
+    pub list_density: Option<DensityPreset>,
+    pub context_wrap: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
+// Main config struct.
+// ---------------------------------------------------------------------------
+
 /// User configuration. Both fields are optional; a missing field falls back to the
 /// CLI flag (if given) and then to the compiled default.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
@@ -41,6 +133,12 @@ pub struct Config {
     /// `.git`) are always excluded and don't need to be listed here.
     #[serde(default)]
     pub exclude_dirs: Vec<String>,
+    /// ADR-0018: TUI color theme overrides. Absent = compiled defaults.
+    #[serde(default)]
+    pub theme: Option<ThemeConfig>,
+    /// ADR-0018: TUI per-panel layout preferences. Wire-up deferred to S3.
+    #[serde(default)]
+    pub ui: Option<UiConfig>,
 }
 
 /// Load config from the effective path: `$TASKI_CONFIG` if set and non-empty, else
@@ -168,7 +266,31 @@ pub fn template(vault: Option<&str>, db: &str) -> String {
          # Use the Advanced URI community plugin (obsidian://advanced-uri) for the `o` gesture so\n\
          # Obsidian jumps to the task's exact line. Requires the plugin installed in Obsidian.\n\
          # Default: false (uses native obsidian://open, which opens the file but cannot target a line).\n\
-         use_advanced_uri = false\n",
+         use_advanced_uri = false\n\
+         \n\
+         # ADR-0018: TUI color theming. Every key is optional — omitted keys\n\
+         # fall back to the compiled default (Taski's classic dark palette).\n\
+         # Accepted values: named colors (cyan, light_red, dark_gray, ...),\n\
+         # hex truecolor (#ff0000), or \"default\" (terminal default fg).\n\
+         # [theme]\n\
+         # accent         = \"cyan\"\n\
+         # accent_bright  = \"light_cyan\"\n\
+         # group_accent   = \"magenta\"\n\
+         # success        = \"green\"\n\
+         # warning        = \"yellow\"\n\
+         # danger         = \"red\"\n\
+         # danger_bright  = \"light_red\"\n\
+         # muted          = \"dark_gray\"\n\
+         # context_target = \"yellow\"\n\
+         # scheduled      = \"cyan\"\n\
+         # path_prefix    = \"dark_gray\"  # dir prefix in note-group headers\n\
+         # background     = \"default\"    # window bg; \"default\" = terminal's own bg\n\
+         \n\
+         # ADR-0018: TUI per-panel layout preferences (all optional).\n\
+         # [ui]\n\
+         # list_pane_percent = 50      # 20–80; list width when context pane is visible\n\
+         # list_density     = \"compact\"  # compact | comfortable | spacious\n\
+         # context_wrap     = false\n",
     )
 }
 
@@ -235,6 +357,8 @@ mod tests {
             inbox_path: None,
             obsidian_vault: None,
             use_advanced_uri: false,
+            theme: None,
+            ui: None,
         };
         let v = resolve_vault(Some("/from/cli"), &cfg).expect("ok");
         assert_eq!(v, PathBuf::from("/from/cli"));
@@ -249,6 +373,8 @@ mod tests {
             inbox_path: None,
             obsidian_vault: None,
             use_advanced_uri: false,
+            theme: None,
+            ui: None,
         };
         let v = resolve_vault(None, &cfg).expect("ok");
         assert_eq!(v, PathBuf::from("/from/config"));
@@ -272,6 +398,8 @@ mod tests {
             inbox_path: None,
             obsidian_vault: None,
             use_advanced_uri: false,
+            theme: None,
+            ui: None,
         };
         assert_eq!(
             resolve_db(Some("/from/cli.db"), &cfg),
@@ -288,6 +416,8 @@ mod tests {
             inbox_path: None,
             obsidian_vault: None,
             use_advanced_uri: false,
+            theme: None,
+            ui: None,
         };
         assert_eq!(resolve_db(None, &cfg), PathBuf::from("/from/config.db"));
     }
@@ -403,5 +533,83 @@ mod tests {
         let cfg = load_from(f.path()).expect("template should parse");
         assert!(cfg.vault.is_none());
         assert_eq!(cfg.db.as_deref(), Some("/tmp/taski.db"));
+    }
+
+    #[test]
+    fn template_has_no_theme_by_default() {
+        // Both [theme] and [ui] are fully commented in the template, so
+        // the parsed Config should see `None` for both.
+        let body = template(Some("/tmp/vault"), "/tmp/db");
+        let f = write_temp(&body);
+        let cfg = load_from(f.path()).expect("template should parse");
+        assert!(cfg.theme.is_none(), "commented [theme] should be None");
+        assert!(cfg.ui.is_none(), "commented [ui] should be None");
+    }
+
+    #[test]
+    fn deserialize_active_theme_section() {
+        let toml = "\
+            vault = \"/tmp/v\"\n\
+            [theme]\n\
+            accent = \"red\"\n\
+            warning = \"#ff8800\"\n\
+            path_prefix = \"blue\"\n\
+            background = \"#1a1b26\"\n\
+        ";
+        let f = write_temp(toml);
+        let cfg = load_from(f.path()).expect("valid theme config should parse");
+        let t = cfg.theme.expect("[theme] section should be Some");
+        assert_eq!(t.accent.as_deref(), Some("red"));
+        assert_eq!(t.warning.as_deref(), Some("#ff8800"));
+        assert_eq!(t.path_prefix.as_deref(), Some("blue"));
+        assert_eq!(t.background.as_deref(), Some("#1a1b26"));
+        // Unset fields stay None.
+        assert!(t.success.is_none());
+        assert!(t.muted.is_none());
+    }
+
+    #[test]
+    fn deserialize_empty_theme_section() {
+        let toml = "\
+            vault = \"/tmp/v\"\n\
+            [theme]\n\
+        ";
+        let f = write_temp(toml);
+        let cfg = load_from(f.path()).expect("empty [theme] should parse");
+        let t = cfg.theme.expect("empty [theme] should still be Some");
+        assert!(t.accent.is_none());
+        assert!(t.accent_bright.is_none());
+    }
+
+    #[test]
+    fn deserialize_active_ui_section() {
+        let toml = "\
+            vault = \"/tmp/v\"\n\
+            [ui]\n\
+            list_pane_percent = 65\n\
+            list_density = \"compact\"\n\
+            context_wrap = true\n\
+        ";
+        let f = write_temp(toml);
+        let cfg = load_from(f.path()).expect("valid ui config should parse");
+        let u = cfg.ui.expect("[ui] section should be Some");
+        assert_eq!(u.list_pane_percent, Some(65));
+        assert_eq!(u.list_density, Some(DensityPreset::Compact));
+        assert_eq!(u.context_wrap, Some(true));
+    }
+
+    #[test]
+    fn deserialize_bad_density_is_error() {
+        // A bad variant name must error at config load (before alt screen).
+        let toml = "\
+            vault = \"/tmp/v\"\n\
+            [ui]\n\
+            list_density = \"Cozy\"\n\
+        ";
+        let f = write_temp(toml);
+        assert!(
+            load_from(f.path()).is_err(),
+            "bad density variant should error"
+        );
     }
 }
