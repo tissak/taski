@@ -1,6 +1,6 @@
 # Tech — Taski
 
-*Last updated: 2026-06-21*
+*Last updated: 2026-06-22*
 
 Authoritative record of technology choices for Taski. Each entry has a one-line rationale and a link to the deciding ADR where applicable. Update this file whenever a choice is made or revised.
 
@@ -36,10 +36,14 @@ Authoritative record of technology choices for Taski. Each entry has a one-line 
 
 > **Frontmatter `taski-skip` opt-out (ADR-0017):** a note whose first-line YAML frontmatter carries `taski-skip: true` contributes **no tasks** to the index. The pure `taski_skip_enabled(markdown)` detector lives in `taski-core` (no new dep, manual string parsing); the daemon's `index_note` guards on it — reconciling with an empty list (which **evicts** any previously-indexed rows via `reconcile_note`'s unmatched-row delete) and skipping the `note_contents` cache. Read-path only: no schema bump, no `pending_actions`, no vault mutation, no write-back ADR touched. Only the literal boolean `true` (case-insensitive) or its quoted `"true"`/`'true'` variants are honored — YAML-1.1 spellings (`yes`/`on`) are deliberately rejected. The per-file, content-local complement to `exclude_dirs`.
 
+> **Theming & density (ADR-0018):** colors and per-panel sizing are user-configurable via optional `[theme]` and `[ui]` sections in `config.toml`. `taski-config` owns the pure-data `ThemeConfig`/`UiConfig` (no ratatui dep); `taski-tui` owns the ratatui-typed `Theme`/`LayoutPrefs` and does the one-way conversion in `run_inner`. Defaults produce byte-identical rendering to the pre-feature TUI — codified by a unit test. Per-pane font size is not possible in terminals (no ECMA-48 escape); the real levers are space allocation, style emphasis, wrapping, and density — what every comparable TUI uses.
+
 ## UI / TUI
 | Choice | Rationale | Decided |
 |---|---|---|
 | **`ratatui`** | De-facto Rust TUI framework; pairs with the single-language stack. | 2026-06-20 |
+| **`ratatui` theming via in-crate `Theme` struct** | User-configurable color palette (`[theme]` in config.toml) resolved once in `run_inner` from a `ThemeConfig` (in `taski-config`, no ratatui dep). Defaults byte-identical to the pre-feature palette. See ADR-0018. | 2026-06-22 |
+| **Per-panel density via `LayoutPrefs`** | User-configurable list-pane percent, list density, context wrap (`[ui]` in config.toml). Reframes the "per-pane font size" ask (impossible in terminals) as space allocation + emphasis. See ADR-0018. | 2026-06-22 |
 
 ## Cross-cutting
 | Choice | Rationale | Decided |

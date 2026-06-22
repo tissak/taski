@@ -37,6 +37,8 @@ Override either per-invocation with `--vault` / `--db` (the CLI flag wins over t
 
 Point taski at an alternate config file with the `TASKI_CONFIG` environment variable. A missing config file is fine (taski falls back to CLI flags / defaults); only a malformed file is an error.
 
+For every option (inbox path, exclude dirs, Obsidian deep-link settings), the TUI color theme — including a ready-made Nord palette — and per-panel layout knobs, see the full **[configuration guide](./config.md)**.
+
 ## 3. Autostart the daemon (launchd)
 
 ```sh
