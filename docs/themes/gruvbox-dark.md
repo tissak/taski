@@ -50,6 +50,7 @@ The Gruvbox dark colors this preset draws from:
   above makes Taski paint that itself; remove it (or set `"default"`) to fall
   back to your terminal's background.
 - On a 256-color (non-truecolor) terminal these hex values are approximated.
-- `accent` and `accent_bright` share the same yellow here (Gruvbox's "today"
-  emphasis comes from the bold weight rather than a brighter hue); set
-  `accent_bright` to a lighter color if you want more contrast on today's tasks.
+- `accent` and `accent_bright` share the same yellow here. Because Taski's
+  global `bold` toggle is **off by default**, "today" tasks would then have no
+  visual distinction — so give `accent_bright` a lighter color (e.g. `#fabd2f`)
+  for contrast, or set `bold = true` in `[theme]` to restore the bold weight.

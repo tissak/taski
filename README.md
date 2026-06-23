@@ -29,7 +29,7 @@ Obsidian stays the source of truth. A background daemon watches one vault, parse
 
 A keyboard-driven TUI. Press `?` in the app for the full keybinding overlay.
 
-- **Browse** every task across the vault, grouped by note / tag / priority / folder (cycle with `G`).
+- **Browse** every task across the vault, grouped by folder+note / note / tag / priority / folder (cycle with `G`).
 - **Filter** by status (`f`), today (`T`), overdue (`O`), text search (`/`), and file search (`F`) — all compose.
 - **See context** — `p` toggles the in-note context pane; `J`/`K` scroll it. This is the whole point.
 - **Act** without leaving the keyboard:

@@ -276,12 +276,22 @@ fn is_open_like(status: &Status) -> bool {
     matches!(status, Status::Open | Status::InProgress)
 }
 
-/// Grouping axis cycled with `G`: Note → Tag → Priority → Folder → Note. The
-/// default is Note (the classic "one group per source file" view). Tag fans out
-/// a single task to multiple groups; Priority and Folder produce exactly one key
-/// per task.
+/// Grouping axis cycled with `G`: FolderNote → Note → Tag → Priority → Folder →
+/// FolderNote. The default is FolderNote (the classic "one group per source
+/// file path" view).
+///
+/// The three path-derived axes form a coarse→fine progression on the same note:
+/// - **Folder** keys on the parent directory (`Projects/Work`).
+/// - **FolderNote** keys on the full note path (`Projects/Work/standup.md`) and
+///   renders the directory prefix dimmed so the filename pops.
+/// - **Note** keys on the filename alone (`standup.md`), ignoring the directory —
+///   so identically-named notes in different folders collapse into one group.
+///
+/// Tag fans out a single task to multiple groups; Priority, Folder, FolderNote,
+/// and Note each produce exactly one key per task.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum GroupBy {
+    FolderNote,
     Note,
     Tag,
     Priority,
@@ -289,19 +299,23 @@ enum GroupBy {
 }
 
 impl GroupBy {
-    /// Cycle to the next axis: Note → Tag → Priority → Folder → Note.
+    /// Cycle to the next axis: FolderNote → Note → Tag → Priority → Folder →
+    /// FolderNote. The two note axes sit next to the folder axis so the
+    /// coarse→fine path views are adjacent.
     fn next(self) -> Self {
         match self {
+            GroupBy::FolderNote => GroupBy::Note,
             GroupBy::Note => GroupBy::Tag,
             GroupBy::Tag => GroupBy::Priority,
             GroupBy::Priority => GroupBy::Folder,
-            GroupBy::Folder => GroupBy::Note,
+            GroupBy::Folder => GroupBy::FolderNote,
         }
     }
 
     /// Short label for the title-bar indicator.
     fn label(self) -> &'static str {
         match self {
+            GroupBy::FolderNote => "folder+note",
             GroupBy::Note => "note",
             GroupBy::Tag => "tag",
             GroupBy::Priority => "priority",
@@ -313,10 +327,13 @@ impl GroupBy {
 /// Return the group key(s) for a task under the given axis. `Tag` can fan out to
 /// multiple keys (one per tag); the other axes always return exactly one.
 /// Untagged tasks go to `(untagged)`, no-priority/unknown to `(no priority)`,
-/// no-folder (top-level note) to `(root)`.
+/// no-folder (top-level note) to `(root)`. `FolderNote` keys on the full note
+/// path; `Note` keys on the filename alone (so same-named notes in different
+/// folders share a group).
 fn group_keys(task: &Task, axis: GroupBy) -> Vec<String> {
     match axis {
-        GroupBy::Note => vec![task.note_path.clone()],
+        GroupBy::FolderNote => vec![task.note_path.clone()],
+        GroupBy::Note => vec![filename_of(&task.note_path)],
         GroupBy::Tag => {
             if task.tags.is_empty() {
                 vec!["(untagged)".to_string()]
@@ -327,6 +344,15 @@ fn group_keys(task: &Task, axis: GroupBy) -> Vec<String> {
         GroupBy::Priority => vec![priority_group_label(task.priority.as_ref())],
         GroupBy::Folder => vec![folder_of(&task.note_path)],
     }
+}
+
+/// The filename (last path component) of a note path, ignoring directories.
+/// `Projects/Work/standup.md` → `standup.md`; a root-level note returns itself.
+/// Used by the `Note` grouping axis (filename-only), the fine end of the
+/// Folder → FolderNote → Note progression. Reuses [`split_note_header`] so the
+/// "what counts as the filename" rule stays in one place.
+fn filename_of(note_path: &str) -> String {
+    split_note_header(note_path).1.to_string()
 }
 
 /// Human-readable label for a task's priority bucket. `Other` (unknown glyph)
@@ -402,7 +428,9 @@ impl DisplayRow {
 /// order is preserved from the input (line order for the Note axis).
 ///
 /// `group_by` controls the grouping axis (cycled with `G`):
-/// - **Note** (default): one group per source note path.
+/// - **FolderNote** (default): one group per source note path.
+/// - **Note**: one group per filename, ignoring directories — same-named notes in
+///   different folders merge into one group.
 /// - **Tag**: one group per tag; an untagged task goes to `(untagged)`. A task with
 ///   multiple tags appears in every matching group (fan-out).
 /// - **Priority**: one group per priority level (`Highest` … `Lowest`), ordered by
@@ -735,7 +763,7 @@ impl App {
             vault_name: None,
             use_advanced_uri: false,
             last_action: None,
-            group_by: GroupBy::Note,
+            group_by: GroupBy::FolderNote,
             show_help: false,
             theme: theme::Theme::default(),
             layout: theme::LayoutPrefs::default(),
@@ -1828,14 +1856,14 @@ fn draw(frame: &mut Frame, app: &mut App) {
             format!("filter: {}", app.filter.label()),
             Style::default()
                 .fg(app.theme.accent)
-                .add_modifier(Modifier::BOLD),
+                .add_modifier(app.theme.bold_modifier()),
         ),
         Span::raw("  ·  "),
         Span::styled(
             format!("group: {}", app.group_by.label()),
             Style::default()
                 .fg(app.theme.group_accent)
-                .add_modifier(Modifier::BOLD),
+                .add_modifier(app.theme.bold_modifier()),
         ),
     ];
     // ADR-0009 Phase 1: surface the Today view state so the user can see it's on.
@@ -1845,7 +1873,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
             "today",
             Style::default()
                 .fg(app.theme.accent_bright)
-                .add_modifier(Modifier::BOLD),
+                .add_modifier(app.theme.bold_modifier()),
         ));
     }
     // ADR-0010: surface active search query in the title bar.
@@ -1855,7 +1883,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
             format!("search: {}", app.search_query),
             Style::default()
                 .fg(app.theme.success)
-                .add_modifier(Modifier::BOLD),
+                .add_modifier(app.theme.bold_modifier()),
         ));
     }
     // ADR-0010: surface active file/path search in the title bar.
@@ -1865,7 +1893,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
             format!("file: {}", app.file_query),
             Style::default()
                 .fg(app.theme.success)
-                .add_modifier(Modifier::BOLD),
+                .add_modifier(app.theme.bold_modifier()),
         ));
     }
     // Overdue filter indicator: red/bold to signal urgency.
@@ -1875,7 +1903,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
             "overdue",
             Style::default()
                 .fg(app.theme.danger_bright)
-                .add_modifier(Modifier::BOLD),
+                .add_modifier(app.theme.bold_modifier()),
         ));
     }
     title_spans.push(Span::raw(format!(
@@ -1934,7 +1962,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
                 " ⚠  ",
                 Style::default()
                     .fg(app.theme.danger)
-                    .add_modifier(Modifier::BOLD),
+                    .add_modifier(app.theme.bold_modifier()),
             ),
             Span::styled(msg.clone(), Style::default().fg(app.theme.danger)),
         ]);
@@ -2061,7 +2089,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
 ///
 /// The prefix includes its trailing `/` (e.g. `("Projects/Work/", "standup.md")`)
 /// so the two parts concatenate back to the original. A root-level note with no
-/// `/` returns `(None, whole_key)`. Used only for `GroupBy::Note` headers, where
+/// `/` returns `(None, whole_key)`. Used only for `GroupBy::FolderNote` headers, where
 /// the prefix is dimmed (`theme.path_prefix`) so the filename pops.
 fn split_note_header(key: &str) -> (Option<&str>, &str) {
     match key.rfind('/') {
@@ -2095,25 +2123,25 @@ fn row_to_item(
                 format!("{marker} "),
                 Style::default()
                     .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
+                    .add_modifier(theme.bold_modifier()),
             )];
             // ADR-0018: under Note grouping the key is a note path; dim the
             // directory prefix so the filename (bold/default) pops at a glance.
             // Other axes (Tag/Priority/Folder) render the key whole.
             match (group_by, split_note_header(group_key)) {
-                (GroupBy::Note, (Some(prefix), filename)) => {
+                (GroupBy::FolderNote, (Some(prefix), filename)) => {
                     spans.push(Span::styled(
                         prefix.to_string(),
                         Style::default().fg(theme.path_prefix),
                     ));
                     spans.push(Span::styled(
                         filename.to_string(),
-                        Style::default().add_modifier(Modifier::BOLD),
+                        Style::default().add_modifier(theme.bold_modifier()),
                     ));
                 }
                 _ => spans.push(Span::styled(
                     group_key.clone(),
-                    Style::default().add_modifier(Modifier::BOLD),
+                    Style::default().add_modifier(theme.bold_modifier()),
                 )),
             }
             spans.push(Span::raw("   "));
@@ -2145,7 +2173,7 @@ fn row_to_item(
                 let style = if is_today {
                     Style::default()
                         .fg(theme.accent_bright)
-                        .add_modifier(Modifier::BOLD)
+                        .add_modifier(theme.bold_modifier())
                 } else {
                     Style::default().fg(theme.scheduled)
                 };
@@ -2265,7 +2293,7 @@ fn draw_context_pane(
             note_path.unwrap_or("(no note selected)"),
             Style::default()
                 .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
+                .add_modifier(theme.bold_modifier()),
         ),
         Span::raw(" "),
     ]);
@@ -2307,7 +2335,7 @@ fn draw_context_pane(
                         let style = if is_target {
                             Style::default()
                                 .fg(theme.context_target)
-                                .add_modifier(Modifier::BOLD)
+                                .add_modifier(theme.bold_modifier())
                         } else {
                             Style::default()
                         };
@@ -2389,7 +2417,7 @@ fn help_popup(theme: &theme::Theme) -> Paragraph<'static> {
             h,
             Style::default()
                 .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
+                .add_modifier(theme.bold_modifier()),
         )])
     };
     // One aligned key/description row: leading indent, padded keycap, gap, desc.
@@ -2409,7 +2437,10 @@ fn help_popup(theme: &theme::Theme) -> Paragraph<'static> {
         row("f", "Cycle status filter (All / Open / Done)"),
         row("T", "Today view (scheduled == today)"),
         row("O", "Overdue view (due < today)"),
-        row("G", "Cycle group-by (note / tag / priority / folder)"),
+        row(
+            "G",
+            "Cycle group-by (folder+note / note / tag / priority / folder)",
+        ),
         row("p", "Toggle context pane"),
         Line::raw(""),
         head("Task actions"),
@@ -2627,7 +2658,7 @@ mod tests {
             "",
             "",
             false,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         // Two collapsed groups -> two headers, no task rows.
         assert_eq!(rows.len(), 2);
@@ -2656,7 +2687,7 @@ mod tests {
             "",
             "",
             false,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         assert_eq!(rows.len(), 3, "header + two tasks");
         assert!(matches!(rows[0], DisplayRow::Header { .. }));
@@ -2678,7 +2709,7 @@ mod tests {
             "",
             "",
             false,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         assert_eq!(rows.len(), 2, "header + only the open task");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
@@ -2701,7 +2732,7 @@ mod tests {
             "",
             "",
             false,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         // Only alpha has an open task; beta is hidden under the Open filter.
         assert_eq!(rows.len(), 1);
@@ -2728,7 +2759,7 @@ mod tests {
             "",
             "",
             false,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         assert!(
             !rows.is_empty(),
@@ -2749,7 +2780,7 @@ mod tests {
             "",
             "",
             false,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         assert!(rows.is_empty(), "done-only group is hidden under Open");
     }
@@ -2768,7 +2799,7 @@ mod tests {
             "",
             "",
             false,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         match &rows[1] {
             DisplayRow::Task { task } => {
@@ -4127,7 +4158,7 @@ mod tests {
             "",
             "",
             false,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         // Only alpha.md has a today-matching task; one collapsed header.
         assert_eq!(rows.len(), 1);
@@ -4154,7 +4185,7 @@ mod tests {
             "",
             "",
             false,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         assert_eq!(rows.len(), 2, "header + one task");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
@@ -4168,7 +4199,7 @@ mod tests {
             "",
             "",
             false,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         assert_eq!(rows.len(), 3, "header + two tasks");
     }
@@ -4226,7 +4257,7 @@ mod tests {
             "",
             "",
             false,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(header(&rows[0]).0, "alpha.md");
@@ -4292,7 +4323,8 @@ mod tests {
     }
 
     /// Under Note grouping, the directory prefix renders dimmed (`path_prefix`)
-    /// while the filename keeps the default fg + BOLD, so the filename pops.
+    /// while the filename keeps the default (brighter) fg, so the filename pops
+    /// by color contrast alone — bold is off by default (global `bold` toggle).
     /// Other axes are unaffected (covered implicitly — the split is Note-only).
     #[test]
     fn note_header_dims_dir_prefix() {
@@ -4341,8 +4373,8 @@ mod tests {
             "filename must not be dimmed"
         );
         assert!(
-            filename_cell.modifier.contains(Modifier::BOLD),
-            "filename must stay bold"
+            !filename_cell.modifier.contains(Modifier::BOLD),
+            "filename must not be bold by default (global bold toggle is off)"
         );
     }
 
@@ -4459,7 +4491,7 @@ mod tests {
             "",
             "",
             true,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         // Only alpha.md (past-due) survives; one collapsed header.
         assert_eq!(rows.len(), 1);
@@ -4485,7 +4517,7 @@ mod tests {
             "",
             "",
             true,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         assert!(rows.is_empty(), "none are past-due");
     }
@@ -4509,7 +4541,7 @@ mod tests {
             "",
             "",
             false,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         assert_eq!(rows.len(), 3, "all three note headers visible");
     }
@@ -4535,7 +4567,7 @@ mod tests {
             "",
             "",
             true,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         assert_eq!(rows.len(), 2, "header + one open past-due task");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
@@ -4550,7 +4582,7 @@ mod tests {
             "",
             "",
             true,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         assert_eq!(rows.len(), 2, "header + one done past-due task");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 2));
@@ -4581,7 +4613,7 @@ mod tests {
             "",
             "",
             true,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         assert_eq!(rows.len(), 2, "header + one task matching both filters");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
@@ -4653,7 +4685,7 @@ mod tests {
             "deploy",
             "",
             false,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         assert_eq!(rows.len(), 3, "header + two matching tasks");
         let task_ids: Vec<i64> = rows
@@ -4691,7 +4723,7 @@ mod tests {
             "DEPLOY",
             "",
             false,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         assert_eq!(rows.len(), 2, "header + one matching task");
     }
@@ -4717,7 +4749,7 @@ mod tests {
             "",
             "deploy",
             false,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         assert_eq!(
             rows.len(),
@@ -4745,7 +4777,7 @@ mod tests {
             "",
             "",
             false,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         assert_eq!(rows.len(), 3, "header + two tasks — no filtering");
     }
@@ -4776,7 +4808,7 @@ mod tests {
             "deploy",
             "",
             false,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         assert_eq!(rows.len(), 2, "header + one task (open)");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
@@ -4810,7 +4842,7 @@ mod tests {
             "deploy",
             "",
             false,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         assert_eq!(rows.len(), 2, "header + one task (today + search)");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
@@ -4899,7 +4931,7 @@ mod tests {
             "",
             "DEPLOYMENT",
             false,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         assert_eq!(
             rows.len(),
@@ -4932,7 +4964,7 @@ mod tests {
             "common",
             "alpha",
             false,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         assert_eq!(rows.len(), 2, "alpha header + its task");
     }
@@ -4956,7 +4988,7 @@ mod tests {
             "",
             "beta",
             false,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         assert_eq!(rows.len(), 2, "beta header + one open task");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 2));
@@ -4986,7 +5018,7 @@ mod tests {
             "deploy",
             "alpha",
             false,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         assert_eq!(rows.len(), 2, "header + one task");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
@@ -4998,7 +5030,7 @@ mod tests {
     #[test]
     fn group_keys_note_axis_returns_note_path() {
         let t = task(1, " ", 1, "dir/note.md");
-        let keys = group_keys(&t, GroupBy::Note);
+        let keys = group_keys(&t, GroupBy::FolderNote);
         assert_eq!(keys, vec!["dir/note.md"]);
     }
 
@@ -5084,18 +5116,21 @@ mod tests {
         assert_eq!(priority_sort_rank("(no priority)"), 5);
     }
 
-    /// `GroupBy::next` cycles Note → Tag → Priority → Folder → Note.
+    /// `GroupBy::next` cycles FolderNote → Note → Tag → Priority → Folder →
+    /// FolderNote.
     #[test]
     fn group_by_cycles_through_all_axes() {
+        assert_eq!(GroupBy::FolderNote.next(), GroupBy::Note);
         assert_eq!(GroupBy::Note.next(), GroupBy::Tag);
         assert_eq!(GroupBy::Tag.next(), GroupBy::Priority);
         assert_eq!(GroupBy::Priority.next(), GroupBy::Folder);
-        assert_eq!(GroupBy::Folder.next(), GroupBy::Note);
+        assert_eq!(GroupBy::Folder.next(), GroupBy::FolderNote);
     }
 
     /// `GroupBy::label` returns the short title-bar string.
     #[test]
     fn group_by_labels() {
+        assert_eq!(GroupBy::FolderNote.label(), "folder+note");
         assert_eq!(GroupBy::Note.label(), "note");
         assert_eq!(GroupBy::Tag.label(), "tag");
         assert_eq!(GroupBy::Priority.label(), "priority");
@@ -5376,15 +5411,21 @@ mod tests {
         let mut app = App::new();
         app.tasks = vec![task_with_tags(1, " ", 1, "a.md", &["work"])];
         app.rebuild();
+        assert_eq!(app.group_by, GroupBy::FolderNote);
+        assert_eq!(header(&app.rows[0]).0, "a.md");
+
+        // FolderNote → Note: still one group, now keyed on the filename.
+        app.cycle_group_by();
         assert_eq!(app.group_by, GroupBy::Note);
         assert_eq!(header(&app.rows[0]).0, "a.md");
 
+        // Note → Tag.
         app.cycle_group_by();
         assert_eq!(app.group_by, GroupBy::Tag);
         assert_eq!(header(&app.rows[0]).0, "work");
     }
 
-    /// `cycle_group_by` wraps around from Folder back to Note.
+    /// `cycle_group_by` wraps around from Folder back to FolderNote.
     #[test]
     fn cycle_group_by_wraps_around() {
         let mut app = App::new();
@@ -5392,21 +5433,25 @@ mod tests {
         app.tasks = vec![task(1, " ", 1, "a.md")];
         app.rebuild();
         app.cycle_group_by();
-        assert_eq!(app.group_by, GroupBy::Note);
+        assert_eq!(app.group_by, GroupBy::FolderNote);
     }
 
     /// Cycling the axis does NOT clear `expanded` — stale keys naturally don't match.
     #[test]
     fn cycle_group_by_does_not_clear_expanded() {
         let mut app = App::new();
-        app.tasks = vec![task(1, " ", 1, "a.md")];
-        app.expanded.insert("a.md".to_string());
+        // A sub-folder note so the FolderNote key ("sub/a.md") differs from the
+        // Note key ("a.md") — otherwise a root note's two keys coincide and the
+        // group would (correctly) stay expanded across the cycle.
+        app.tasks = vec![task(1, " ", 1, "sub/a.md")];
+        app.expanded.insert("sub/a.md".to_string());
         app.rebuild();
-        assert!(app.expanded.contains("a.md"));
+        assert!(app.expanded.contains("sub/a.md"));
 
-        app.cycle_group_by(); // Note → Tag
-        // expanded set still has the old key, but it doesn't match "(untagged)"
-        assert!(app.expanded.contains("a.md"));
+        app.cycle_group_by(); // FolderNote → Note
+        // expanded set still has the old full-path key, but it doesn't match the
+        // filename-only key "a.md", so the new group starts collapsed.
+        assert!(app.expanded.contains("sub/a.md"));
         assert!(matches!(app.rows[0], DisplayRow::Header { collapsed, .. } if collapsed));
     }
 
@@ -5502,11 +5547,57 @@ mod tests {
         assert!(app.expanded.is_empty());
     }
 
-    /// Default `App` starts with `GroupBy::Note`.
+    /// Default `App` starts with `GroupBy::FolderNote`.
     #[test]
-    fn app_default_group_by_is_note() {
+    fn app_default_group_by_is_folder_note() {
         let app = App::new();
-        assert_eq!(app.group_by, GroupBy::Note);
+        assert_eq!(app.group_by, GroupBy::FolderNote);
+    }
+
+    /// `filename_of` strips directories; root notes return themselves.
+    #[test]
+    fn filename_of_strips_directories() {
+        assert_eq!(filename_of("Projects/Work/standup.md"), "standup.md");
+        assert_eq!(filename_of("inbox.md"), "inbox.md");
+    }
+
+    /// The `Note` axis keys on the filename alone, so identically-named notes in
+    /// different folders collapse into a single group (vs `FolderNote`, which
+    /// keys on the full path and keeps them separate).
+    #[test]
+    fn note_axis_merges_same_filename_across_folders() {
+        let tasks = vec![
+            task(1, " ", 1, "Work/standup.md"),
+            task(2, " ", 1, "Personal/standup.md"),
+        ];
+        // FolderNote: two distinct full-path groups.
+        let fk1 = group_keys(&tasks[0], GroupBy::FolderNote);
+        let fk2 = group_keys(&tasks[1], GroupBy::FolderNote);
+        assert_ne!(fk1, fk2);
+        // Note: both collapse to the same "standup.md" key.
+        assert_eq!(group_keys(&tasks[0], GroupBy::Note), vec!["standup.md"]);
+        assert_eq!(group_keys(&tasks[1], GroupBy::Note), vec!["standup.md"]);
+
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &HashSet::new(),
+            false,
+            "",
+            "",
+            "",
+            false,
+            GroupBy::Note,
+        );
+        // Exactly one header (the merged "standup.md" group), counting both tasks.
+        let headers: Vec<_> = rows
+            .iter()
+            .filter(|r| matches!(r, DisplayRow::Header { .. }))
+            .collect();
+        assert_eq!(headers.len(), 1);
+        let (key, _open, total, _collapsed) = header(headers[0]);
+        assert_eq!(key, "standup.md");
+        assert_eq!(total, 2);
     }
 
     /// Header counts are accurate under the Tag axis when a task fans out
@@ -5588,7 +5679,7 @@ mod tests {
             "",
             "",
             false,
-            GroupBy::Note,
+            GroupBy::FolderNote,
         );
         assert_eq!(rows.len(), 4, "header + three tasks");
         let indents: Vec<usize> = rows

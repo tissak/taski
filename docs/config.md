@@ -89,6 +89,7 @@ context_target = "yellow"      # context-pane target-line highlight
 scheduled      = "cyan"        # ⏳ <date> suffix
 path_prefix    = "dark_gray"   # dir prefix in note-group headers (filename pops)
 background     = "default"      # window bg; "default" = terminal's own background
+bold           = false          # global bold emphasis (off = crisper text)
 
 # ── UI: per-panel layout (all optional) ────────────────────────────────
 [ui]
@@ -178,14 +179,29 @@ independent of your terminal theme — useful when you want the app to look like
 specific theme (e.g. Nord on `#2e3440`) regardless of the terminal's own colors.
 The fill covers everything: blank rows, gaps, and the help overlay.
 
+### Bold emphasis
+
+`bold` is a single global toggle (not a color) for every emphasised surface in
+the TUI — title-bar labels, group-header markers and names, the "today"
+indicator, scheduled-today dates, the failure-notice icon, the context-pane
+title and target line, and help-popup headers. It defaults to **`false`**
+because bold glyphs render fuzzy on some terminals and fonts, and Taski already
+encodes emphasis through color. Set `bold = true` to bring bold back everywhere.
+
+This is the one option whose default deliberately differs from Taski's original
+hardcoded rendering (which was bold); every color role still defaults to the
+classic palette.
+
 ### Note-header filename emphasis
 
 Under the **Note** grouping axis a group header is a note path, e.g.
 `Projects/Work/standup.md`. Taski dims the directory prefix (`Projects/Work/`)
-with `path_prefix` and keeps the filename (`standup.md`) bold and bright, so the
-filename is easy to spot while scanning. This applies to Note grouping only —
-Tag / Priority / Folder headers render whole, and root-level notes (no `/`) have
-no prefix. To restore the old undimmed look set `path_prefix = "default"`.
+with `path_prefix` and leaves the filename (`standup.md`) at the default
+foreground, so it stands out by color contrast while scanning. This applies to
+Note grouping only — Tag / Priority / Folder headers render whole, and
+root-level notes (no `/`) have no prefix. To restore the old undimmed look set
+`path_prefix = "default"`; the filename is also bold if you enable the global
+`bold` toggle above.
 
 ### Tips for building a palette
 

@@ -12,7 +12,7 @@
 //! happen through a separate config-layer type in `taski-config` and be mapped to this
 //! type at the `run_inner` boundary.
 
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier};
 use taski_config::{ThemeConfig, UiConfig};
 
 /// 12 semantic colour roles that cover every render call site in the TUI.
@@ -61,6 +61,13 @@ pub struct Theme {
     /// so the default theme stays byte-identical. Set it to any named/hex color
     /// to make Taski fill its whole surface, independent of the terminal theme.
     pub background: Color,
+    /// Global bold toggle for every emphasised surface in the TUI. Bold glyphs
+    /// render fuzzy on some terminals/fonts, so this defaults to `false` (off)
+    /// — the only field whose default diverges from the pre-theming rendering,
+    /// by deliberate choice: colour contrast already carries the emphasis. Set
+    /// `bold = true` in `[theme]` to restore bold everywhere. Read it through
+    /// [`Theme::bold_modifier`] at render sites, never the field directly.
+    pub bold: bool,
 }
 
 impl Default for Theme {
@@ -80,11 +87,26 @@ impl Default for Theme {
             // Reset = the terminal's own background. `draw` skips the bg paint
             // entirely while this is Reset, so default rendering is unchanged.
             background: Color::Reset,
+            // Off by default: bold renders fuzzy on some fonts and colour
+            // contrast already carries emphasis. Opt back in with bold = true.
+            bold: false,
         }
     }
 }
 
 impl Theme {
+    /// The bold modifier to apply at emphasis sites: `Modifier::BOLD` when the
+    /// global `bold` toggle is on, otherwise `Modifier::empty()` (a no-op when
+    /// passed to `Style::add_modifier`). Every render site routes its bold
+    /// through this so the toggle is honoured in exactly one place.
+    pub fn bold_modifier(&self) -> Modifier {
+        if self.bold {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        }
+    }
+
     /// Resolve a `Theme` from an optional user config section.
     ///
     /// Every field in `cfg` that is `Some(valid_color)` overrides the compiled
@@ -124,6 +146,7 @@ impl Theme {
             scheduled: role(&cfg.scheduled, defaults.scheduled),
             path_prefix: role(&cfg.path_prefix, defaults.path_prefix),
             background: role(&cfg.background, defaults.background),
+            bold: cfg.bold.unwrap_or(defaults.bold),
         }
     }
 }
@@ -288,6 +311,31 @@ mod tests {
         // background defaults to Reset = "terminal's own background"; `draw`
         // paints nothing while it's Reset, keeping default rendering unchanged.
         assert_eq!(t.background, Color::Reset);
+        // bold is off by default (deliberate divergence from pre-theming): bold
+        // glyphs render fuzzy on some fonts, so colour contrast carries emphasis.
+        assert!(!t.bold);
+        assert_eq!(t.bold_modifier(), Modifier::empty());
+    }
+
+    /// The global `bold` toggle resolves from config and drives `bold_modifier`.
+    #[test]
+    fn resolve_from_bold_toggle() {
+        // Default / absent → off.
+        assert!(!Theme::resolve_from(None).bold);
+        // Explicit true → on, and bold_modifier reflects it.
+        let on = Theme::resolve_from(Some(&ThemeConfig {
+            bold: Some(true),
+            ..ThemeConfig::default()
+        }));
+        assert!(on.bold);
+        assert_eq!(on.bold_modifier(), Modifier::BOLD);
+        // Explicit false → off.
+        let off = Theme::resolve_from(Some(&ThemeConfig {
+            bold: Some(false),
+            ..ThemeConfig::default()
+        }));
+        assert!(!off.bold);
+        assert_eq!(off.bold_modifier(), Modifier::empty());
     }
 
     /// The default layout prefs must match the current hardcoded behaviour.

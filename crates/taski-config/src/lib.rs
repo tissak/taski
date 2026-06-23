@@ -51,9 +51,15 @@ pub struct ThemeConfig {
     pub muted: Option<String>,
     pub context_target: Option<String>,
     pub scheduled: Option<String>,
-    /// Directory-prefix color in Note-group headers (ADR-0018). The filename
-    /// stays bold/default; the leading path is dimmed so the filename pops.
+    /// Directory-prefix color in Note-group headers (ADR-0018). The leading
+    /// path is dimmed (with `path_prefix`) so the filename pops.
     pub path_prefix: Option<String>,
+    /// Global bold toggle for the whole TUI. Bold glyphs render fuzzy on some
+    /// terminals/fonts, so Taski leaves bold **off** by default and leans on
+    /// color contrast for emphasis instead. Absent = the compiled default
+    /// (`false` — off). Set `bold = true` to restore bold on every emphasised
+    /// surface (title labels, group headers, "today", help headers, etc.).
+    pub bold: Option<bool>,
     /// Window background color (ADR-0018 follow-on). Absent / `"default"` means
     /// "use the terminal's background" (Taski paints nothing) — preserving the
     /// byte-identical default. Set it (named or hex) to make Taski own its

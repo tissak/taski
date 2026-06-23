@@ -26,7 +26,7 @@ The real levers, which Taski now exposes:
 | Lever | What it does | Taski knob |
 |---|---|---|
 | **Space allocation** | Give a pane more cells (rows/columns). A "larger list" really means more columns for the list. | `ui.list_pane_percent` |
-| **Style emphasis** | `bold` reads as heavier; `dim` as lighter. The closest thing to font-weight. | (already applied: BOLD for headers, DIM for footer) |
+| **Style emphasis** | `bold` reads as heavier; `dim` as lighter. The closest thing to font-weight. | `theme.bold` (global, **off** by default — bold renders fuzzy on some fonts; DIM footer is always on) |
 | **Wrapping** | Narrow pane = wrapped dense lines; wide pane = one line per task. | `ui.context_wrap` |
 | **Padding / spacing** | Blank lines between groups simulate line-height. | `ui.list_density` |
 | **Color hierarchy** | Bright fg = prominent; dim fg = recessed. | `[theme]` section |
@@ -87,8 +87,9 @@ untouched, so one full-screen fill underneath shows through everywhere.
 
 Under the **Note** grouping axis, each group header is a note path like
 `Projects/Work/standup.md`. Taski dims the directory prefix (`Projects/Work/`)
-using `path_prefix` and keeps the filename (`standup.md`) bold + default-fg, so
-the filename is easy to spot when scanning a long list. This applies only to
+using `path_prefix` and leaves the filename (`standup.md`) at the default fg, so
+it stands out by color contrast when scanning a long list (bold is off by
+default; enable `theme.bold` to bold it too). This applies only to
 Note grouping — Tag / Priority / Folder headers render whole. Root-level notes
 (no `/`) have no prefix. Set `path_prefix = "default"` to restore the old
 undimmed look.
