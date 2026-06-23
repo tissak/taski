@@ -7,6 +7,7 @@ section) and restart Taski.
 | Theme | Kind |
 |---|---|
 | [opencode](./opencode.md) | dark (+ light variant), truecolor |
+| [Catppuccin](./catppuccin.md) | dark (Mocha) + light (Latte), truecolor |
 | [Tokyo Night](./tokyo-night.md) | dark, truecolor |
 | [Nord](./nord.md) | dark, truecolor |
 | [Gruvbox Dark](./gruvbox-dark.md) | dark, truecolor |
