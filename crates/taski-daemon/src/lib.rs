@@ -620,6 +620,11 @@ pub fn process_pending_actions(conn: &Connection, vault_root: &Path) -> Result<(
                 // `Applied`, same as every other action type.
                 "quick_add" => process_quick_add(vault_root, action),
                 "quick_add_undo" => process_quick_add_undo(vault_root, action),
+                // ADR-0019: task notes — append a free-text note under the task's
+                // `### notes-<id>` heading and (on the first note) insert an
+                // aliased in-page link into the task line. Two spans, one atomic
+                // write; needs `conn` to resolve the task row + cached note hash.
+                "add_note" => process_add_note(conn, vault_root, action),
                 // Unknown action_type: refuse with a distinct, accurate message.
                 // (NOT the checkbox `new_char` phrasing — there is no `new_char`
                 // here; this is an unrecognized write gesture.)
@@ -1285,6 +1290,187 @@ pub fn process_quick_add_undo_at(
         }
         WriteResult::Conflict => Ok(ApplyOutcome::ConflictNoteChanged),
     }
+}
+
+/// Execute one pending `add_note` action (ADR-0019): append a free-text note as a
+/// bullet under the task's `### notes-<id>` heading inside a single `## task-notes`
+/// section in the note the task lives in, and — on the *first* note for that task —
+/// insert one aliased in-page wikilink (`[[#notes-<id>|Notes]]`) into the task line.
+/// Both spans commit in **one** `atomic_write` under the ADR-0004 TOCTOU guard.
+///
+/// Identity is gated by the cached note hash (ADR-0006): an equal whole-file hash
+/// means the task line at the row's current `line_number` is byte-identical to what
+/// was indexed, so no per-line `expected_char` is needed (ADR-0019 §"Why no per-line
+/// `expected_char`"). The daemon — never the TUI — decides first-vs-append (by
+/// inspecting the task line for an existing notes link) and mints the `<id>`.
+///
+/// Not replay-idempotent on the bullet append (a crash between write and resolve can
+/// duplicate a note) — a bounded, documented risk matching `process_quick_add`.
+pub fn process_add_note(
+    conn: &Connection,
+    vault_root: &Path,
+    action: &PendingAction,
+) -> Result<ApplyOutcome> {
+    let text = action.payload.as_deref().unwrap_or("");
+
+    // 1. Current task row (a *claim*, re-verified below). Same id→location fallback
+    //    the other processors use: a prior write may have re-surrogated the id.
+    let row = match lookup_task_for_action(conn, action.task_id)? {
+        Some(row) => row,
+        None => match lookup_task_by_location(conn, &action.note_path, action.line_number)? {
+            Some(row) => row,
+            None => return Ok(ApplyOutcome::TaskNotFound),
+        },
+    };
+
+    // 2. Read the note fresh.
+    let note_abs = vault_root.join(&row.note_path);
+    let bytes = match fs::read(&note_abs) {
+        Ok(b) => b,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(ApplyOutcome::TaskNotFound),
+        Err(e) => return Err(e).with_context(|| format!("reading note {:?}", note_abs)),
+    };
+
+    // 3. Authoritative conflict check via the cached note hash (ADR-0006 + ADR-0004).
+    let snapshot_hash = content_hash(&bytes);
+    if Some(&snapshot_hash) != row.note_hash.as_ref() {
+        return Ok(ApplyOutcome::ConflictNoteChanged);
+    }
+
+    // 4. Resolve the task's CURRENT line; confirm it is still a checkbox line.
+    let Some(line_range) = line_byte_range(&bytes, row.line_number) else {
+        return Ok(ApplyOutcome::TaskLineMismatch);
+    };
+    if find_checkbox_char_any(&bytes, line_range.clone()).is_none() {
+        return Ok(ApplyOutcome::TaskLineMismatch);
+    }
+    // CR-trim so the link is inserted into the line content, not between CR and LF
+    // (the CRLF hazard handled identically in `process_metadata_action`).
+    let content_end = if line_range.end > line_range.start && bytes[line_range.end - 1] == b'\r' {
+        line_range.end - 1
+    } else {
+        line_range.end
+    };
+
+    // 5. Decode the whole note (Obsidian notes are UTF-8). Byte offsets from `bytes`
+    //    index the `String` identically.
+    let content = match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => return Ok(ApplyOutcome::TaskLineMismatch),
+    };
+    let line_str = &content[line_range.start..content_end];
+    let bullet = taski_core::note_bullet_for(text);
+
+    // 6. First-vs-append, decided from the task line itself (the daemon owns this).
+    let new_content = match taski_core::notes_link_id(line_str) {
+        // Append: the task already links to `### notes-<id>`. Add the bullet at the
+        // end of that heading's block. If the heading was deleted, recreate at EOF.
+        Some(id) => match notes_block_insert_offset(&content, &id) {
+            Some(at) => insert_bullet_at(&content, at, &bullet),
+            None => append_new_note_block(&content, &id, &bullet),
+        },
+        // First note: mint an id, insert the aliased link into the task line, then
+        // append the `### notes-<id>` block (and `## task-notes` section if absent).
+        None => {
+            let id = generate_note_id(&content);
+            let new_line = taski_core::insert_notes_link(line_str, &id);
+            let edited = format!(
+                "{}{}{}",
+                &content[..line_range.start],
+                new_line,
+                &content[content_end..]
+            );
+            append_new_note_block(&edited, &id, &bullet)
+        }
+    };
+
+    // 7. One atomic write (both spans), full ADR-0004 TOCTOU guard.
+    match atomic_write(&note_abs, new_content.as_bytes(), &snapshot_hash)? {
+        WriteResult::Written => {
+            tracing::info!(note = %row.note_path, "task note appended");
+            Ok(ApplyOutcome::Applied)
+        }
+        WriteResult::Conflict => Ok(ApplyOutcome::ConflictNoteChanged),
+    }
+}
+
+/// The literal `## task-notes` section heading (ADR-0019). Hardcoded for v1; a
+/// config knob is a documented fast-follow.
+const TASK_NOTES_HEADING: &str = "## task-notes";
+
+/// True iff `content` already opens a `## task-notes` section (a line whose
+/// trimmed content equals the heading). Avoids emitting a second section when
+/// another task in the same note already opened one.
+fn has_task_notes_section(content: &str) -> bool {
+    content.lines().any(|l| l.trim_end() == TASK_NOTES_HEADING)
+}
+
+/// Mint an `<id>` unique within `content` for a new `### notes-<id>` heading
+/// (ADR-0019): write-time Unix-epoch milliseconds, bumped on the (astronomically
+/// unlikely) chance the heading already exists, so the in-page link always
+/// resolves to exactly one heading.
+fn generate_note_id(content: &str) -> String {
+    let mut id = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    while content.contains(&format!("### notes-{id}")) {
+        id += 1;
+    }
+    id.to_string()
+}
+
+/// Byte offset at which to insert a new bullet at the END of the `### notes-<id>`
+/// heading's block — the start of the next Markdown heading after it, or EOF.
+/// `None` if the heading is absent (user deleted it). Deliberately simple per
+/// ADR-0019: no level-aware nesting — the block ends at the first later line that
+/// begins with `#`.
+fn notes_block_insert_offset(content: &str, id: &str) -> Option<usize> {
+    let target = format!("### notes-{id}");
+    let mut offset = 0usize;
+    let mut found = false;
+    for line in content.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if found && trimmed.starts_with('#') {
+            return Some(offset); // start of the next heading — insert just before it
+        }
+        if trimmed == target {
+            found = true;
+        }
+        offset += line.len();
+    }
+    // Heading found but no following heading → the block runs to EOF.
+    found.then_some(content.len())
+}
+
+/// Insert `bullet` as its own line at byte offset `at` (a line boundary or EOF),
+/// keeping the file line-delimited. A newline is interposed if `at` is not already
+/// at a line start (the EOF-without-trailing-newline case).
+fn insert_bullet_at(content: &str, at: usize, bullet: &str) -> String {
+    let mut out = String::with_capacity(content.len() + bullet.len() + 2);
+    out.push_str(&content[..at]);
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(bullet);
+    out.push('\n');
+    out.push_str(&content[at..]);
+    out
+}
+
+/// Append a fresh `### notes-<id>` block at EOF — with the `## task-notes` section
+/// header too, if the note doesn't already have one — carrying `bullet` as its
+/// first note.
+fn append_new_note_block(content: &str, id: &str, bullet: &str) -> String {
+    let mut out = content.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if !has_task_notes_section(&out) {
+        out.push_str(&format!("\n{TASK_NOTES_HEADING}\n"));
+    }
+    out.push_str(&format!("\n### notes-{id}\n{bullet}\n"));
+    out
 }
 
 /// First-creation helper for ADR-0014: write a brand-new file via temp → fsync →

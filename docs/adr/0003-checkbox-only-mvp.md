@@ -1,6 +1,6 @@
 # ADR-0003: MVP write-back is checkbox-state flips only
 
-- **Status:** Accepted (amended 2026-06-20 by [ADR-0009](./0009-scheduled-date-today.md), 2026-06-21 by [ADR-0012](./0012-done-date-on-toggle.md), 2026-06-21 by [ADR-0013](./0013-cancelled-date-on-cancel.md), 2026-06-21 by [ADR-0014](./0014-quick-add-inbox-creation.md))
+- **Status:** Accepted (amended 2026-06-20 by [ADR-0009](./0009-scheduled-date-today.md), 2026-06-21 by [ADR-0012](./0012-done-date-on-toggle.md), 2026-06-21 by [ADR-0013](./0013-cancelled-date-on-cancel.md), 2026-06-21 by [ADR-0014](./0014-quick-add-inbox-creation.md), 2026-06-23 by [ADR-0019](./0019-task-notes-annotation.md))
 - **Date:** 2026-06-20
 - **Decides:** PRD §10.2 — MVP write-back scope
 
@@ -146,5 +146,33 @@ contentually known).
 See ADR-0014 for the full design, the new gate's boundary, the first-creation path rationale,
 the undo semantics, and the alternatives.
 
+## Amendment — ADR-0019 (2026-06-23): write-back scope widened to bounded task annotation
+
+[ADR-0019](./0019-task-notes-annotation.md) ("task notes") introduces the first **annotation**
+feature — the `n` key opens a single-line text-entry modal that appends a free-text note as a
+bullet under a per-task `### notes-<id>` heading inside a single `## task-notes` section **in the
+note the task already lives in**, and on the first note for that task inserts one aliased in-page
+wikilink (`[[#notes-<id>|Notes]]`) into the task line. Unlike ADR-0014 (which opened the
+append-only *creation* gate, scoped to a designated inbox and rejecting both arbitrary-note append
+and existing-line text edits), this amendment opens a **second, parallel gate class** — bounded
+task annotation — and deliberately crosses those two ADR-0014 exclusions under a narrower
+justification (the target note is deterministic, not arbitrary; the line edit is a single bounded
+idempotent link insertion, not free editing):
+
+> The write-back scope is widened to also include **bounded task annotation** (`add_note`
+> action): at the user's explicit request on an existing task, Taski may append a free-text note
+> as a bullet under a per-task `### notes-<id>` heading inside a single `## task-notes` section in
+> the note the task lives in, and on the first such note insert one aliased in-page wikilink
+> (`[[#notes-<id>|Notes]]`) into the task line before its Tasks metadata. The ADR-0009
+> grammar-provability gate and the ADR-0014 creation gate are **unchanged**. The new gate permits
+> append-only note content plus a single bounded, idempotent link insertion, composed into one
+> `atomic_write` under ADR-0004, gated by the ADR-0006 cached note hash. Editing other lines,
+> mid-note insertion outside these rules, deletion, and reordering remain rejected.
+
+This amendment does **not** add a schema change (the existing `pending_actions` columns carry
+sentinel values for unused fields, per ADR-0014) and does **not** amend ADR-0004/0005/0006. No undo
+in v1 (the user removes a note in Obsidian). See ADR-0019 for the full design, the new gate's
+boundary, the heading/link scheme, the hash-gated identity argument, and the alternatives.
+
 ## References
-- [`docs/tech.md`](../tech.md), [ADR-0002](./0002-write-back-through-daemon.md), [ADR-0004](./0004-refuse-on-conflict.md), [ADR-0009](./0009-scheduled-date-today.md) *(amendment)*, [ADR-0012](./0012-done-date-on-toggle.md) *(amendment)*, [ADR-0013](./0013-cancelled-date-on-cancel.md) *(amendment)*, [ADR-0014](./0014-quick-add-inbox-creation.md) *(amendment)*
+- [`docs/tech.md`](../tech.md), [ADR-0002](./0002-write-back-through-daemon.md), [ADR-0004](./0004-refuse-on-conflict.md), [ADR-0009](./0009-scheduled-date-today.md) *(amendment)*, [ADR-0012](./0012-done-date-on-toggle.md) *(amendment)*, [ADR-0013](./0013-cancelled-date-on-cancel.md) *(amendment)*, [ADR-0014](./0014-quick-add-inbox-creation.md) *(amendment)*, [ADR-0019](./0019-task-notes-annotation.md) *(amendment)*

@@ -603,6 +603,31 @@ pub fn enqueue_quick_add_undo(
     Ok(conn.last_insert_rowid())
 }
 
+/// ADR-0019: enqueue an "add task note" request — append a free-text note under
+/// the task's `### notes-<id>` heading inside a `## task-notes` section in the
+/// note the task lives in, and (on the first note) insert one aliased in-page
+/// wikilink into the task line. The daemon owns the first-vs-append decision and
+/// `<id>` assignment; the TUI supplies only the task's identity and the typed
+/// text. `expected_char`/`new_char` are unused (stored empty); the daemon
+/// dispatches on `action_type='add_note'` and verifies via the cached note hash.
+/// The note text travels in `payload`. Returns the new row id.
+pub fn enqueue_add_note(
+    conn: &Connection,
+    task_id: i64,
+    note_path: &str,
+    line_number: usize,
+    text: &str,
+) -> rusqlite::Result<i64> {
+    conn.execute(
+        "INSERT INTO pending_actions
+            (task_id, note_path, line_number, expected_char, new_char, state,
+             created_at, action_type, payload)
+         VALUES (?1, ?2, ?3, '', '', 'pending', ?4, 'add_note', ?5)",
+        rusqlite::params![task_id, note_path, line_number as i64, unix_now(), text],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
 /// All actions still awaiting processing, oldest first.
 pub fn pending_actions(conn: &Connection) -> rusqlite::Result<Vec<PendingAction>> {
     let mut stmt = conn.prepare(

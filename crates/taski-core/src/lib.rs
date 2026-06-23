@@ -607,6 +607,115 @@ pub fn inbox_line_for(text: &str, today: &str) -> String {
     format!("- [ ] {clean} {CREATED_EMOJI} {today}")
 }
 
+/// The leading emoji of every Obsidian Tasks metadata token Taski recognizes —
+/// the four written date stamps, the read-path date emojis, the recurrence
+/// marker, and the five priority glyphs. Used by [`insert_notes_link`] as the
+/// boundary: description text (the notes link) must land **before** any trailing
+/// metadata, since the Tasks plugin parses metadata from the end of the line.
+const METADATA_EMOJIS: &[char] = &[
+    SCHEDULED_EMOJI, // ⏳
+    DONE_EMOJI,      // ✅
+    CANCELLED_EMOJI, // ❌
+    CREATED_EMOJI,   // ➕
+    '📅',
+    '📆',
+    '🗓',
+    '🛫',
+    '🔁',
+    '🔺',
+    '⏫',
+    '🔼',
+    '🔽',
+    '⏬',
+];
+
+/// Byte offset within `body` of the first Tasks metadata emoji (see
+/// [`METADATA_EMOJIS`]), or `None` if the body carries no metadata. The link is
+/// inserted *before* this offset so it stays in the description.
+fn first_metadata_offset(body: &str) -> Option<usize> {
+    body.char_indices()
+        .find(|&(_, c)| METADATA_EMOJIS.contains(&c))
+        .map(|(i, _)| i)
+}
+
+/// ADR-0019: the pure line-rewrite that inserts a single aliased in-page wikilink
+/// `[[#notes-<id>|Notes]]` into a task line's description, immediately before the
+/// first Tasks-plugin metadata token (or at end-of-line if the line carries no
+/// metadata). The link is description text, so it must precede `⏳`/`📅`/`✅`/…
+/// to keep the plugin's right-to-left metadata parse intact.
+///
+/// **Idempotent:** if the line already contains a `[[#notes-<id>|` link for this
+/// `id`, the line is returned unchanged (the replay/double-press guard). If the
+/// line does not parse as a checkbox task (defensive — the daemon already
+/// verified it), it is also returned unchanged.
+///
+/// Every byte outside the inserted span is preserved verbatim; exactly one ASCII
+/// space is guaranteed on each side of the inserted link. Pure (no I/O) so it is
+/// proptested in isolation.
+pub fn insert_notes_link(line: &str, id: &str) -> String {
+    // Idempotent: never insert a second link for this id.
+    if line.contains(&format!("[[#notes-{id}|")) {
+        return line.to_string();
+    }
+    let link = format!("[[#notes-{id}|Notes]]");
+    let Some((_, body)) = task_captures(line) else {
+        // Not a checkbox task line — defensive no-op (daemon verifies upstream).
+        return line.to_string();
+    };
+    // `body` is a suffix slice of `line`, so its start offset is exact.
+    let body_start = line.len() - body.len();
+    match first_metadata_offset(body) {
+        Some(off) => {
+            let at = body_start + off;
+            let left = &line[..at];
+            // Valid lines already have whitespace before the metadata emoji; the
+            // separator guard covers the rare malformed line with none.
+            let sep = if left.ends_with(|c: char| c.is_whitespace()) {
+                ""
+            } else {
+                " "
+            };
+            format!("{left}{sep}{link} {}", &line[at..])
+        }
+        // No metadata: append at end of line, after trimming trailing whitespace.
+        None => format!("{} {link}", line.trim_end()),
+    }
+}
+
+/// ADR-0019: extract the `<id>` from a task line's `[[#notes-<id>|…]]` link, or
+/// `None` if the line carries no such link. The daemon uses this to decide
+/// first-note (insert link + create heading) vs append-note (text under the
+/// existing `### notes-<id>` heading), and to locate that heading. The `<id>` is
+/// the run of bytes between `[[#notes-` and the first `|` (aliased) or `]`.
+pub fn notes_link_id(line: &str) -> Option<String> {
+    let start = line.find("[[#notes-")? + "[[#notes-".len();
+    let rest = &line[start..];
+    let end = rest.find(['|', ']'])?;
+    let id = &rest[..end];
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// ADR-0019: the pure construction oracle for a task-note bullet. Given the
+/// user-typed `text`, produce a single Markdown list item `- <text>` to append
+/// under a `### notes-<id>` heading. Strips embedded newlines (the note modal is
+/// single-line) and trims surrounding whitespace.
+///
+/// **Phantom-task guard:** if `- <text>` would itself parse as a checkbox task
+/// (e.g. `text == "[ ] buy milk"` → `- [ ] buy milk`), the first `[` is escaped
+/// (`- \[ ] buy milk`) so the indexer can never mistake a note for a task. A
+/// backslash before the `[` defeats [`task_captures`] (which requires a literal
+/// `[` opener) while Obsidian renders the bracket literally. Pure (no I/O).
+pub fn note_bullet_for(text: &str) -> String {
+    let clean: String = text.chars().filter(|&c| c != '\n' && c != '\r').collect();
+    let mut bullet = format!("- {}", clean.trim());
+    if task_captures(&bullet).is_some()
+        && let Some(pos) = bullet.find('[')
+    {
+        bullet.insert(pos, '\\');
+    }
+    bullet
+}
+
 /// Shared core behind [`rewrite_scheduled`] (ADR-0009) and [`rewrite_done_date`]
 /// (ADR-0012). The two emojis share the identical insertion grammar (emoji +
 /// optional VS16 + whitespace + strict `YYYY-MM-DD`, scanned right-to-left by
@@ -2181,5 +2290,72 @@ plain text
         // Just `---` with nothing else: no closing fence and no key → false.
         assert!(!taski_skip_enabled("---"));
         assert!(!taski_skip_enabled("---\n"));
+    }
+
+    // --- ADR-0019: task-note oracles ---------------------------------------
+
+    #[test]
+    fn insert_notes_link_before_metadata() {
+        // The link lands in the description, before the ⏳ token, one space each side.
+        assert_eq!(
+            insert_notes_link("- [ ] Redesign page ⏳ 2026-06-25", "1234"),
+            "- [ ] Redesign page [[#notes-1234|Notes]] ⏳ 2026-06-25"
+        );
+    }
+
+    #[test]
+    fn insert_notes_link_no_metadata_appends_at_end() {
+        assert_eq!(
+            insert_notes_link("- [ ] Plain task", "1234"),
+            "- [ ] Plain task [[#notes-1234|Notes]]"
+        );
+        // Trailing whitespace is trimmed before the appended link.
+        assert_eq!(
+            insert_notes_link("- [ ] Plain task   ", "9"),
+            "- [ ] Plain task [[#notes-9|Notes]]"
+        );
+    }
+
+    #[test]
+    fn insert_notes_link_is_idempotent_for_same_id() {
+        let once = insert_notes_link("- [ ] Task 📅 2026-01-01", "77");
+        assert_eq!(insert_notes_link(&once, "77"), once);
+    }
+
+    #[test]
+    fn insert_notes_link_before_priority_emoji() {
+        assert_eq!(
+            insert_notes_link("- [ ] Task 🔼", "5"),
+            "- [ ] Task [[#notes-5|Notes]] 🔼"
+        );
+    }
+
+    #[test]
+    fn insert_notes_link_noop_on_non_task() {
+        assert_eq!(insert_notes_link("not a task", "1"), "not a task");
+    }
+
+    #[test]
+    fn notes_link_id_roundtrip() {
+        let line = insert_notes_link("- [ ] Task ⏳ 2026-06-25", "1719153000123");
+        assert_eq!(notes_link_id(&line), Some("1719153000123".to_string()));
+        assert_eq!(notes_link_id("- [ ] no link here"), None);
+    }
+
+    #[test]
+    fn note_bullet_for_basic() {
+        assert_eq!(note_bullet_for("  went with hero  "), "- went with hero");
+        assert_eq!(note_bullet_for("a\nb"), "- ab"); // newlines stripped (single-line)
+    }
+
+    #[test]
+    fn note_bullet_for_escapes_phantom_checkbox() {
+        // A note whose text forms a checkbox must NOT parse as a task.
+        let bullet = note_bullet_for("[ ] buy milk");
+        assert_eq!(bullet, "- \\[ ] buy milk");
+        assert!(task_captures(&bullet).is_none());
+        // A plain note is never escaped and is never a task.
+        let plain = note_bullet_for("just a thought");
+        assert!(task_captures(&plain).is_none());
     }
 }

@@ -679,6 +679,13 @@ struct App {
     quick_adding: bool,
     /// ADR-0014: the text typed so far in the quick-add modal.
     quick_add_query: String,
+    /// ADR-0019: when true, the add-note text-entry modal is active (the `n`
+    /// key). Keystrokes accumulate in `note_query`. Mirrors `quick_adding`, but
+    /// the action targets the selected task (append a note + add an in-page link)
+    /// rather than creating a new inbox task.
+    adding_note: bool,
+    /// ADR-0019: the note text typed so far in the add-note modal.
+    note_query: String,
     /// ADR-0014: the resolved inbox path (vault-relative), threaded from
     /// `run_inner` via `taski_config::resolve_inbox_path`. Defaults to
     /// `"task-inbox.md"` for tests that construct `App::new()` directly.
@@ -759,6 +766,8 @@ impl App {
             overdue_only: false,
             quick_adding: false,
             quick_add_query: String::new(),
+            adding_note: false,
+            note_query: String::new(),
             inbox_path: "task-inbox.md".to_string(),
             vault_name: None,
             use_advanced_uri: false,
@@ -920,6 +929,60 @@ impl App {
         }
         self.quick_add_query.clear();
         self.quick_adding = false;
+        self.track_enqueued(result);
+    }
+
+    /// ADR-0019: open the add-note modal for the task under the cursor (the `n`
+    /// key). No-op on a header / empty list — a note must attach to a real task.
+    /// Mirrors `start_quick_add`; suppresses the other modals.
+    fn start_add_note(&mut self) {
+        if self.selected_task().is_none() {
+            return;
+        }
+        self.searching = false;
+        self.file_searching = false;
+        self.quick_adding = false;
+        self.adding_note = true;
+        self.note_query.clear();
+    }
+
+    /// Append a character to the note query.
+    fn push_note_char(&mut self, c: char) {
+        self.note_query.push(c);
+    }
+
+    /// Pop the last character (Backspace).
+    fn pop_note_char(&mut self) {
+        self.note_query.pop();
+    }
+
+    /// Cancel add-note: clear the query, exit the modal.
+    fn clear_add_note(&mut self) {
+        self.adding_note = false;
+        self.note_query.clear();
+    }
+
+    /// `Enter` in the add-note modal: enqueue an `add_note` action (ADR-0019) for
+    /// the selected task with the typed text (trimmed; empty text is a no-op that
+    /// just dismisses the modal). No undo in v1 (no `LastAction` recorded). The
+    /// daemon performs the vault write (note append + first-note link insertion).
+    fn submit_add_note(&mut self, conn: &Connection) {
+        let text = self.note_query.trim();
+        if text.is_empty() {
+            self.clear_add_note();
+            return;
+        }
+        let text = text.to_string();
+        let result = {
+            let Some(task) = self.selected_task() else {
+                self.clear_add_note();
+                return;
+            };
+            db::enqueue_add_note(conn, task.id, &task.note_path, task.line_number, &text)
+                .context("enqueuing add_note")
+        };
+        self.note_query.clear();
+        self.adding_note = false;
         self.track_enqueued(result);
     }
 
@@ -1450,6 +1513,17 @@ fn run_loop(
                 KeyCode::Char(c) => app.push_quick_add_char(c),
                 _ => {}
             }
+        } else if app.adding_note {
+            // ADR-0019: add-note modal (n key). Keystrokes build the note; Enter
+            // enqueues an `add_note` action for the selected task, Esc cancels.
+            // Like quick-add it does NOT call `rebuild()` (no filter to recompute).
+            match key.code {
+                KeyCode::Esc => app.clear_add_note(),
+                KeyCode::Enter => app.submit_add_note(conn),
+                KeyCode::Backspace => app.pop_note_char(),
+                KeyCode::Char(c) => app.push_note_char(c),
+                _ => {}
+            }
         } else if app.show_help {
             // Help overlay is MODAL: it intercepts keys before normal-mode
             // dispatch. `?`/`Esc`/`q` close it and do nothing else — notably
@@ -1531,6 +1605,12 @@ fn run_loop(
                 // prompt — `a` falls through to `push_search_char` in the search
                 // arms above, exactly like `b`/`d`/`t`.
                 KeyCode::Char('a') => app.start_quick_add(),
+                // ADR-0019 task notes: `n` opens the add-note modal for the
+                // selected task. The vault write (note append + first-note link
+                // insertion) is the daemon's job via `enqueue_add_note`; the TUI
+                // never touches files directly. Suppressed during a search prompt —
+                // `n` falls through to `push_search_char` in the search arms above.
+                KeyCode::Char('n') => app.start_add_note(),
                 KeyCode::Tab => app.expand_all(),
                 KeyCode::BackTab => app.collapse_all(),
                 // Uppercase J/K scroll the context pane (lowercase j/k move the task list).
@@ -1785,6 +1865,9 @@ fn render_failure_notice(action: &PendingAction) -> String {
         // Press a to try again", not the done-toggle wording.
         "quick_add" => ("Quick add", "a"),
         "quick_add_undo" => ("Quick-add undo", "u"),
+        // ADR-0019: add-note (n key). A refused note surfaces "Add note not
+        // applied — … Press n to try again".
+        "add_note" => ("Add note", "n"),
         // The default/checkbox path (done-toggle).
         _ => ("Toggle", "Space"),
     };
@@ -2035,6 +2118,23 @@ fn draw(frame: &mut Frame, app: &mut App) {
             ),
             Span::styled(
                 app.quick_add_query.clone(),
+                Style::default().fg(app.theme.success),
+            ),
+            Span::styled(cursor, Style::default().add_modifier(Modifier::SLOW_BLINK)),
+        ]))
+        .style(Style::new())
+    } else if app.adding_note {
+        // ADR-0019: add-note modal prompt. Mirrors the quick-add layout but uses a
+        // "note" label — the write targets the selected task's note, not the inbox.
+        let cursor = if (app.note_query.len() as u16) < footer_area.width.saturating_sub(12) {
+            "█"
+        } else {
+            ""
+        };
+        Paragraph::new(Line::from(vec![
+            Span::styled(" note  ", Style::default().fg(app.theme.accent)),
+            Span::styled(
+                app.note_query.clone(),
                 Style::default().fg(app.theme.success),
             ),
             Span::styled(cursor, Style::default().add_modifier(Modifier::SLOW_BLINK)),
@@ -2451,6 +2551,7 @@ fn help_popup(theme: &theme::Theme) -> Paragraph<'static> {
         row("i", "Mark in-progress / re-open"),
         row("u", "Undo last flip / bullet / quick-add"),
         row("a", "Quick-add to inbox"),
+        row("n", "Add a note to the task (links it)"),
         row("o", "Open in Obsidian"),
         Line::raw(""),
         head("Search"),
