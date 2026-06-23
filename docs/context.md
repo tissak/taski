@@ -1,6 +1,6 @@
 # Taski — Engineering Context & Onboarding
 
-*Onboarding guide for new engineers. Last updated: 2026-06-22 (post-v0.4 — adds Tier 1 metadata parsing [tags, priority, start/created/done/cancelled dates], Tier 2 views [overdue `O`, group-by cycling `G`], the `✅` done-date stamp on toggle [ADR-0012], the `❌` cancelled-date stamp on cancel [ADR-0013], the `➕` quick-add inbox creation [ADR-0014], the `o` open-in-Obsidian deep-link gesture [ADR-0015], the `i` in-progress toggle gesture [ADR-0016], and the `taski-skip` frontmatter opt-out [ADR-0017]; and user-configurable TUI theming + per-panel density knobs [ADR-0018]; 350+ tests across 6 crates).*
+*Onboarding guide for new engineers. Last updated: 2026-06-23 (post-v0.4 — adds Tier 1 metadata parsing [tags, priority, start/created/done/cancelled dates], Tier 2 views [overdue `O`, group-by cycling `G`], the `✅` done-date stamp on toggle [ADR-0012], the `❌` cancelled-date stamp on cancel [ADR-0013], the `➕` quick-add inbox creation [ADR-0014], the `o` open-in-Obsidian deep-link gesture [ADR-0015], the `i` in-progress toggle gesture [ADR-0016], and the `taski-skip` frontmatter opt-out [ADR-0017]; user-configurable TUI theming + per-panel density knobs [ADR-0018], followed by a global `bold` style toggle [off by default — color contrast carries emphasis] and a finer note-grouping split [`folder+note` / `note` / `folder`]; 390 tests across 6 crates).*
 
 This document is the "operating manual" for working on Taski: what it is, how it's
 built, the decisions that are load-bearing (and must not be casually undone), and the
@@ -46,7 +46,7 @@ Cargo workspace, edition 2024, six crates. Dependencies point downward only (no 
 | `taski-config` | TOML config loading (`~/.config/taski/config.toml`) + CLI→config→default precedence + the `template()` renderer for `--init-config`. Fields include `exclude_dirs` for skipping vault subdirectory trees, `inbox_path` for the quick-add target note (ADR-0014), and `obsidian_vault`/`use_advanced_uri` for the open-in-Obsidian deep link (ADR-0015), and `ThemeConfig`/`UiConfig` for TUI theming and per-panel density (ADR-0018). Keeps FS/TOML out of `taski-core`. | `crates/taski-config/src/lib.rs` |
 | `taski-db` | The canonical SQLite schema, `open()` (WAL + schema + dir creation), and all read/write APIs (`all_tasks`, `reconcile_note`, `enqueue_action` / `enqueue_set_scheduled` / `enqueue_bullet_toggle`, `pending_actions`, `prune_old_actions`, `delete_tasks_for_excluded_dirs`, …). Owns `tasks` + `pending_actions` + `note_contents`. | `crates/taski-db/src/lib.rs` |
 | `taski-daemon` | The watcher/scanner + **sole writer to the vault**: the reusable engine `run_daemon(opts, shutdown, lock)`, plus `scan_vault`, `index_note`, `process_action` (checkbox flips) / `process_metadata_action` (`⏳` writes) / `process_bullet_action` (checkbox↔bullet toggle) — all three reuse `atomic_write` (ADR-0009/0011), the watch loop; the `ShutdownSignal`/`ShutdownHandle` pair; and the `flock` single-writer lock (`DaemonLockGuard`/`acquire_daemon_lock`/`LockOutcome`). The drain loop dispatches on `pending_actions.action_type`. Also handles `exclude_dirs` purge + filtered scanning. **lib + bin** — a `taski-daemon` binary *and* the library the unified launcher depends on. | `crates/taski-daemon/src/{lib,main,shutdown,lock}.rs`, `tests/` |
-| `taski-tui` | The `ratatui` client: polls the index, groups by note/tag/priority/folder (`G` cycling), filters (status-cycle `f`, Today view `T`, Overdue `O`, text search `/`, file search `F`), renders, submits toggle (`Space`) / mark-for-today (`t`) / bullet toggle (`b`) / undo (`u`) actions, shows the context pane via the cached `note_contents` table, and opens the selected task's note in Obsidian via an `obsidian://` deep link (`o`, ADR-0015 — the TUI's first `std::process::Command` spawn). Never touches vault files. **lib + bin** — public entry points `run()` / `run_with_db(db)` / `run_combined(db, quit_hook)`; `main.rs` is a thin shim. Key internal modules: `App` (state machine), `build_view` (filter pipeline + HashMap grouping), `draw` (render), `run_loop` (input), `theme.rs` for the `Theme` + `LayoutPrefs` types resolved from config (ADR-0018). | `crates/taski-tui/src/{lib,main}.rs` |
+| `taski-tui` | The `ratatui` client: polls the index, groups by folder+note/note/tag/priority/folder (`G` cycling), filters (status-cycle `f`, Today view `T`, Overdue `O`, text search `/`, file search `F`), renders, submits toggle (`Space`) / mark-for-today (`t`) / bullet toggle (`b`) / undo (`u`) actions, shows the context pane via the cached `note_contents` table, and opens the selected task's note in Obsidian via an `obsidian://` deep link (`o`, ADR-0015 — the TUI's first `std::process::Command` spawn). Never touches vault files. **lib + bin** — public entry points `run()` / `run_with_db(db)` / `run_combined(db, quit_hook)`; `main.rs` is a thin shim. Key internal modules: `App` (state machine), `build_view` (filter pipeline + HashMap grouping), `draw` (render), `run_loop` (input), `theme.rs` for the `Theme` + `LayoutPrefs` types resolved from config (ADR-0018). | `crates/taski-tui/src/{lib,main}.rs` |
 | `taski` | The **unified launcher** binary: runs the daemon (background thread) + TUI (main thread) together by default (`taski`), or either alone via `taski daemon` / `taski tui` subcommands. Attach-or-spawn + single-writer lock (ADRs 0007/0008). | `crates/taski/src/main.rs` |
 
 Supporting: `docs/` (PRD, tech, ADRs, setup, code reviews under `docs/cr/`, this file), `scripts/install-launchd.sh`
@@ -59,7 +59,7 @@ Supporting: `docs/` (PRD, tech, ADRs, setup, code reviews under `docs/cr/`, this
 ```sh
 cargo build --workspace                       # dev build
 cargo build --release --workspace             # optimized daily-driver binaries
-cargo test --workspace                        # all tests (~259, post-v0.4)
+cargo test --workspace                        # all tests (~390, post-v0.4)
 cargo test -p taski-daemon writeback          # run one suite / filter by name
 ```
 
@@ -210,10 +210,12 @@ filter can only reduce the visible set:
 | Text search | `/` | Case-insensitive substring of `task.text` |
 | File search | `F` | Case-insensitive substring of `task.note_path` |
 
-Separately, a **grouping axis** (`G`) reorganizes the list's group buckets: note (default)
-→ tag → priority → folder → note. Tag grouping **fans out** — a task with N tags appears
-under all N tag groups. Groups sort alphabetically (note/tag/folder) or by importance rank
-(priority, so Medium doesn't sort between Low and Lowest). The grouping axis is orthogonal
+Separately, a **grouping axis** (`G`) reorganizes the list's group buckets: folder+note
+(default) → note → tag → priority → folder → folder+note. **folder+note** keys on the full
+note path; **note** keys on the filename alone (same-named notes in different folders merge);
+**folder** keys on the parent directory. Tag grouping **fans out** — a task with N tags appears
+under all N tag groups. Groups sort alphabetically (folder+note/note/tag/folder) or by importance
+rank (priority, so Medium doesn't sort between Low and Lowest). The grouping axis is orthogonal
 to the filters: filters narrow *which* tasks show; grouping controls *how* the survivors
 are bucketed.
 
@@ -237,7 +239,7 @@ fn build_view(
     search_query: &str,          // text search
     file_query: &str,            // file/path search
     overdue_only: bool,          // O — due_date < today
-    group_by: GroupBy,           // G — Note / Tag / Priority / Folder
+    group_by: GroupBy,           // G — FolderNote / Note / Tag / Priority / Folder
 ) -> Vec<DisplayRow>
 ```
 
@@ -259,7 +261,7 @@ filter predicates within each bucket and emits `Header` + `Task` rows.
 | `f` | Cycle status filter: All → Open → Done → All (`Open` shows active/not-done tasks — both `Open` and `InProgress`) |
 | `T` | Toggle Today view (tasks scheduled for today) |
 | `O` | Toggle Overdue view (tasks whose `due_date < today`) |
-| `G` | Cycle grouping axis: note → tag → priority → folder → note |
+| `G` | Cycle grouping axis: folder+note → note → tag → priority → folder → folder+note |
 | `t` | Mark/unmark selected task for today (writes `⏳ <today>`) |
 | `b` | Toggle selected task between checkbox (`- [ ]`) and bullet (`-`) format |
 | `d` | Cancel selected task (`- [ ]` → `- [-]`, stamps `❌ <today>`; press again to un-cancel) [ADR-0013] |
@@ -498,19 +500,23 @@ complement to `exclude_dirs` (#11, directory-level). Notably `exclude_dirs` lack
 the frontmatter grammar is a load-bearing contract future parsing must respect.
 
 18. **Color theming and per-panel density knobs** ([ADR-0018](./adr/0018-theming-and-per-panel-density.md)) —
-    `[theme]` (12 semantic color roles — 11 fg + a `background`) and `[ui]` (list_pane_percent,
-    list_density, context_wrap) sections
+    `[theme]` (12 semantic color roles — 11 fg + a `background` — plus a global `bold` toggle) and
+    `[ui]` (list_pane_percent, list_density, context_wrap) sections
     in `config.toml` drive user-configurable colors and per-panel space allocation. Resolved from
     `ThemeConfig`/`UiConfig` in `taski-config` (no ratatui dep) to `Theme`/`LayoutPrefs` in `taski-tui`
-    once at startup in `run_inner`. Defaults are byte-identical to today's hardcoded palette — except
-    Note-group headers, which dim the directory prefix (`path_prefix` role) so the filename pops.
+    once at startup in `run_inner`. Defaults reproduce today's hardcoded palette, with **two deliberate
+    divergences**: Note-group headers dim the directory prefix (`path_prefix` role) so the filename pops
+    by color contrast, and the global `bold` toggle defaults **off** (bold renders fuzzy on some fonts;
+    every render site routes its bold through `Theme::bold_modifier()`, the one choke point).
     `background` defaults to `Reset` (terminal bg, no paint); set it and `draw` fills the whole surface
     (every span is `.fg`-only, so one base bg block shows through). Bad
     color/percent values fall back per-role with `tracing::warn!` (never garble the alt screen); bad
     `list_density` variant fails at config load before the alt screen. Per-pane font size is impossible
     in terminals (no ECMA-48 escape) — the feature reframes "larger text" as allocation + emphasis +
     wrap + density, exactly matching every comparable TUI. No schema bump, no daemon change, no
-    write-back ADR touched.
+    write-back ADR touched. **Follow-on:** the old single `note` grouping axis was split into
+    `folder+note` (full path, the default), `note` (filename only — same-named notes across folders
+    merge), and the existing `folder` axis, via `group_keys` + the new `filename_of` helper.
 
 ---
 
@@ -519,7 +525,7 @@ the frontmatter grammar is a load-bearing contract future parsing must respect.
 These are the things that aren't obvious from reading the code and will cost you time.
 
 - **Never run tests against the real vault.** The real vault
-  (`/Users/.../Personal-PARA`) is the user's data. All tests use `tempfile` fake vaults
+  (`/Users/.../Personal-Final`, per `~/.config/taski/config.toml`) is the user's data. All tests use `tempfile` fake vaults
   or `:memory:` DBs. If you point a test or a `cargo run` at the real vault, you risk
   mutating real notes. The daemon's `atomic_write` is safe, but **don't rely on that as
   license to test against real data.**
@@ -692,7 +698,7 @@ These are the things that aren't obvious from reading the code and will cost you
 | `taski-daemon/tests/writeback.rs` + `writeback_proptest.rs` + `metadata_writeback_proptest.rs` + `done_date_writeback_proptest.rs` + `cancelled_date_writeback_proptest.rs` + `quick_add_writeback_proptest.rs` | The safety contract: atomic_write commits on match, refuses on conflict, never corrupts; `⏳` metadata write-back "never corrupts" (256-case ADR-0009 Phase 2, oracle = `rewrite_scheduled`); `✅` done-date-on-toggle stamp "never corrupts" (256-case ADR-0012, oracle = `rewrite_done_date`, CRLF assertion, VS16 guards); `❌` cancelled-date-on-cancel stamp "never corrupts" (256-case ADR-0013, oracle = `rewrite_cancelled_date`; also exercises cross-state `✅`-clearing); quick-add append/create "never corrupts" (256-case ADR-0014, oracle = `inbox_line_for`; also covers first-creation and undo removal). Also covers `toggle_bullet` and `undo` action types (ADR-0011). |
 | `taski-daemon/src/lock.rs` unit tests | The `flock` single-writer lock: acquire/refuse outcome, lock-path derivation. |
 | `taski-daemon` unit tests in `lib.rs` | `should_exclude_entry`, `path_matches_exclude`, `scan_vault_with_exclude_dirs_skips_matching_directory` — exclude-dir filtering in WalkDir and watcher events. |
-| `taski-tui` unit tests (in `lib.rs`) | View model: grouping (note/tag/priority/folder via `G`, incl. tag fan-out + group ordering), collapse, five-axis filter composition (status + today + overdue + text search + file search), display-index↔Task mapping, selection reconciliation (incl. duplicate task_ids under tag grouping), failure-notice surfacing, context-pane render/scroll/toggle + `context_view` centering (headless `TestBackend` smoke), and the pure `obsidian_url` + `percent_encode_query` deep-link builder (native vs advanced, RFC 3986 component encoding incl. unicode; ADR-0015), and the `?` help-overlay modal dispatch (`help_dismisses_on`) + headless `TestBackend` render smoke; `Theme::default()` byte-equality with today's palette, per-role fallback on bad `ColorSpec`, `LayoutPrefs` clamp range, `TestBackend` buffer assertions on a non-default theme + a 60/40 pane split; `split_note_header` path/filename split + a `TestBackend` assertion that Note headers dim the dir prefix (`path_prefix`) while the filename stays bold; an end-to-end `TestBackend` check that a configured `accent` hex reaches rendered cells; and that a configured `background` fills every cell while `Reset` (default) paints none (ADR-0018). |
+| `taski-tui` unit tests (in `lib.rs`) | View model: grouping (folder+note/note/tag/priority/folder via `G`, incl. the filename-only `note` merge, tag fan-out + group ordering), collapse, five-axis filter composition (status + today + overdue + text search + file search), display-index↔Task mapping, selection reconciliation (incl. duplicate task_ids under tag grouping), failure-notice surfacing, context-pane render/scroll/toggle + `context_view` centering (headless `TestBackend` smoke), and the pure `obsidian_url` + `percent_encode_query` deep-link builder (native vs advanced, RFC 3986 component encoding incl. unicode; ADR-0015), and the `?` help-overlay modal dispatch (`help_dismisses_on`) + headless `TestBackend` render smoke; `Theme::default()` byte-equality with today's palette, per-role fallback on bad `ColorSpec`, `LayoutPrefs` clamp range, `TestBackend` buffer assertions on a non-default theme + a 60/40 pane split; `split_note_header` path/filename split + a `TestBackend` assertion that Note headers dim the dir prefix (`path_prefix`) while the filename keeps the default fg (not dimmed, not bold — the global `bold` toggle is off by default); an end-to-end `TestBackend` check that a configured `accent` hex reaches rendered cells; and that a configured `background` fills every cell while `Reset` (default) paints none (ADR-0018). |
 | `taski-db` unit tests | `delete_tasks_for_excluded_dirs` — verifies exact-match and prefix-match SQL purges the right rows. |
 | `taski` (unified launcher) | No unit tests by design — it's thin dispatch over the two libraries. Correctness is runtime-verified (combined spawn, attach-when-held, refuse-when-held, quit-drain); see the smokes described in ADRs 0007/0008. |
 
@@ -710,7 +716,7 @@ exercised only at runtime (its `taski.db` is gitignored).
 | Cache/read note content for the TUI context pane | `taski-db`: `note_contents` table + `upsert_note_content`/`note_content`/`delete_note_content`; daemon writes it in `index_note` ([ADR-0006](./adr/0006-note-content-cached-in-index.md)) |
 | Change write-back behavior | `taski-daemon`: `process_action` (checkbox flips + `✅` stamp, ADR-0012) / `process_metadata_action` (`⏳` writes, ADR-0009), `atomic_write` (mind ADR-0004 TOCTOU); the drain loop dispatches on `pending_actions.action_type` |
 | Change how the TUI looks/behaves | `taski-tui/src/lib.rs`: `App`, `build_view` (filter pipeline), `context_view`/`draw_context_pane`, key handling in `run_loop` |
-| Change the TUI filter composition / grouping | `crates/taski-tui/src/lib.rs:build_view()` — ANDs five filter axes (status + today + overdue + text search + file search) and buckets survivors by the `G` grouping axis (note/tag/priority/folder; HashMap-based, tag fan-out). The 9-param function carries a documented `#[allow(clippy::too_many_arguments)]` (a parameter-struct refactor is deferred). |
+| Change the TUI filter composition / grouping | `crates/taski-tui/src/lib.rs:build_view()` — ANDs five filter axes (status + today + overdue + text search + file search) and buckets survivors by the `G` grouping axis (folder+note/note/tag/priority/folder; HashMap-based, tag fan-out). The 9-param function carries a documented `#[allow(clippy::too_many_arguments)]` (a parameter-struct refactor is deferred). |
 | Change keybindings (add/remove a key) | `crates/taski-tui/src/lib.rs:run_loop()` — handles three branches: `searching`, `file_searching`, and normal mode. `b` / `u` added in ADR-0011; `d` (cancel) added in ADR-0013; `i` (in-progress) added in ADR-0016 |
 | Change context-pane keybindings/behavior | `taski-tui/src/lib.rs` key match in `run_loop` (`J`/`K` scroll, `p` toggle) + `MIN_SPLIT_WIDTH` auto-hide; `sync_context` for the read path |
 | Change open-in-Obsidian behavior | `crates/taski-tui/src/lib.rs`: `obsidian_url`/`percent_encode_query` (pure URL builder + encoder), `open_in_obsidian` (spawn helper), `run_loop` `o` key; `crates/taski-config/src/lib.rs`: `obsidian_vault`/`use_advanced_uri` fields; ADR-0015 |
@@ -729,7 +735,8 @@ exercised only at runtime (its `taski.db` is gitignored).
 | Generate a config file | `taski-daemon --init-config --vault …` (full reference: `docs/config.md`) |
 | Inspect the index / pending actions | `sqlite3 <db> "SELECT …"` (see Debugging) |
 | Add a new dependency | add to `[workspace.dependencies]` + the crate; record in `tech.md` |
-| Recolor the TUI | `[theme]` in `~/.config/taski/config.toml`; restart. See `docs/config.md` (incl. a Nord preset) / `docs/features/theming.md`; ADR-0018 |
+| Recolor the TUI | `[theme]` in `~/.config/taski/config.toml`; restart. See `docs/config.md` + the theme gallery `docs/themes/` (opencode, Catppuccin, Tokyo Night, Nord, Gruvbox, Light) / `docs/features/theming.md`; ADR-0018 |
+| Turn bold on/off | `bold` in `[theme]` (global, off by default); routes through `Theme::bold_modifier()`; ADR-0018 |
 | Change task-list / context-pane proportions | `[ui].list_pane_percent` in config (20–80); ADR-0018 |
 | Understand *why* something is the way it is | check `docs/adr/` first, then git history |
 
