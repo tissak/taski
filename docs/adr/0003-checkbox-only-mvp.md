@@ -1,6 +1,6 @@
 # ADR-0003: MVP write-back is checkbox-state flips only
 
-- **Status:** Accepted (amended 2026-06-20 by [ADR-0009](./0009-scheduled-date-today.md), 2026-06-21 by [ADR-0012](./0012-done-date-on-toggle.md), 2026-06-21 by [ADR-0013](./0013-cancelled-date-on-cancel.md), 2026-06-21 by [ADR-0014](./0014-quick-add-inbox-creation.md), 2026-06-23 by [ADR-0019](./0019-task-notes-annotation.md))
+- **Status:** Accepted (amended 2026-06-20 by [ADR-0009](./0009-scheduled-date-today.md), 2026-06-21 by [ADR-0012](./0012-done-date-on-toggle.md), 2026-06-21 by [ADR-0013](./0013-cancelled-date-on-cancel.md), 2026-06-21 by [ADR-0014](./0014-quick-add-inbox-creation.md), 2026-06-23 by [ADR-0019](./0019-task-notes-annotation.md), 2026-06-24 by [ADR-0020](./0020-task-reordering.md))
 - **Date:** 2026-06-20
 - **Decides:** PRD §10.2 — MVP write-back scope
 
@@ -174,5 +174,34 @@ sentinel values for unused fields, per ADR-0014) and does **not** amend ADR-0004
 in v1 (the user removes a note in Obsidian). See ADR-0019 for the full design, the new gate's
 boundary, the heading/link scheme, the hash-gated identity argument, and the alternatives.
 
+## Amendment — ADR-0020 (2026-06-24): write-back scope widened to bounded structural reordering
+
+[ADR-0020](./0020-task-reordering.md) ("task reordering") introduces the first write that
+changes a line's **position** — an `m`-key TUI-local "move mode" in which `j`/`k` bubble the
+selected task up/down among the other tasks in its note, and `Enter` commits the new order as a
+single `reorder` action. Unlike the three token amendments (in-place line edits) and the two
+append-based gate classes (ADR-0014 creation, ADR-0019 annotation), this opens a **third gate
+class** — bounded structural reordering — and **revokes the "reordering remain rejected" clause**
+that the ADR-0014 and ADR-0019 gate boundaries carried:
+
+> The write-back scope is widened to also include **bounded structural reordering** (`reorder`
+> action): at the user's explicit request, Taski may permute the contents of the checkbox-task
+> lines within a **single** note among those same lines' existing positions, preserving line count
+> and every non-task line, committed as one `atomic_write` under ADR-0004 and gated by the ADR-0006
+> cached note hash. This **revokes** the "reordering remain rejected" clause in the ADR-0014 and
+> ADR-0019 gate boundaries. The ADR-0009 grammar-provability gate and the ADR-0014/0019
+> creation/annotation gates are otherwise **unchanged**. Cross-note movement, moving non-task
+> lines, insertion, deletion, and text editing remain rejected.
+
+The reorder is modeled as a **permutation of task-line contents among their existing positions**
+(line count and non-task lines invariant), so it reduces to several in-place line-content
+replacements — the already-proven-safe mutation class — and identity follows content via the
+existing `text_hash` reconciliation (ADR-0005, **not amended**). This amendment does **not** add a
+schema change (sentinel/anchor values in existing `pending_actions` columns, per ADR-0014/0019) and
+does **not** amend ADR-0004/0005/0006. v1 is **flat-only** (notes with nested tasks refuse move
+mode); undo is deferred (reorder is cleanly invertible, so it is a low-risk fast-follow). See
+ADR-0020 for the full design, the pure `permute_lines` oracle and its proptest invariants, the
+flat-only rationale, the replay-safety argument, and the alternatives.
+
 ## References
-- [`docs/tech.md`](../tech.md), [ADR-0002](./0002-write-back-through-daemon.md), [ADR-0004](./0004-refuse-on-conflict.md), [ADR-0009](./0009-scheduled-date-today.md) *(amendment)*, [ADR-0012](./0012-done-date-on-toggle.md) *(amendment)*, [ADR-0013](./0013-cancelled-date-on-cancel.md) *(amendment)*, [ADR-0014](./0014-quick-add-inbox-creation.md) *(amendment)*, [ADR-0019](./0019-task-notes-annotation.md) *(amendment)*
+- [`docs/tech.md`](../tech.md), [ADR-0002](./0002-write-back-through-daemon.md), [ADR-0004](./0004-refuse-on-conflict.md), [ADR-0009](./0009-scheduled-date-today.md) *(amendment)*, [ADR-0012](./0012-done-date-on-toggle.md) *(amendment)*, [ADR-0013](./0013-cancelled-date-on-cancel.md) *(amendment)*, [ADR-0014](./0014-quick-add-inbox-creation.md) *(amendment)*, [ADR-0019](./0019-task-notes-annotation.md) *(amendment)*, [ADR-0020](./0020-task-reordering.md) *(amendment)*

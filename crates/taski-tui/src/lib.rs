@@ -686,6 +686,18 @@ struct App {
     adding_note: bool,
     /// ADR-0019: the note text typed so far in the add-note modal.
     note_query: String,
+    /// ADR-0020: when true, move mode is active (the `m` key). `j`/`k` bubble the
+    /// selected task up/down among its note's tasks by swapping rows locally;
+    /// `Enter` commits the new order as one `reorder` action, `Esc` restores the
+    /// original order. Purely local until commit — the index refresh is suspended
+    /// while moving so it can't clobber the in-progress reorder.
+    moving: bool,
+    /// ADR-0020: the surrogate id of the task being moved (so the selection and the
+    /// reorder anchor follow it as it bubbles, and `Esc` can re-select it).
+    move_task_id: i64,
+    /// ADR-0020: the moved group's task ids in their order at move-start, used to
+    /// restore the original order on `Esc` and to detect a no-op commit.
+    move_initial_ids: Vec<i64>,
     /// ADR-0014: the resolved inbox path (vault-relative), threaded from
     /// `run_inner` via `taski_config::resolve_inbox_path`. Defaults to
     /// `"task-inbox.md"` for tests that construct `App::new()` directly.
@@ -768,6 +780,9 @@ impl App {
             quick_add_query: String::new(),
             adding_note: false,
             note_query: String::new(),
+            moving: false,
+            move_task_id: 0,
+            move_initial_ids: Vec::new(),
             inbox_path: "task-inbox.md".to_string(),
             vault_name: None,
             use_advanced_uri: false,
@@ -984,6 +999,156 @@ impl App {
         self.note_query.clear();
         self.adding_note = false;
         self.track_enqueued(result);
+    }
+
+    // ── ADR-0020 move mode (m key) ───────────────────────────────────────
+
+    /// The `[start, end)` row-index span of the contiguous run of `Task` rows that
+    /// contains the current selection — i.e. the selected task's group's task rows
+    /// (groups are separated by `Header` rows). `None` if the cursor is not on a
+    /// task row. Recomputable each call because rows are stable while moving.
+    fn group_task_row_range(&self) -> Option<(usize, usize)> {
+        let sel = self.state.selected()?;
+        if !matches!(self.rows.get(sel)?, DisplayRow::Task { .. }) {
+            return None;
+        }
+        let mut start = sel;
+        while start > 0 && matches!(self.rows[start - 1], DisplayRow::Task { .. }) {
+            start -= 1;
+        }
+        let mut end = sel + 1;
+        while end < self.rows.len() && matches!(self.rows[end], DisplayRow::Task { .. }) {
+            end += 1;
+        }
+        Some((start, end))
+    }
+
+    /// Enter move mode on the task under the cursor (`m`). Refused (with a notice,
+    /// no state change) when the cursor isn't on a task, the group spans more than
+    /// one note (reorder is a within-note permutation), or the note has nested
+    /// tasks (flat-only in v1 — a content swap would orphan a parent's children).
+    fn start_move(&mut self) {
+        let Some((start, end)) = self.group_task_row_range() else {
+            return;
+        };
+        // Owned snapshot of the run so the borrow of `self.rows` ends before the
+        // eligibility checks (which set `self.notice`).
+        let run: Vec<(i64, String)> = self.rows[start..end]
+            .iter()
+            .filter_map(|r| match r {
+                DisplayRow::Task { task } => Some((task.id, task.note_path.clone())),
+                _ => None,
+            })
+            .collect();
+        let Some((anchor_id, note_path)) = run.first().cloned() else {
+            return;
+        };
+        if run.iter().any(|(_, np)| np != &note_path) {
+            self.notice =
+                Some("Reorder works within a single note (use folder+note grouping)".to_string());
+            return;
+        }
+        if self
+            .tasks
+            .iter()
+            .any(|t| t.note_path == note_path && t.indent != 0)
+        {
+            self.notice = Some(
+                "Reorder supports flat task lists only (v1); this note has subtasks".to_string(),
+            );
+            return;
+        }
+        self.move_task_id = self.selected_task().map(|t| t.id).unwrap_or(anchor_id);
+        self.move_initial_ids = run.into_iter().map(|(id, _)| id).collect();
+        self.moving = true;
+    }
+
+    /// `j`/`k` (or `↑`/`↓`) while moving: bubble the selected task one row toward
+    /// `delta`, swapping it with its neighbour. Clamped to the note's task run, so
+    /// the task can't escape past the group's first/last task. Local only — nothing
+    /// is written until `Enter`.
+    fn move_task(&mut self, delta: i32) {
+        let Some((start, end)) = self.group_task_row_range() else {
+            return;
+        };
+        let Some(sel) = self.state.selected() else {
+            return;
+        };
+        let target = sel as i32 + delta;
+        if target < start as i32 || target >= end as i32 {
+            return; // at the top/bottom of the note's task block
+        }
+        let target = target as usize;
+        self.rows.swap(sel, target);
+        self.state.select(Some(target));
+        self.ctx_scroll = 0;
+    }
+
+    /// `Enter` while moving: commit the new order. Enqueues one `reorder` action
+    /// carrying the run's task line numbers in their new top-to-bottom order, unless
+    /// the order is unchanged from move-start (an idempotent no-op → no enqueue).
+    /// Exits move mode either way; the next refresh (resumed now) reflects the write.
+    fn commit_move(&mut self, conn: &Connection) {
+        // Compute the enqueue inputs while only borrowing `self` immutably.
+        let plan = self.group_task_row_range().and_then(|(start, end)| {
+            let run: Vec<(i64, usize, String)> = self.rows[start..end]
+                .iter()
+                .filter_map(|r| match r {
+                    DisplayRow::Task { task } => {
+                        Some((task.id, task.line_number, task.note_path.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let current_ids: Vec<i64> = run.iter().map(|(id, _, _)| *id).collect();
+            if run.is_empty() || current_ids == self.move_initial_ids {
+                return None; // nothing selected, or no net change
+            }
+            let note_path = run[0].2.clone();
+            let desired: Vec<usize> = run.iter().map(|(_, ln, _)| *ln).collect();
+            let anchor_line = run
+                .iter()
+                .find(|(id, _, _)| *id == self.move_task_id)
+                .map(|(_, ln, _)| *ln)
+                .unwrap_or(run[0].1);
+            Some((self.move_task_id, note_path, anchor_line, desired))
+        });
+
+        self.moving = false;
+        self.move_initial_ids.clear();
+
+        if let Some((anchor_id, note_path, anchor_line, desired)) = plan {
+            let result = db::enqueue_reorder(conn, anchor_id, &note_path, anchor_line, &desired)
+                .context("enqueuing reorder");
+            self.track_enqueued(result);
+        }
+    }
+
+    /// `Esc` while moving: cancel — restore the group's task rows to their order at
+    /// move-start and re-select the moved task. Nothing was ever written, so this is
+    /// a pure local revert.
+    fn cancel_move(&mut self) {
+        let order = std::mem::take(&mut self.move_initial_ids);
+        if let Some((start, end)) = self.group_task_row_range() {
+            let mut drained: Vec<DisplayRow> = self.rows.drain(start..end).collect();
+            drained.sort_by_key(|r| match r {
+                DisplayRow::Task { task } => order
+                    .iter()
+                    .position(|&id| id == task.id)
+                    .unwrap_or(usize::MAX),
+                _ => usize::MAX,
+            });
+            for (i, row) in drained.into_iter().enumerate() {
+                self.rows.insert(start + i, row);
+            }
+            if let Some(pos) = self.rows.iter().position(
+                |r| matches!(r, DisplayRow::Task { task } if task.id == self.move_task_id),
+            ) {
+                self.state.select(Some(pos));
+            }
+        }
+        self.moving = false;
+        self.ctx_scroll = 0;
     }
 
     /// Re-read the index from the DB, then rebuild the view and poll the resolution
@@ -1460,8 +1625,12 @@ fn run_loop(
     let mut last_refresh: Option<Instant> = None;
 
     loop {
-        // Refresh the task list on the interval, independent of input.
-        let due = last_refresh.is_none_or(|t| t.elapsed() >= REFRESH_INTERVAL);
+        // Refresh the task list on the interval, independent of input — but NOT
+        // while move mode is active (ADR-0020): a refresh rebuilds `rows` from the
+        // on-disk order and would clobber the in-progress local reorder. The
+        // refresh resumes (and fires immediately, since `last_refresh` didn't
+        // advance) as soon as move mode exits on commit/cancel.
+        let due = !app.moving && last_refresh.is_none_or(|t| t.elapsed() >= REFRESH_INTERVAL);
         if due {
             app.refresh(conn)?;
             last_refresh = Some(Instant::now());
@@ -1522,6 +1691,25 @@ fn run_loop(
                 KeyCode::Enter => app.submit_add_note(conn),
                 KeyCode::Backspace => app.pop_note_char(),
                 KeyCode::Char(c) => app.push_note_char(c),
+                _ => {}
+            }
+        } else if app.moving {
+            // ADR-0020: move mode (m key) is MODAL. `j`/`k`/`↑`/`↓` bubble the
+            // selected task within its note; `Enter` commits the new order as one
+            // `reorder` action; `Esc` restores the original order. Nothing is
+            // written until commit, so `Esc` is a free local revert. `Ctrl-C`
+            // stays the emergency exit; every other key is swallowed.
+            if ctrl && key.code == KeyCode::Char('c') {
+                if let Some(hook) = quit_hook {
+                    hook();
+                }
+                return Ok(());
+            }
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => app.move_task(1),
+                KeyCode::Up | KeyCode::Char('k') => app.move_task(-1),
+                KeyCode::Enter => app.commit_move(conn),
+                KeyCode::Esc => app.cancel_move(),
                 _ => {}
             }
         } else if app.show_help {
@@ -1611,6 +1799,13 @@ fn run_loop(
                 // never touches files directly. Suppressed during a search prompt —
                 // `n` falls through to `push_search_char` in the search arms above.
                 KeyCode::Char('n') => app.start_add_note(),
+                // ADR-0020 reorder: `m` enters move mode on the selected task.
+                // `j`/`k` then bubble it within its note; `Enter` commits, `Esc`
+                // cancels. The vault write (a single line-content permutation) is
+                // the daemon's job via `enqueue_reorder`; the TUI never touches
+                // files. Suppressed during a search prompt — `m` falls through to
+                // `push_search_char` in the search arms above, like `b`/`a`/`n`.
+                KeyCode::Char('m') => app.start_move(),
                 KeyCode::Tab => app.expand_all(),
                 KeyCode::BackTab => app.collapse_all(),
                 // Uppercase J/K scroll the context pane (lowercase j/k move the task list).
@@ -2123,6 +2318,24 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Span::styled(cursor, Style::default().add_modifier(Modifier::SLOW_BLINK)),
         ]))
         .style(Style::new())
+    } else if app.moving {
+        // ADR-0020: move-mode indicator. No text entry — just the live gesture help.
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " MOVE  ",
+                Style::default()
+                    .fg(app.theme.accent)
+                    .add_modifier(Modifier::REVERSED),
+            ),
+            Span::raw("  "),
+            Span::styled("j/k", Style::default().fg(app.theme.warning)),
+            Span::raw(" move  ·  "),
+            Span::styled("Enter", Style::default().fg(app.theme.warning)),
+            Span::raw(" place  ·  "),
+            Span::styled("Esc", Style::default().fg(app.theme.warning)),
+            Span::raw(" cancel "),
+        ]))
+        .style(Style::new())
     } else if app.adding_note {
         // ADR-0019: add-note modal prompt. Mirrors the quick-add layout but uses a
         // "note" label — the write targets the selected task's note, not the inbox.
@@ -2171,7 +2384,10 @@ fn draw(frame: &mut Frame, app: &mut App) {
     // (list, notice, footer). `Clear` wipes the cells beneath so the popup's
     // block reads cleanly against the underlying UI rather than blending into it.
     if app.show_help {
-        let popup = popup_area(area, 70, 90);
+        // 95% tall: the full key list (grown by the `m` move-mode row, ADR-0020) is
+        // 35 content lines + a border, so it needs the extra height to avoid
+        // clipping the closing hint on a ~40-row terminal.
+        let popup = popup_area(area, 70, 95);
         frame.render_widget(Clear, popup);
         // `Clear` resets the popup cells to the terminal default bg, so re-apply
         // the themed background there before drawing the help text.
@@ -2552,6 +2768,10 @@ fn help_popup(theme: &theme::Theme) -> Paragraph<'static> {
         row("u", "Undo last flip / bullet / quick-add"),
         row("a", "Quick-add to inbox"),
         row("n", "Add a note to the task (links it)"),
+        row(
+            "m",
+            "Move mode: reorder within note (Enter place / Esc cancel)",
+        ),
         row("o", "Open in Obsidian"),
         Line::raw(""),
         head("Search"),
@@ -2692,6 +2912,131 @@ mod tests {
         assert_eq!(got.len(), 2, "upsert on same id must not grow the table");
         let a = got.iter().find(|t| t.id == 1).unwrap();
         assert_eq!(a.status, Status::InProgress);
+    }
+
+    // ── ADR-0020 move mode ─────────────────────────────────────────────────
+
+    /// Build an `App` with `n` open tasks (lines 1..=n) in one note, the group
+    /// expanded, and the i-th task row selected. Returns the app ready for move
+    /// mode. Rows are `[Header, Task1, Task2, …]`, so task row indices are 1-based.
+    fn app_with_expanded_note(note: &str, n: usize, select_task_idx: usize) -> App {
+        let mut app = App::new();
+        app.tasks = (1..=n).map(|i| task(i as i64, " ", i, note)).collect();
+        app.rebuild();
+        app.expand_all();
+        // Row 0 is the header; task rows follow in line order.
+        app.state.select(Some(select_task_idx));
+        app
+    }
+
+    /// Helper: the ids of the `Task` rows, top to bottom.
+    fn task_row_ids(app: &App) -> Vec<i64> {
+        app.rows
+            .iter()
+            .filter_map(|r| match r {
+                DisplayRow::Task { task } => Some(task.id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn move_task_bubbles_and_clamps() {
+        // Select the first task (row 1); the run is rows [1, 4).
+        let mut app = app_with_expanded_note("inbox.md", 3, 1);
+        app.start_move();
+        assert!(app.moving, "entered move mode on a flat single-note group");
+        assert_eq!(task_row_ids(&app), vec![1, 2, 3]);
+
+        // Up from the top task is clamped — no change.
+        app.move_task(-1);
+        assert_eq!(task_row_ids(&app), vec![1, 2, 3]);
+        assert_eq!(app.state.selected(), Some(1));
+
+        // Down swaps task 1 with task 2; selection follows the moved task.
+        app.move_task(1);
+        assert_eq!(task_row_ids(&app), vec![2, 1, 3]);
+        assert_eq!(app.state.selected(), Some(2));
+
+        // Down again swaps to the bottom; a further down is clamped.
+        app.move_task(1);
+        assert_eq!(task_row_ids(&app), vec![2, 3, 1]);
+        app.move_task(1);
+        assert_eq!(task_row_ids(&app), vec![2, 3, 1], "clamped at the bottom");
+    }
+
+    #[test]
+    fn commit_move_enqueues_reorder_with_new_order() {
+        let conn = db::open(":memory:").unwrap();
+        let mut app = app_with_expanded_note("inbox.md", 3, 1);
+        app.start_move();
+        app.move_task(1); // 1 below 2 → order [2, 1, 3]
+        app.commit_move(&conn);
+        assert!(!app.moving, "commit exits move mode");
+
+        let pending = db::pending_actions(&conn).unwrap();
+        assert_eq!(pending.len(), 1);
+        let a = &pending[0];
+        assert_eq!(a.action_type, "reorder");
+        // New top-to-bottom order of the run's line numbers: task2(line2),
+        // task1(line1), task3(line3).
+        assert_eq!(a.payload.as_deref(), Some("2,1,3"));
+        assert_eq!(a.task_id, 1, "anchor is the moved task");
+        assert_eq!(a.note_path, "inbox.md");
+    }
+
+    #[test]
+    fn commit_move_no_change_does_not_enqueue() {
+        let conn = db::open(":memory:").unwrap();
+        let mut app = app_with_expanded_note("inbox.md", 3, 1);
+        app.start_move();
+        app.move_task(-1); // clamped no-op
+        app.commit_move(&conn);
+        assert!(!app.moving);
+        assert!(
+            db::pending_actions(&conn).unwrap().is_empty(),
+            "an unchanged order enqueues nothing"
+        );
+    }
+
+    #[test]
+    fn cancel_move_restores_original_order() {
+        let mut app = app_with_expanded_note("inbox.md", 3, 1);
+        app.start_move();
+        app.move_task(1);
+        app.move_task(1); // order now [2, 3, 1]
+        assert_eq!(task_row_ids(&app), vec![2, 3, 1]);
+
+        app.cancel_move();
+        assert!(!app.moving, "cancel exits move mode");
+        assert_eq!(task_row_ids(&app), vec![1, 2, 3], "original order restored");
+        // The moved task (id 1) is re-selected at its restored position (row 1).
+        assert_eq!(app.state.selected(), Some(1));
+    }
+
+    #[test]
+    fn start_move_refused_on_note_with_subtasks() {
+        let mut app = App::new();
+        let mut child = task(2, " ", 2, "inbox.md");
+        child.indent = 4; // a nested subtask
+        app.tasks = vec![task(1, " ", 1, "inbox.md"), child];
+        app.rebuild();
+        app.expand_all();
+        app.state.select(Some(1)); // first task row
+
+        app.start_move();
+        assert!(
+            !app.moving,
+            "flat-only: a note with subtasks refuses move mode"
+        );
+        assert!(app.notice.is_some(), "a notice explains the refusal");
+    }
+
+    #[test]
+    fn start_move_noop_on_header() {
+        let mut app = app_with_expanded_note("inbox.md", 2, 0); // row 0 is the header
+        app.start_move();
+        assert!(!app.moving, "no move mode when the cursor is on a header");
     }
 
     /// Headless refresh smoke: `App::refresh` pulls DB changes into the live view

@@ -628,6 +628,42 @@ pub fn enqueue_add_note(
     Ok(conn.last_insert_rowid())
 }
 
+/// ADR-0020: enqueue a "reorder" request — permute the contents of a single
+/// note's checkbox-task lines among their existing positions. `anchor_task_id` is
+/// the moved task (used by the daemon to fetch the cached note hash, ADR-0006);
+/// `note_path` is the note; `anchor_line` is informational. `desired_order` is the
+/// involved task lines' original 1-based line numbers in their new top-to-bottom
+/// order — stored in `payload` as a comma-separated list. `expected_char`/`new_char`
+/// are unused (stored empty); the daemon dispatches on `action_type='reorder'` and
+/// verifies via the cached note hash. Returns the new row id.
+pub fn enqueue_reorder(
+    conn: &Connection,
+    anchor_task_id: i64,
+    note_path: &str,
+    anchor_line: usize,
+    desired_order: &[usize],
+) -> rusqlite::Result<i64> {
+    let payload = desired_order
+        .iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    conn.execute(
+        "INSERT INTO pending_actions
+            (task_id, note_path, line_number, expected_char, new_char, state,
+             created_at, action_type, payload)
+         VALUES (?1, ?2, ?3, '', '', 'pending', ?4, 'reorder', ?5)",
+        rusqlite::params![
+            anchor_task_id,
+            note_path,
+            anchor_line as i64,
+            unix_now(),
+            payload
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
 /// All actions still awaiting processing, oldest first.
 pub fn pending_actions(conn: &Connection) -> rusqlite::Result<Vec<PendingAction>> {
     let mut stmt = conn.prepare(
@@ -1273,6 +1309,31 @@ mod tests {
         assert_eq!(undo.action_type, "quick_add_undo");
         assert_eq!(undo.payload.as_deref(), Some("buy milk"));
         assert_eq!(undo.note_path, "task-inbox.md");
+    }
+
+    /// ADR-0020: `enqueue_reorder` round-trips with the anchor task in `task_id`,
+    /// the note in `note_path`, and the desired top-to-bottom line order encoded
+    /// as a comma-separated `payload`. `expected_char`/`new_char` are unused.
+    #[test]
+    fn enqueue_reorder_round_trips() {
+        let conn = open(":memory:").unwrap();
+
+        let id = enqueue_reorder(&conn, 7, "inbox.md", 3, &[3, 1, 2]).unwrap();
+
+        let pending = pending_actions(&conn).unwrap();
+        let a = pending.iter().find(|a| a.id == id).unwrap();
+        assert_eq!(a.action_type, "reorder");
+        assert_eq!(a.task_id, 7, "anchor task id");
+        assert_eq!(a.note_path, "inbox.md");
+        assert_eq!(a.line_number, 3, "anchor line");
+        assert_eq!(
+            a.payload.as_deref(),
+            Some("3,1,2"),
+            "desired order in payload"
+        );
+        assert_eq!(a.expected_char, "", "unused for reorder");
+        assert_eq!(a.new_char, "", "unused for reorder");
+        assert_eq!(a.state, "pending");
     }
 
     // --- Tier 1: parsed-metadata round-trips (tags, priority, dates) -------

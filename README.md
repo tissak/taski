@@ -39,6 +39,7 @@ A keyboard-driven TUI. Press `?` in the app for the full keybinding overlay.
   - `b` — toggle checkbox ↔ bullet
   - `a` — quick-add to an inbox note (`➕`)
   - `n` — add a closing note to the task (grouped under a `## task-notes` section, with a clickable in-page link)
+  - `m` — move mode: reorder a task within its note (`j`/`k` to bubble, `Enter` to place, `Esc` to cancel)
   - `u` — undo
   - `o` — open the task's note in Obsidian (native deep link, or exact-line jump with the [Advanced URI](https://github.com/Vinzent03/obsidian-advanced-uri) plugin)
 

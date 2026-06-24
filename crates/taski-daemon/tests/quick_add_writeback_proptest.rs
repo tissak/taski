@@ -288,7 +288,8 @@ fn quick_add_inserts_above_task_notes_section() {
     let inbox_abs = root.join(inbox_rel);
     let today = "2026-06-21";
     // An inbox with one task that already has a note grouped under `## task-notes`.
-    let original = "# Inbox\n- [ ] existing [[#notes-1|Notes]]\n\n## task-notes\n\n### notes-1\n- a note\n";
+    let original =
+        "# Inbox\n- [ ] existing [[#notes-1|Notes]]\n\n## task-notes\n\n### notes-1\n- a note\n";
     std::fs::write(&inbox_abs, original).unwrap();
 
     let conn = db::open(&tmp.path().join("p.db").to_string_lossy()).unwrap();

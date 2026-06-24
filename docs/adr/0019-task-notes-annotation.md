@@ -1,6 +1,6 @@
 # ADR-0019: Task notes — grouped closing notes under a `## task-notes` section with an aliased in-page link
 
-- **Status:** Accepted
+- **Status:** Accepted (the "reordering remain rejected" clause in this ADR's gate boundary was **revoked 2026-06-24 by [ADR-0020](./0020-task-reordering.md)**, which opens a separate bounded structural-reordering gate; this ADR's annotation gate is otherwise unchanged)
 - **Date:** 2026-06-23
 - **Decides:** How Taski lets the user attach free-text closing notes to an existing task from the TUI — an `n`-key single-line text-entry modal that appends the note as a bullet under a per-task `### notes-<id>` heading inside a single `## task-notes` section in **the note the task already lives in**, and (on the first note for that task) inserts one aliased in-page wikilink (`[[#notes-<id>|Notes]]`) into the task line so the task can jump to its notes. **Amends [ADR-0003](./0003-checkbox-only-mvp.md)** for a fifth time and opens a **second new gate class** — bounded task annotation — distinct from both the grammar-provability token gate (ADRs 0009/0012/0013) and the bounded append-only *creation* gate (ADR-0014).
 

@@ -1,6 +1,6 @@
 # ADR-0014: Quick-add — bounded append-only task creation to a designated inbox
 
-- **Status:** Accepted
+- **Status:** Accepted (the "reorder … remain rejected" clause in this ADR's gate boundary was **revoked 2026-06-24 by [ADR-0020](./0020-task-reordering.md)**, which opens a separate bounded structural-reordering gate; this ADR's append-only creation gate is otherwise unchanged)
 - **Date:** 2026-06-21
 - **Decides:** How Taski enables the user to create a new task from the TUI without leaving it — a single-line text-entry modal (`a` key) that appends `- [ ] <text> ➕ <today>` to a configurable inbox note (default `task-inbox.md`, created if missing). **Amends [ADR-0003](./0003-checkbox-only-mvp.md)** for a fourth time and opens a **new gate class** — bounded append-only creation — distinct from the grammar-provability token gate of ADRs 0009/0012/0013.
 
