@@ -1214,16 +1214,39 @@ pub fn process_quick_add_at(
         Ok(original_bytes) => {
             // Existing inbox: append with the full TOCTOU guard.
             let original_hash = content_hash(&original_bytes);
-            let mut content = String::from_utf8(original_bytes)
+            let content = String::from_utf8(original_bytes)
                 .with_context(|| format!("inbox {inbox_rel:?} is not valid UTF-8"))?;
-            // Prepend a newline if the file has content but no trailing newline,
-            // so the appended line starts on its own line. An empty file gets the
-            // line directly (no prepended newline).
-            if !content.ends_with('\n') && !content.is_empty() {
-                content.push('\n');
-            }
-            content.push_str(&line);
-            content.push('\n');
+            // A new task line joins the task list, never lands under a note. If the
+            // inbox carries a `## task-notes` section (ADR-0019), insert the line
+            // just above it; otherwise append at EOF (the common case).
+            let content = match task_notes_section_start(&content) {
+                Some(section_start) => {
+                    let ins = insert_offset_above_section(&content, section_start);
+                    let mut out = String::with_capacity(content.len() + line.len() + 2);
+                    out.push_str(&content[..ins]);
+                    // `ins` is a line boundary, so `out` already ends with '\n'
+                    // (unless the section opens the file); guard the latter.
+                    if !out.is_empty() && !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    out.push_str(&line);
+                    out.push('\n');
+                    out.push_str(&content[ins..]);
+                    out
+                }
+                None => {
+                    // Prepend a newline if the file has content but no trailing
+                    // newline, so the appended line starts on its own line. An empty
+                    // file gets the line directly (no prepended newline).
+                    let mut out = content;
+                    if !out.ends_with('\n') && !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(&line);
+                    out.push('\n');
+                    out
+                }
+            };
             let new_bytes = content.into_bytes();
             match atomic_write(&inbox_abs, &new_bytes, &original_hash)? {
                 WriteResult::Written => {
@@ -1273,16 +1296,27 @@ pub fn process_quick_add_undo_at(
     let content = String::from_utf8(original_bytes)
         .with_context(|| format!("inbox {inbox_rel:?} is not valid UTF-8"))?;
 
-    // The expected suffix is the appended line plus its trailing `\n`.
+    // The expected suffix is the appended line plus its trailing `\n`. It sits at
+    // EOF normally, but ABOVE a `## task-notes` section when one exists (symmetric
+    // with `process_quick_add_at`'s task-list-aware placement, ADR-0019). `cut` is
+    // the byte offset just past the line's trailing newline in either case.
     let expected_suffix = format!("{expected_line}\n");
-    if !content.ends_with(&expected_suffix) {
-        // The last line doesn't match — either externally edited or different content.
+    let cut = match task_notes_section_start(&content) {
+        Some(section_start) => insert_offset_above_section(&content, section_start),
+        None => content.len(),
+    };
+    if !content[..cut].ends_with(&expected_suffix) {
+        // The target line doesn't match — either externally edited or different content.
         tracing::warn!(inbox = %inbox_rel, "quick-add undo refused: last line mismatch");
         return Ok(ApplyOutcome::ConflictNoteChanged);
     }
 
-    // Remove the last line (including its trailing newline).
-    let new_bytes = &content.as_bytes()[..content.len() - expected_suffix.len()];
+    // Remove exactly that line (including its trailing newline), splicing the
+    // remainder (e.g. the preserved `## task-notes` section) back on.
+    let mut new_content = String::with_capacity(content.len() - expected_suffix.len());
+    new_content.push_str(&content[..cut - expected_suffix.len()]);
+    new_content.push_str(&content[cut..]);
+    let new_bytes = new_content.as_bytes();
     match atomic_write(&inbox_abs, new_bytes, &original_hash)? {
         WriteResult::Written => {
             tracing::info!(inbox = %inbox_rel, "quick-add undo removed last line");
@@ -1441,6 +1475,40 @@ fn notes_block_insert_offset(content: &str, id: &str) -> Option<usize> {
     }
     // Heading found but no following heading → the block runs to EOF.
     found.then_some(content.len())
+}
+
+/// Byte offset of the start of the `## task-notes` section heading line, if the
+/// inbox already opens one (ADR-0019). Quick-add (ADR-0014) uses this so a new
+/// task line lands *above* the notes section — in the task list — never under a
+/// note. `None` when there is no section (the common case → append at EOF).
+fn task_notes_section_start(content: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    for line in content.split_inclusive('\n') {
+        if line.trim_end_matches(['\r', '\n']) == TASK_NOTES_HEADING {
+            return Some(offset);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// Given the `## task-notes` section start offset, return the offset just before
+/// the trailing run of blank lines that separates the task list from the section
+/// — the start of the first blank line above the heading (or `section_start`
+/// itself if no blank line precedes it). Inserting a task line here keeps the
+/// blank-line separator below it intact. `ins` is always a line boundary.
+fn insert_offset_above_section(content: &str, section_start: usize) -> usize {
+    let mut ins = section_start;
+    while ins > 0 {
+        // Start of the line whose terminating '\n' sits at `ins - 1`.
+        let prev_start = content[..ins - 1].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        if content[prev_start..ins - 1].trim().is_empty() {
+            ins = prev_start;
+        } else {
+            break;
+        }
+    }
+    ins
 }
 
 /// Insert `bullet` as its own line at byte offset `at` (a line boundary or EOF),

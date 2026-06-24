@@ -276,3 +276,51 @@ fn quick_add_undo_task_not_found_when_inbox_absent() {
     let outcome = process_quick_add_undo_at(root, &undo_action, today).unwrap();
     assert_eq!(outcome, ApplyOutcome::TaskNotFound);
 }
+
+/// Regression: when the inbox carries a `## task-notes` section (ADR-0019), a new
+/// quick-add task line joins the task list ABOVE the section — it must never be
+/// appended under a note. The blank-line separator before the section is kept.
+#[test]
+fn quick_add_inserts_above_task_notes_section() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let inbox_rel = "task-inbox.md";
+    let inbox_abs = root.join(inbox_rel);
+    let today = "2026-06-21";
+    // An inbox with one task that already has a note grouped under `## task-notes`.
+    let original = "# Inbox\n- [ ] existing [[#notes-1|Notes]]\n\n## task-notes\n\n### notes-1\n- a note\n";
+    std::fs::write(&inbox_abs, original).unwrap();
+
+    let conn = db::open(&tmp.path().join("p.db").to_string_lossy()).unwrap();
+    let _id = db::enqueue_quick_add(&conn, inbox_rel, "buy milk").unwrap();
+    let action = db::pending_actions(&conn).unwrap()[0].clone();
+    let outcome = process_quick_add_at(root, &action, today).unwrap();
+    assert_eq!(outcome, ApplyOutcome::Applied);
+
+    let on_disk = std::fs::read_to_string(&inbox_abs).unwrap();
+    let expected = format!(
+        "# Inbox\n- [ ] existing [[#notes-1|Notes]]\n{}\n\n## task-notes\n\n### notes-1\n- a note\n",
+        inbox_line_for("buy milk", today)
+    );
+    assert_eq!(
+        on_disk, expected,
+        "new task must land in the task list above `## task-notes`, not under the note"
+    );
+
+    // The note section is unchanged: still exactly one `### notes-` heading and
+    // the new task line is not parsed as a note bullet.
+    let tasks = parse_tasks(&on_disk, inbox_rel);
+    assert_eq!(tasks.len(), 2, "exactly the two checkbox tasks are parsed");
+
+    // Undo must remove exactly the line it inserted (above the section), not the
+    // file's true last line — restoring the original byte-for-byte.
+    let _undo_id = db::enqueue_quick_add_undo(&conn, inbox_rel, "buy milk").unwrap();
+    let undo_action = db::pending_actions(&conn).unwrap()[0].clone();
+    let undo_outcome = process_quick_add_undo_at(root, &undo_action, today).unwrap();
+    assert_eq!(undo_outcome, ApplyOutcome::Applied);
+    let after_undo = std::fs::read_to_string(&inbox_abs).unwrap();
+    assert_eq!(
+        after_undo, original,
+        "undo of a task-list-aware insert must restore the original content"
+    );
+}

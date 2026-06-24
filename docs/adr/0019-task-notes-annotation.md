@@ -134,6 +134,7 @@ ADR-0005 rejected injecting a **foreign, opaque identity marker** (`%% taski:abc
 - ⚠️ **Append is not replay-idempotent** (see above) — bounded, matches quick-add, documented.
 - ⚠️ The `n` key is consumed for add-note. No undo for v1.
 - ⚠️ `## task-notes` is hardcoded; a new `### notes-<id>` heading appended at EOF when `## task-notes` sits mid-file may land structurally after a later section, though the link still resolves (heading links are position-independent). Accepted per the user's "click-to-see over structure" priority.
+- ⚠️ **Quick-add (ADR-0014) must place new tasks above this section.** Because notes append a `## task-notes` section at the end of the note, an inbox that is also a note-bearing file ends with that section. Quick-add's append-at-EOF would otherwise drop new tasks *under* a note, so its placement (and undo) became task-list-aware: when a `## task-notes` section is present, the new task line is inserted at the end of the task list, above the section. ADR-0014 was amended to document this; the notes section is preserved byte-for-byte. See [ADR-0014 "Interaction with ADR-0019"](./0014-quick-add-inbox-creation.md#interaction-with-adr-0019-task-notes).
 
 ### Cross-reference note — ADR-0003 (fifth amendment)
 
@@ -177,4 +178,4 @@ ADR-0003's amendment block records a **fifth** amendment, opening a second new g
 - [ADR-0005](./0005-surrogate-identity.md) — **not amended**; the aliased wikilink is native, user-requested, navigational — not an opaque identity marker.
 - [ADR-0006](./0006-note-content-cached-in-index.md) — the cached note hash that gates the write and makes a per-line `expected_char` unnecessary.
 - [ADR-0009](./0009-scheduled-date-today.md) — the grammar-provability gate; **unchanged** (this ADR opens a separate gate).
-- [ADR-0014](./0014-quick-add-inbox-creation.md) — the bounded append-only *creation* gate; this ADR is a **parallel** gate (annotation), and crosses ADR-0014's "arbitrary-note append" and "existing-line text edit" exclusions under the narrower justification above.
+- [ADR-0014](./0014-quick-add-inbox-creation.md) — the bounded append-only *creation* gate; this ADR is a **parallel** gate (annotation), and crosses ADR-0014's "arbitrary-note append" and "existing-line text edit" exclusions under the narrower justification above. The `## task-notes` section this ADR appends also made quick-add's placement **task-list-aware** (insert above the section, not at EOF) so new tasks never land under a note — documented in ADR-0014.

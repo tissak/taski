@@ -64,7 +64,7 @@ No `RewriteResult` — there is no existing line to fail on. The oracle is pure 
 
 1. Resolve the inbox: `vault_root.join(&action.note_path)` (the `note_path` column carries the inbox path).
 2. Construct the line: `taski_core::inbox_line_for(payload, ymd_from_unix(unix_now()))`.
-3. **If the inbox exists:** read it, append the line (prepend `\n` if the file lacks a trailing newline), `atomic_write` with the pre-append hash as `expected_hash` (standard TOCTOU — ADR-0004 reused unchanged).
+3. **If the inbox exists:** read it, place the line, `atomic_write` with the pre-append hash as `expected_hash` (standard TOCTOU — ADR-0004 reused unchanged). Placement is **append-at-EOF** unless the inbox carries a `## task-notes` section (ADR-0019), in which case the line is inserted on the last line of the task list — immediately **above** that section's blank-line separator — so a new task joins the task list and never lands under a note (see ["Interaction with ADR-0019"](#interaction-with-adr-0019-task-notes) below). Prepend `\n` if the insertion point lacks a trailing newline.
 4. **If the inbox does NOT exist:** write it directly (temp → fsync → rename) with the single line as content. No TOCTOU re-hash — a non-existent file has no state to conflict with. This is a deliberate, bounded exception to ADR-0004, justified below.
 5. On success: re-index the inbox note. The scanner parses the new line and `reconcile_note` inserts the task row. The task appears in the TUI on next poll (~750 ms).
 
@@ -78,11 +78,19 @@ No `RewriteResult` — there is no existing line to fail on. The oracle is pure 
 
 The exception is bounded to the first-creation path only; every subsequent append uses the full TOCTOU guard unchanged.
 
+### Interaction with ADR-0019 (task notes)
+
+ADR-0019 lets the user attach closing notes to a task; those notes accumulate under a single `## task-notes` section appended at the **end** of the note. When the inbox is also a task's note-bearing file, that section sits below the task list. A naïve append-at-EOF would then place each new quick-add task *under* the notes section — visually grouped with a note rather than in the task list — which is wrong: the `## task-notes` section is annotation, not task content.
+
+So quick-add's placement is **task-list-aware**: if the inbox contains a `## task-notes` section, the new line is inserted at the end of the task list — just above the blank line that precedes the section heading — instead of at EOF. The notes section and its blank-line separator are preserved byte-for-byte. When there is no such section (the common case), placement is plain append-at-EOF as before.
+
+This stays inside the bounded append-only creation gate: the write is still append-only with respect to *existing* lines (no existing line is modified, reordered, or deleted — the new line is inserted at a line boundary), still one `atomic_write` under the ADR-0004 TOCTOU guard, and the only structural awareness added is locating the `## task-notes` heading to choose the insertion point. The decision is owned by the daemon at write time, read from the file (single writer, re-read per action), consistent with ADR-0019's "the file is the single source of truth" principle. Placement is a pure offset computation over the read content; no new oracle and no schema change.
+
 ### Undo
 
 Undo of quick-add (`u` after `a`) removes the appended line. This is the first **content-removing** undo (all prior undos flip a checkbox or bullet back). It is safe because:
 
-- The appended line is **positionally known** (the last line of the inbox, or the only line on first-creation).
+- The appended line is **positionally known** — the last line of the inbox, or, when a `## task-notes` section exists, the last line of the task list (just above the section). Undo recomputes the same placement offset and removes exactly that line, leaving the notes section intact (symmetric with the task-list-aware add path above).
 - The appended line is **content-known** (Taski wrote it; the daemon can verify it matches `inbox_line_for(text, today)` before removing).
 - If the inbox was edited externally between append and undo, the TOCTOU hash check catches the mismatch and refuses.
 
@@ -141,6 +149,7 @@ New `inbox_path: Option<String>` on `Config`. `resolve_inbox_path(&cfg) -> Strin
 - ⚠️ `pending_actions` carries sentinel values (`0`, `''`, `0`) for `quick_add` rows — documented but semantically weak. If a future action type also lacks these fields, a schema v7 redesign should be considered.
 - ⚠️ The `a` key is consumed for quick-add. The `u` undo scope widens (now covers quick-add removal in addition to checkbox flips, cancels, and bullet toggles).
 - ⚠️ User text containing emoji dates (`✅`, `❌`, `📅`, `⏳`) is preserved verbatim — the scanner will parse them as metadata. This is a known edge case; the user can fix in Obsidian.
+- ⚠️ **Placement became task-list-aware** (post-ADR-0019): when the inbox carries a `## task-notes` section, quick-add inserts above it rather than at EOF, and undo recomputes the same offset. This stays inside the append-only creation gate (no existing line modified/reordered/deleted; one `atomic_write`), but the position is no longer unconditionally "last line of file." See ["Interaction with ADR-0019"](#interaction-with-adr-0019-task-notes).
 
 ### Cross-reference note — ADR-0003 (fourth amendment)
 
@@ -163,6 +172,7 @@ ADR-0003's amendment block must record a **fourth** amendment. Unlike the prior 
 |---|---|
 | Inbox exists, ends with `\n` | Append `- [ ] text ➕ today\n` directly. |
 | Inbox exists, no trailing `\n` | Append `\n- [ ] text ➕ today\n` (prepend newline). |
+| Inbox has a `## task-notes` section (ADR-0019) | Insert the line at the end of the task list, above the section's blank-line separator — not at EOF. The section and separator are preserved byte-for-byte. Undo recomputes the same offset and removes that line. |
 | Inbox does not exist | Create with `- [ ] text ➕ today\n` as sole content (first-creation path, no TOCTOU). |
 | Inbox exists, concurrent Obsidian edit | Hash mismatch → `ConflictNoteChanged` → refuse (ADR-0004, unchanged for existing-file path). |
 | Empty text (Enter on empty query) | Refuse at TUI layer (do not enqueue); modal exits with no action. |
@@ -183,3 +193,4 @@ ADR-0003's amendment block must record a **fourth** amendment. Unlike the prior 
 - [ADR-0009](./0009-scheduled-date-today.md) — the grammar-provability gate; **unchanged** by this ADR (which opens a separate gate).
 - [ADR-0011](./0011-bullet-toggle-undo.md) — the undo model this ADR extends with `LastAction::QuickAdd`.
 - [ADR-0012](./0012-done-date-on-toggle.md) / [ADR-0013](./0013-cancelled-date-on-cancel.md) — the compose-stamp-into-write pattern; `➕` extends it to creation.
+- [ADR-0019](./0019-task-notes-annotation.md) — introduces the `## task-notes` section; quick-add placement (and undo) became task-list-aware to keep new tasks above it. See ["Interaction with ADR-0019"](#interaction-with-adr-0019-task-notes).
