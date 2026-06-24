@@ -591,6 +591,11 @@ pub enum ApplyOutcome {
     /// (flip + stamp) is refused, the vault is untouched. Parallel to
     /// [`ApplyOutcome::DoneDateUnparseable`] on the `❌` axis.
     CancelledDateUnparseable,
+    /// ADR-0020: a `reorder` action's payload is inconsistent with the note's
+    /// current task lines — a listed line is out of range, not a flat checkbox
+    /// task line, or the list is malformed/duplicated. Refused (defensive; the
+    /// cached-hash guard should normally preclude it).
+    ReorderInconsistent,
 }
 
 /// Process every currently-pending action to completion, resolving each (`done` on
@@ -625,6 +630,11 @@ pub fn process_pending_actions(conn: &Connection, vault_root: &Path) -> Result<(
                 // aliased in-page link into the task line. Two spans, one atomic
                 // write; needs `conn` to resolve the task row + cached note hash.
                 "add_note" => process_add_note(conn, vault_root, action),
+                // ADR-0020: reorder — permute the contents of a single note's
+                // checkbox-task lines among their existing positions. One atomic
+                // write of the pure `permute_lines` result; needs `conn` to resolve
+                // the anchor task row + cached note hash.
+                "reorder" => process_reorder(conn, vault_root, action),
                 // Unknown action_type: refuse with a distinct, accurate message.
                 // (NOT the checkbox `new_char` phrasing — there is no `new_char`
                 // here; this is an unrecognized write gesture.)
@@ -690,6 +700,9 @@ pub fn process_pending_actions(conn: &Connection, vault_root: &Path) -> Result<(
                         }
                         ApplyOutcome::CancelledDateUnparseable => {
                             "existing ❌ is malformed or unparseable; cancel not applied"
+                        }
+                        ApplyOutcome::ReorderInconsistent => {
+                            "reorder no longer matches the note's task lines; action not applied"
                         }
                         ApplyOutcome::Applied => unreachable!(),
                     };
@@ -1426,6 +1439,110 @@ pub fn process_add_note(
         }
         WriteResult::Conflict => Ok(ApplyOutcome::ConflictNoteChanged),
     }
+}
+
+/// ADR-0020: execute one pending `reorder` action — permute the contents of a
+/// single note's checkbox-task lines among their existing positions via the pure
+/// [`taski_core::permute_lines`] oracle, in one [`atomic_write`] under the ADR-0004
+/// TOCTOU guard. The vault is mutated **only** on a successful
+/// [`ApplyOutcome::Applied`]; every other path leaves it untouched.
+///
+/// The `payload` is the involved task lines' 1-based line numbers in their desired
+/// top-to-bottom order. Identity is gated by the anchor task's cached note hash
+/// (ADR-0006): if it still matches the file, every listed line is byte-identical to
+/// what was indexed, so the line numbers are valid. Defensive validation then
+/// confirms each listed line is a flat (`indent == 0`) checkbox task line before the
+/// write; anything off → [`ApplyOutcome::ReorderInconsistent`].
+pub fn process_reorder(
+    conn: &Connection,
+    vault_root: &Path,
+    action: &PendingAction,
+) -> Result<ApplyOutcome> {
+    // 1. Anchor task row (a *claim*, re-verified below). Same id→location fallback
+    //    the other processors use in case the surrogate id churned.
+    let row = match lookup_task_for_action(conn, action.task_id)? {
+        Some(row) => row,
+        None => match lookup_task_by_location(conn, &action.note_path, action.line_number)? {
+            Some(row) => row,
+            None => return Ok(ApplyOutcome::TaskNotFound),
+        },
+    };
+
+    // 2. Read the note fresh.
+    let note_abs = vault_root.join(&row.note_path);
+    let bytes = match fs::read(&note_abs) {
+        Ok(b) => b,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(ApplyOutcome::TaskNotFound),
+        Err(e) => return Err(e).with_context(|| format!("reading note {:?}", note_abs)),
+    };
+
+    // 3. Authoritative conflict check via the cached note hash (ADR-0006 + ADR-0004).
+    let snapshot_hash = content_hash(&bytes);
+    if Some(&snapshot_hash) != row.note_hash.as_ref() {
+        return Ok(ApplyOutcome::ConflictNoteChanged);
+    }
+
+    // 4. Decode the note (Obsidian notes are UTF-8).
+    let content = match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => return Ok(ApplyOutcome::TaskLineMismatch),
+    };
+
+    // 5. Parse the desired-order payload.
+    let Some(desired) = parse_reorder_payload(action.payload.as_deref()) else {
+        return Ok(ApplyOutcome::ReorderInconsistent);
+    };
+
+    // 6. Defensive validation against the note's actual task lines. Every listed
+    //    line must be a flat (indent == 0) checkbox task line. (The hash guard
+    //    should already imply this; we re-check rather than trust the payload.)
+    let flat_task_lines: std::collections::HashSet<usize> =
+        taski_core::parse_tasks(&content, &row.note_path)
+            .into_iter()
+            .filter(|t| t.indent == 0)
+            .map(|t| t.line_number)
+            .collect();
+    if desired.is_empty() || !desired.iter().all(|ln| flat_task_lines.contains(ln)) {
+        return Ok(ApplyOutcome::ReorderInconsistent);
+    }
+
+    // 7. Apply the pure permutation. A no-op (already in order) short-circuits
+    //    without a write — nothing to commit, and re-index would be a no-op too.
+    let new_content = taski_core::permute_lines(&content, &desired);
+    if new_content == content {
+        return Ok(ApplyOutcome::Applied);
+    }
+
+    // 8. One atomic write, full ADR-0004 TOCTOU guard.
+    match atomic_write(&note_abs, new_content.as_bytes(), &snapshot_hash)? {
+        WriteResult::Written => {
+            tracing::info!(note = %row.note_path, lines = desired.len(), "tasks reordered");
+            Ok(ApplyOutcome::Applied)
+        }
+        WriteResult::Conflict => Ok(ApplyOutcome::ConflictNoteChanged),
+    }
+}
+
+/// Parse a `reorder` payload (`"3,1,2"`) into 1-based line numbers. Returns `None`
+/// if the payload is missing, empty, or contains a non-numeric / zero entry — the
+/// caller refuses with [`ApplyOutcome::ReorderInconsistent`]. Duplicates are not
+/// checked here; [`taski_core::permute_lines`] treats a duplicate as a no-op and the
+/// step-6 subset check would still pass, so duplicates are harmless (worst case: a
+/// no-op write avoided by the step-7 short-circuit).
+fn parse_reorder_payload(payload: Option<&str>) -> Option<Vec<usize>> {
+    let raw = payload?;
+    if raw.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for part in raw.split(',') {
+        let n: usize = part.trim().parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        out.push(n);
+    }
+    Some(out)
 }
 
 /// The literal `## task-notes` section heading (ADR-0019). Hardcoded for v1; a

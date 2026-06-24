@@ -1030,6 +1030,74 @@ pub fn toggle_bullet(line: &str) -> RewriteResult {
     }
 }
 
+/// ADR-0020: permute the *contents* of the lines named in `desired_order`
+/// (1-based line numbers) among those same lines' positions, leaving every other
+/// line and every line terminator byte-identical.
+///
+/// `desired_order` is the listed lines in their new top-to-bottom order. The i-th
+/// smallest of those line numbers (the target positions, ascending) receives the
+/// content of `desired_order[i]`. "Content" is the text of a line *excluding* its
+/// terminator (`\n` / `\r\n` / none-at-EOF); **terminators stay with positions**,
+/// so a `\r\n`-terminated position stays `\r\n` regardless of which content moves
+/// in (the CRLF-preservation discipline the single-line rewrites also follow).
+///
+/// Returns the input unchanged (an idempotent no-op) when `desired_order` is empty,
+/// contains an out-of-range or duplicate line number, or is already in ascending
+/// order. This is the pure reorder oracle the daemon's `process_reorder` applies;
+/// it is a permutation, so it never invents or drops a line.
+pub fn permute_lines(content: &str, desired_order: &[usize]) -> String {
+    let segments = split_lines_with_terminators(content);
+    let n = segments.len();
+
+    if desired_order.is_empty() {
+        return content.to_string();
+    }
+    // Validate: every line number in range and unique. Bail to a no-op otherwise —
+    // the daemon validates separately and refuses; this keeps the oracle total.
+    let mut seen = vec![false; n];
+    for &ln in desired_order {
+        if ln == 0 || ln > n || seen[ln - 1] {
+            return content.to_string();
+        }
+        seen[ln - 1] = true;
+    }
+
+    // Target positions = the listed lines, ascending. Place the content of
+    // `desired_order[i]` into the i-th smallest target position.
+    let mut targets: Vec<usize> = desired_order.iter().map(|&ln| ln - 1).collect();
+    targets.sort_unstable();
+
+    let mut new_contents: Vec<&str> = segments.iter().map(|&(c, _)| c).collect();
+    for (i, &tgt) in targets.iter().enumerate() {
+        new_contents[tgt] = segments[desired_order[i] - 1].0;
+    }
+
+    let mut out = String::with_capacity(content.len());
+    for (i, &(_, term)) in segments.iter().enumerate() {
+        out.push_str(new_contents[i]);
+        out.push_str(term);
+    }
+    out
+}
+
+/// Split `content` into `(line_content, terminator)` pairs, one per line, where the
+/// terminator is `"\r\n"`, `"\n"`, or `""` (the final line when the file has no
+/// trailing newline). The 0-based index of each pair equals its 1-based line number
+/// minus one, matching the line numbering [`parse_tasks`] derives via `str::lines`.
+fn split_lines_with_terminators(content: &str) -> Vec<(&str, &str)> {
+    let mut segments = Vec::new();
+    for piece in content.split_inclusive('\n') {
+        if let Some(body) = piece.strip_suffix("\r\n") {
+            segments.push((body, "\r\n"));
+        } else if let Some(body) = piece.strip_suffix('\n') {
+            segments.push((body, "\n"));
+        } else {
+            segments.push((piece, ""));
+        }
+    }
+    segments
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2357,5 +2425,126 @@ plain text
         // A plain note is never escaped and is never a task.
         let plain = note_bullet_for("just a thought");
         assert!(task_captures(&plain).is_none());
+    }
+
+    // ── permute_lines (ADR-0020) ───────────────────────────────────────────
+
+    #[test]
+    fn permute_lines_swaps_two_adjacent() {
+        let s = "- [ ] a\n- [ ] b\n- [ ] c\n";
+        // Move line 2 above line 1: desired order [2, 1] over positions {1, 2}.
+        assert_eq!(permute_lines(s, &[2, 1]), "- [ ] b\n- [ ] a\n- [ ] c\n");
+    }
+
+    #[test]
+    fn permute_lines_rotation() {
+        let s = "- [ ] x\n- [ ] a\n- [ ] b\n";
+        // Bubble line 3 to the top: new top-to-bottom order is [3, 1, 2].
+        assert_eq!(permute_lines(s, &[3, 1, 2]), "- [ ] b\n- [ ] x\n- [ ] a\n");
+    }
+
+    #[test]
+    fn permute_lines_subset_leaves_others_in_place() {
+        // Only lines 1 and 3 are reordered; line 2 (a non-listed line) stays put.
+        let s = "- [ ] a\nplain prose\n- [ ] c\n";
+        assert_eq!(permute_lines(s, &[3, 1]), "- [ ] c\nplain prose\n- [ ] a\n");
+    }
+
+    #[test]
+    fn permute_lines_preserves_crlf_per_position() {
+        // Position 1 is CRLF, position 2 is LF: terminators stay with positions.
+        let s = "- [ ] a\r\n- [ ] b\n";
+        assert_eq!(permute_lines(s, &[2, 1]), "- [ ] b\r\n- [ ] a\n");
+    }
+
+    #[test]
+    fn permute_lines_no_trailing_newline() {
+        let s = "- [ ] a\n- [ ] b";
+        assert_eq!(permute_lines(s, &[2, 1]), "- [ ] b\n- [ ] a");
+    }
+
+    #[test]
+    fn permute_lines_identity_and_invalid_are_noops() {
+        let s = "- [ ] a\n- [ ] b\n- [ ] c\n";
+        assert_eq!(permute_lines(s, &[1, 2, 3]), s); // already ascending
+        assert_eq!(permute_lines(s, &[]), s); // empty
+        assert_eq!(permute_lines(s, &[0, 1]), s); // line 0 invalid
+        assert_eq!(permute_lines(s, &[1, 9]), s); // out of range
+        assert_eq!(permute_lines(s, &[2, 2]), s); // duplicate
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+        /// The "never-corrupts" contract for the reorder oracle: for any note and
+        /// any permutation of any subset of its lines, the output is line-count-
+        /// preserving, a true permutation of line contents, pins every non-listed
+        /// line, and is invertible (ADR-0020).
+        #[test]
+        fn permute_lines_never_corrupts(
+            // 1..8 short non-empty line bodies; CRLF or LF; optional trailing
+            // newline. Bodies are non-empty so `bodies.len()` equals both the
+            // `lines()` count and the oracle's segment count (an empty body could
+            // collapse a `\n`-join into fewer lines than `bodies.len()`).
+            bodies in proptest::collection::vec("[a-c]{1,4}", 1..8usize),
+            use_crlf in proptest::prelude::any::<bool>(),
+            trailing_nl in proptest::prelude::any::<bool>(),
+            // A seed used to pick a subset + shuffle it deterministically below.
+            seed in proptest::prelude::any::<u64>(),
+        ) {
+            let sep = if use_crlf { "\r\n" } else { "\n" };
+            let mut content = bodies.join(sep);
+            if trailing_nl {
+                content.push_str(sep);
+            }
+            let n = bodies.len();
+
+            // Build a subset of line numbers (every other line, by the seed parity)
+            // then rotate it by one — a non-trivial permutation when len >= 2.
+            let mut subset: Vec<usize> = (1..=n)
+                .filter(|i| (i.wrapping_add(seed as usize)) % 2 == 0)
+                .collect();
+            if subset.len() >= 2 {
+                subset.rotate_left(1);
+            }
+
+            let out = permute_lines(&content, &subset);
+
+            // (a) line count preserved.
+            let in_lines: Vec<&str> = content.lines().collect();
+            let out_lines: Vec<&str> = out.lines().collect();
+            proptest::prop_assert_eq!(in_lines.len(), out_lines.len());
+
+            // (b) permutation: the multiset of line contents is unchanged.
+            let mut a = in_lines.clone();
+            let mut b = out_lines.clone();
+            a.sort_unstable();
+            b.sort_unstable();
+            proptest::prop_assert_eq!(a, b);
+
+            // (c) non-listed lines pinned in place.
+            for i in 1..=n {
+                if !subset.contains(&i) {
+                    proptest::prop_assert_eq!(in_lines[i - 1], out_lines[i - 1]);
+                }
+            }
+
+            // (d) invertible: applying the inverse permutation restores the input.
+            //     inverse[target_pos] = source line that landed there.
+            let mut targets: Vec<usize> = subset.clone();
+            targets.sort_unstable();
+            // desired_order maps i-th target <- subset[i]; the inverse, expressed in
+            // the same "desired_order over the same positions" form, sends each
+            // target back to its origin.
+            let mut inverse = vec![0usize; subset.len()];
+            for (i, &src) in subset.iter().enumerate() {
+                // src's content sits at targets[i] after the forward permute; to
+                // invert, the position targets[i] must supply content back to src.
+                let pos_idx = targets.iter().position(|&t| t == src).unwrap();
+                inverse[pos_idx] = targets[i];
+            }
+            let restored = permute_lines(&out, &inverse);
+            proptest::prop_assert_eq!(restored, content);
+        }
     }
 }
