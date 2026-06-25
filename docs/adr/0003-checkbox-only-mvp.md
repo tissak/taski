@@ -1,6 +1,6 @@
 # ADR-0003: MVP write-back is checkbox-state flips only
 
-- **Status:** Accepted (amended 2026-06-20 by [ADR-0009](./0009-scheduled-date-today.md), 2026-06-21 by [ADR-0012](./0012-done-date-on-toggle.md), 2026-06-21 by [ADR-0013](./0013-cancelled-date-on-cancel.md), 2026-06-21 by [ADR-0014](./0014-quick-add-inbox-creation.md), 2026-06-23 by [ADR-0019](./0019-task-notes-annotation.md), 2026-06-24 by [ADR-0020](./0020-task-reordering.md))
+- **Status:** Accepted (amended 2026-06-20 by [ADR-0009](./0009-scheduled-date-today.md), 2026-06-21 by [ADR-0012](./0012-done-date-on-toggle.md), 2026-06-21 by [ADR-0013](./0013-cancelled-date-on-cancel.md), 2026-06-21 by [ADR-0014](./0014-quick-add-inbox-creation.md), 2026-06-23 by [ADR-0019](./0019-task-notes-annotation.md), 2026-06-24 by [ADR-0020](./0020-task-reordering.md), 2026-06-24 by [ADR-0021](./0021-archive-completed-tasks.md))
 - **Date:** 2026-06-20
 - **Decides:** PRD §10.2 — MVP write-back scope
 
@@ -203,5 +203,44 @@ mode); undo is deferred (reorder is cleanly invertible, so it is a low-risk fast
 ADR-0020 for the full design, the pure `permute_lines` oracle and its proptest invariants, the
 flat-only rationale, the replay-safety argument, and the alternatives.
 
+## Amendment — ADR-0021 (2026-06-24): write-back scope widened to bounded archival (move by copy-then-delete)
+
+[ADR-0021](./0021-archive-completed-tasks.md) ("archive completed tasks") introduces the first
+write that **deletes an existing line** and the first that **crosses a note boundary** — an `A`-key
+one-shot that moves every flat `[x]` done / `[-]` cancelled task line from the selected note into a
+designated archive note via a **durable-copy-then-delete** sequence, committed as a single
+`archive` action. Unlike the three token amendments (in-place line edits), the two append-based
+gate classes (ADR-0014 creation, ADR-0019 annotation), and the structural-reordering gate (ADR-0020,
+a within-note permutation), this opens a **fourth gate class** — bounded archival — and **revokes
+the "deletion remain rejected" clause** the ADR-0014 and ADR-0020 boundaries carried and the
+**"cross-note movement remain rejected" clause** ADR-0020 carried, both **bounded to this archival
+operation**:
+
+> The write-back scope is widened to also include **bounded archival** (`archive` action): at the
+> user's explicit request, Taski may move every flat `[x]` done / `[-]` cancelled task line from a
+> **single** source note into a designated archive note, by **durably copying** the lines into the
+> archive (the ADR-0014 append-only creation gate, first-creation path for a missing archive) and
+> **then** deleting exactly those lines from the source (the ADR-0006-hash-gated, ADR-0004-TOCTOU
+> `remove_lines` rewrite). This **revokes** the "deletion remain rejected" clause in the ADR-0014
+> and ADR-0020 boundaries and the "cross-note movement remain rejected" clause in ADR-0020, **bounded
+> to this archival operation**. The ADR-0009 grammar-provability gate and the ADR-0014/0019/0020
+> creation/annotation/reordering gates are otherwise **unchanged**. Arbitrary deletion, deletion of
+> non-completed or nested lines, cross-note movement of incomplete tasks, mid-note insertion, and
+> text editing remain rejected.
+
+Archival decomposes into two already-proven operations sequenced so the only failure mode is
+recoverable: **Phase A** durably appends the completed lines to the archive (the ADR-0014 append
+gate), and **Phase B** deletes exactly those lines from the source via a pure `remove_lines` rewrite
+(the deletion analogue of ADR-0020's `permute_lines`) under the ADR-0004 TOCTOU guard. Copying
+before deleting makes a crash or conflict leave the tasks in **both** files (recoverable) — never in
+**neither** (lost). Identity follows content via the existing `text_hash` reconciliation (ADR-0005,
+**not amended**): survivors keep their id at their shifted-up line, archived tasks get fresh ids in
+the archive. This amendment does **not** add a schema change (anchor/sentinel values in existing
+`pending_actions` columns with the archive path tab-encoded in `payload`, per ADR-0014/0019/0020) and
+does **not** amend ADR-0004/0005/0006. v1 is **flat-only** and **single-note**; undo is deferred (a
+recorded planned feature — archival is invertible). See ADR-0021 for the full design, the pure
+`remove_lines`/`extract_lines` oracles and their proptest invariants, the copy-then-delete safety
+argument, the no-loss failure table, and the alternatives.
+
 ## References
-- [`docs/tech.md`](../tech.md), [ADR-0002](./0002-write-back-through-daemon.md), [ADR-0004](./0004-refuse-on-conflict.md), [ADR-0009](./0009-scheduled-date-today.md) *(amendment)*, [ADR-0012](./0012-done-date-on-toggle.md) *(amendment)*, [ADR-0013](./0013-cancelled-date-on-cancel.md) *(amendment)*, [ADR-0014](./0014-quick-add-inbox-creation.md) *(amendment)*, [ADR-0019](./0019-task-notes-annotation.md) *(amendment)*, [ADR-0020](./0020-task-reordering.md) *(amendment)*
+- [`docs/tech.md`](../tech.md), [ADR-0002](./0002-write-back-through-daemon.md), [ADR-0004](./0004-refuse-on-conflict.md), [ADR-0009](./0009-scheduled-date-today.md) *(amendment)*, [ADR-0012](./0012-done-date-on-toggle.md) *(amendment)*, [ADR-0013](./0013-cancelled-date-on-cancel.md) *(amendment)*, [ADR-0014](./0014-quick-add-inbox-creation.md) *(amendment)*, [ADR-0019](./0019-task-notes-annotation.md) *(amendment)*, [ADR-0020](./0020-task-reordering.md) *(amendment)*, [ADR-0021](./0021-archive-completed-tasks.md) *(amendment)*

@@ -1080,6 +1080,45 @@ pub fn permute_lines(content: &str, desired_order: &[usize]) -> String {
     out
 }
 
+/// Return the content of the lines named in `line_numbers` (1-based), in the order
+/// the numbers are given, each **without** its terminator — the block to append to
+/// the archive (ADR-0021 Phase A). Out-of-range numbers (zero or beyond the line
+/// count) are skipped; the caller passes a validated subset. Pure: no I/O, the
+/// structural read-half of the archive move.
+pub fn extract_lines(content: &str, line_numbers: &[usize]) -> Vec<String> {
+    let segments = split_lines_with_terminators(content);
+    let n = segments.len();
+    line_numbers
+        .iter()
+        .filter(|&&ln| ln >= 1 && ln <= n)
+        .map(|&ln| segments[ln - 1].0.to_string())
+        .collect()
+}
+
+/// Remove the lines named in `line_numbers` (1-based) from `content`, leaving every
+/// surviving line and its terminator (`\n` / `\r\n` / none-at-EOF) byte-identical and
+/// in order — the structural **deletion** analogue of [`permute_lines`] (ADR-0021
+/// Phase B). Out-of-range and duplicate numbers are ignored. Pure: no I/O, so it
+/// never invents or reorders a surviving line.
+pub fn remove_lines(content: &str, line_numbers: &[usize]) -> String {
+    let segments = split_lines_with_terminators(content);
+    let n = segments.len();
+    let mut drop = vec![false; n];
+    for &ln in line_numbers {
+        if ln >= 1 && ln <= n {
+            drop[ln - 1] = true;
+        }
+    }
+    let mut out = String::with_capacity(content.len());
+    for (i, &(c, term)) in segments.iter().enumerate() {
+        if !drop[i] {
+            out.push_str(c);
+            out.push_str(term);
+        }
+    }
+    out
+}
+
 /// Split `content` into `(line_content, terminator)` pairs, one per line, where the
 /// terminator is `"\r\n"`, `"\n"`, or `""` (the final line when the file has no
 /// trailing newline). The 0-based index of each pair equals its 1-based line number
@@ -2545,6 +2584,110 @@ plain text
             }
             let restored = permute_lines(&out, &inverse);
             proptest::prop_assert_eq!(restored, content);
+        }
+    }
+
+    // ── remove_lines / extract_lines (ADR-0021) ─────────────────────────────
+
+    #[test]
+    fn extract_lines_returns_named_contents_in_order() {
+        let s = "- [ ] a\n- [x] b\n- [-] c\n";
+        // Ask for lines 3 then 2 — order follows the argument, terminators stripped.
+        assert_eq!(extract_lines(s, &[3, 2]), vec!["- [-] c", "- [x] b"]);
+    }
+
+    #[test]
+    fn extract_lines_skips_out_of_range() {
+        let s = "- [x] a\n- [ ] b\n";
+        assert_eq!(extract_lines(s, &[1, 9, 0]), vec!["- [x] a"]);
+    }
+
+    #[test]
+    fn remove_lines_deletes_named_and_pins_survivors() {
+        let s = "# Inbox\n- [ ] a\n- [x] b\n- [-] c\n";
+        // Remove the two closed tasks (lines 3, 4); heading + open task stay.
+        assert_eq!(remove_lines(s, &[3, 4]), "# Inbox\n- [ ] a\n");
+    }
+
+    #[test]
+    fn remove_lines_middle_keeps_terminators() {
+        let s = "- [ ] a\n- [x] b\n- [ ] c\n";
+        assert_eq!(remove_lines(s, &[2]), "- [ ] a\n- [ ] c\n");
+    }
+
+    #[test]
+    fn remove_lines_preserves_crlf_on_survivors() {
+        let s = "- [ ] a\r\n- [x] b\r\n- [ ] c\r\n";
+        assert_eq!(remove_lines(s, &[2]), "- [ ] a\r\n- [ ] c\r\n");
+    }
+
+    #[test]
+    fn remove_lines_last_line_without_trailing_newline() {
+        // Removing the final, unterminated line leaves the prior line's own `\n`.
+        let s = "- [ ] a\n- [x] b";
+        assert_eq!(remove_lines(s, &[2]), "- [ ] a\n");
+    }
+
+    #[test]
+    fn remove_lines_empty_and_out_of_range_are_noops() {
+        let s = "- [ ] a\n- [x] b\n";
+        assert_eq!(remove_lines(s, &[]), s);
+        assert_eq!(remove_lines(s, &[0]), s);
+        assert_eq!(remove_lines(s, &[9]), s);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+        /// The "never-corrupts" contract for the archive move's structural oracles
+        /// (ADR-0021): for any note and any subset of its lines, `extract_lines` ⊎
+        /// the survivors of `remove_lines` equals the original line multiset (no
+        /// loss), survivors stay byte-identical and in order, and the removed count
+        /// is exact.
+        #[test]
+        fn remove_and_extract_never_lose_a_line(
+            bodies in proptest::collection::vec("[a-c]{1,4}", 1..8usize),
+            use_crlf in proptest::prelude::any::<bool>(),
+            trailing_nl in proptest::prelude::any::<bool>(),
+            seed in proptest::prelude::any::<u64>(),
+        ) {
+            let sep = if use_crlf { "\r\n" } else { "\n" };
+            let mut content = bodies.join(sep);
+            if trailing_nl {
+                content.push_str(sep);
+            }
+            let n = bodies.len();
+
+            // Pick a subset of line numbers by seed parity (the "completed" lines).
+            let subset: Vec<usize> = (1..=n)
+                .filter(|i| (i.wrapping_add(seed as usize)) % 2 == 0)
+                .collect();
+
+            let extracted = extract_lines(&content, &subset);
+            let kept = remove_lines(&content, &subset);
+
+            let in_lines: Vec<&str> = content.lines().collect();
+            let kept_lines: Vec<&str> = kept.lines().collect();
+
+            // (a) removed count is exact.
+            proptest::prop_assert_eq!(kept_lines.len(), n - subset.len());
+
+            // (b) no loss: extracted ⊎ kept == original (as multisets of contents).
+            let mut union: Vec<String> =
+                kept_lines.iter().map(|s| s.to_string()).collect();
+            union.extend(extracted.iter().cloned());
+            let mut original: Vec<String> =
+                in_lines.iter().map(|s| s.to_string()).collect();
+            union.sort();
+            original.sort();
+            proptest::prop_assert_eq!(union, original);
+
+            // (c) survivors stay in their original relative order, byte-identical.
+            let survivors: Vec<&str> = (1..=n)
+                .filter(|i| !subset.contains(i))
+                .map(|i| in_lines[i - 1])
+                .collect();
+            proptest::prop_assert_eq!(kept_lines, survivors);
         }
     }
 }

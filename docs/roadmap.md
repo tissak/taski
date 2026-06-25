@@ -15,7 +15,7 @@
 ## Where Taski is today (v0.4 + Tier 1/2 + interop fix)
 
 - **Reads:** every checkbox task in the vault, `📅`/`📆`/`🗓` due date, `⏳` scheduled date, `🛫` start date, `➕`/`✅`/`❌` created/done/cancelled dates, `#tags` (multi-value), `🔺`/`⏫`/`🔼`/`🔽`/`⏬` priority.
-- **Writes:** checkbox toggle (stamps `✅ <today>` on done, clears on un-done — ADR-0012), `⏳` mark-for-today, checkbox↔bullet conversion, undo.
+- **Writes:** checkbox toggle (stamps `✅ <today>` on done, clears on un-done — ADR-0012), `❌`-on-cancel (`d`, ADR-0013), `i` in-progress toggle (ADR-0016), `⏳` mark-for-today, checkbox↔bullet conversion, quick-add to inbox (`a`, ADR-0014), add-note (`n`, ADR-0019), reorder/move mode (`m`, ADR-0020), archive completed → archive note (`A`, ADR-0021), undo.
 - **Views:** status cycle (`f`), Today (`T`), text search (`/`), file search (`F`), overdue (`O`), group-by cycling (`G`: note/tag/priority/folder), note context pane (`p`).
 
 Taski now parses **8 of ~15** Obsidian Tasks metadata tokens (up from 2). The metadata is now surfaced as filters and groupings; remaining view-side gaps are the "Happens" date union and urgency-score sort (Tier 2), plus the write-path items (Tier 3).
@@ -113,8 +113,9 @@ Matches the project's vertical-slice philosophy and the architecture (read path 
 
 1. **~~Tier 1 metadata parsing~~** — tags, priority, start, created/done/cancelled. Read-only, no risk, unlocks everything below. **✅ Done (schema v6).**
 2. **Tier 2 views** — overdue, happens, group-by, urgency sort (each as its dependency lands).
-3. **~~The `✅`-on-toggle interop fix~~** — small write-path slice, high correctness value. **✅ Done (ADR-0012).** `❌`-on-cancel remains open (depends on a cancel gesture).
-4. **Bulk operations** — the highest-impact single feature; do after metadata is rich enough to act on.
-5. **Recurrence write-back** — the viewer→manager leap; last because it's the hardest write.
+3. **~~The `✅`-on-toggle interop fix~~** — small write-path slice, high correctness value. **✅ Done (ADR-0012).** `❌`-on-cancel **✅ Done (ADR-0013)**.
+4. **~~Inbox capture + annotation + within-note structure~~** — quick-add (ADR-0014), task notes (ADR-0019), reorder (ADR-0020), and **archive completed → archive note (`A`, ADR-0021)** — the inbox-triage workflow. **✅ Done.** Archival opened the fourth write gate class (bounded move by copy-then-delete; first line deletion + first cross-note op). Its **undo** is a recorded planned fast-follow (archival is invertible).
+5. **Bulk operations** — the highest-impact single feature; do after metadata is rich enough to act on.
+6. **Recurrence write-back** — the viewer→manager leap; last because it's the hardest write.
 
 Each write-path step gets its own ADR (the ADR-0009 template), pure oracle, and proptest before it ships.
