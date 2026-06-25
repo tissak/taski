@@ -1,6 +1,6 @@
 # Taski — Engineering Context & Onboarding
 
-*Onboarding guide for new engineers. Last updated: 2026-06-24 (post-v0.4 — adds Tier 1 metadata parsing [tags, priority, start/created/done/cancelled dates], Tier 2 views [overdue `O`, group-by cycling `G`], the `✅` done-date stamp on toggle [ADR-0012], the `❌` cancelled-date stamp on cancel [ADR-0013], the `➕` quick-add inbox creation [ADR-0014], the `o` open-in-Obsidian deep-link gesture [ADR-0015], the `i` in-progress toggle gesture [ADR-0016], and the `taski-skip` frontmatter opt-out [ADR-0017]; user-configurable TUI theming + per-panel density knobs [ADR-0018], followed by a global `bold` style toggle [off by default — color contrast carries emphasis] and a finer note-grouping split [`folder+note` / `note` / `folder`], and the `n` add-note task-annotation gesture [grouped `## task-notes` section + aliased in-page link, ADR-0019], and the `m` move-mode task-reordering gesture [TUI-local reorder committed as one in-note line-content permutation, ADR-0020]; 421 tests across 6 crates).*
+*Onboarding guide for new engineers. Last updated: 2026-06-24 (post-v0.4 — adds Tier 1 metadata parsing [tags, priority, start/created/done/cancelled dates], Tier 2 views [overdue `O`, group-by cycling `G`], the `✅` done-date stamp on toggle [ADR-0012], the `❌` cancelled-date stamp on cancel [ADR-0013], the `➕` quick-add inbox creation [ADR-0014], the `o` open-in-Obsidian deep-link gesture [ADR-0015], the `i` in-progress toggle gesture [ADR-0016], and the `taski-skip` frontmatter opt-out [ADR-0017]; user-configurable TUI theming + per-panel density knobs [ADR-0018], followed by a global `bold` style toggle [off by default — color contrast carries emphasis] and a finer note-grouping split [`folder+note` / `note` / `folder`], and the `n` add-note task-annotation gesture [grouped `## task-notes` section + aliased in-page link, ADR-0019], and the `m` move-mode task-reordering gesture [TUI-local reorder committed as one in-note line-content permutation, ADR-0020], and the `A` archive-completed gesture [copy-then-delete move of a note's done/cancelled tasks into a designated archive note, ADR-0021]; 439 tests across 6 crates).*
 
 This document is the "operating manual" for working on Taski: what it is, how it's
 built, the decisions that are load-bearing (and must not be casually undone), and the
@@ -42,11 +42,11 @@ Cargo workspace, edition 2024, six crates. Dependencies point downward only (no 
 
 | Crate | Responsibility | Key file(s) |
 |---|---|---|
-| `taski-core` | **Pure** domain: `Task`/`Status`/`Priority` types, the Markdown parser (`parse_tasks`, fence-aware), emoji extraction (`extract_due_date` 📅/📆/🗓, `extract_scheduled_date` ⏳, `extract_start_date` 🛫, `extract_created_date` ➕, `extract_done_date` ✅, `extract_cancelled_date` ❌ — all via shared `extract_emoji_date`; plus `extract_priority` 🔺/⏫/🔼/🔽/⏬ and `extract_tags` `#tag`), the pure `rewrite_scheduled` line-rewrite oracle (ADR-0009 Phase 2), `inbox_line_for` construction oracle (ADR-0014), the task-note oracles `insert_notes_link`/`notes_link_id`/`note_bullet_for` (ADR-0019), the pure `permute_lines` reorder oracle (ADR-0020), and pure `ymd_from_unix` (today's date, no date crate). No FS, no I/O, no deps on other taski crates. | `crates/taski-core/src/lib.rs` |
-| `taski-config` | TOML config loading (`~/.config/taski/config.toml`) + CLI→config→default precedence + the `template()` renderer for `--init-config`. Fields include `exclude_dirs` for skipping vault subdirectory trees, `inbox_path` for the quick-add target note (ADR-0014), and `obsidian_vault`/`use_advanced_uri` for the open-in-Obsidian deep link (ADR-0015), and `ThemeConfig`/`UiConfig` for TUI theming and per-panel density (ADR-0018). Keeps FS/TOML out of `taski-core`. | `crates/taski-config/src/lib.rs` |
+| `taski-core` | **Pure** domain: `Task`/`Status`/`Priority` types, the Markdown parser (`parse_tasks`, fence-aware), emoji extraction (`extract_due_date` 📅/📆/🗓, `extract_scheduled_date` ⏳, `extract_start_date` 🛫, `extract_created_date` ➕, `extract_done_date` ✅, `extract_cancelled_date` ❌ — all via shared `extract_emoji_date`; plus `extract_priority` 🔺/⏫/🔼/🔽/⏬ and `extract_tags` `#tag`), the pure `rewrite_scheduled` line-rewrite oracle (ADR-0009 Phase 2), `inbox_line_for` construction oracle (ADR-0014), the task-note oracles `insert_notes_link`/`notes_link_id`/`note_bullet_for` (ADR-0019), the pure `permute_lines` reorder oracle (ADR-0020), the pure `remove_lines`/`extract_lines` archive oracles (ADR-0021), and pure `ymd_from_unix` (today's date, no date crate). No FS, no I/O, no deps on other taski crates. | `crates/taski-core/src/lib.rs` |
+| `taski-config` | TOML config loading (`~/.config/taski/config.toml`) + CLI→config→default precedence + the `template()` renderer for `--init-config`. Fields include `exclude_dirs` for skipping vault subdirectory trees, `inbox_path` for the quick-add target note (ADR-0014), `archive_path` for the archive-completed target note (ADR-0021), and `obsidian_vault`/`use_advanced_uri` for the open-in-Obsidian deep link (ADR-0015), and `ThemeConfig`/`UiConfig` for TUI theming and per-panel density (ADR-0018). Keeps FS/TOML out of `taski-core`. | `crates/taski-config/src/lib.rs` |
 | `taski-db` | The canonical SQLite schema, `open()` (WAL + schema + dir creation), and all read/write APIs (`all_tasks`, `reconcile_note`, `enqueue_action` / `enqueue_set_scheduled` / `enqueue_bullet_toggle`, `pending_actions`, `prune_old_actions`, `delete_tasks_for_excluded_dirs`, …). Owns `tasks` + `pending_actions` + `note_contents`. | `crates/taski-db/src/lib.rs` |
-| `taski-daemon` | The watcher/scanner + **sole writer to the vault**: the reusable engine `run_daemon(opts, shutdown, lock)`, plus `scan_vault`, `index_note`, `process_action` (checkbox flips) / `process_metadata_action` (`⏳` writes) / `process_bullet_action` (checkbox↔bullet toggle) / `process_quick_add` (inbox append, ADR-0014) / `process_add_note` (task-note append + first-note link insertion, ADR-0019) / `process_reorder` (in-note line-content permutation, ADR-0020) — all reuse `atomic_write` (ADR-0009/0011/0019/0020), the watch loop; the `ShutdownSignal`/`ShutdownHandle` pair; and the `flock` single-writer lock (`DaemonLockGuard`/`acquire_daemon_lock`/`LockOutcome`). The drain loop dispatches on `pending_actions.action_type`. Also handles `exclude_dirs` purge + filtered scanning. **lib + bin** — a `taski-daemon` binary *and* the library the unified launcher depends on. | `crates/taski-daemon/src/{lib,main,shutdown,lock}.rs`, `tests/` |
-| `taski-tui` | The `ratatui` client: polls the index, groups by folder+note/note/tag/priority/folder (`G` cycling), filters (status-cycle `f`, Today view `T`, Overdue `O`, text search `/`, file search `F`), renders, submits toggle (`Space`) / mark-for-today (`t`) / bullet toggle (`b`) / quick-add (`a`) / add-note (`n`, ADR-0019) / reorder (`m` move mode, ADR-0020) / undo (`u`) actions, shows the context pane via the cached `note_contents` table, and opens the selected task's note in Obsidian via an `obsidian://` deep link (`o`, ADR-0015 — the TUI's first `std::process::Command` spawn). Never touches vault files. **lib + bin** — public entry points `run()` / `run_with_db(db)` / `run_combined(db, quit_hook)`; `main.rs` is a thin shim. Key internal modules: `App` (state machine), `build_view` (filter pipeline + HashMap grouping), `draw` (render), `run_loop` (input), `theme.rs` for the `Theme` + `LayoutPrefs` types resolved from config (ADR-0018). | `crates/taski-tui/src/{lib,main}.rs` |
+| `taski-daemon` | The watcher/scanner + **sole writer to the vault**: the reusable engine `run_daemon(opts, shutdown, lock)`, plus `scan_vault`, `index_note`, `process_action` (checkbox flips) / `process_metadata_action` (`⏳` writes) / `process_bullet_action` (checkbox↔bullet toggle) / `process_quick_add` (inbox append, ADR-0014) / `process_add_note` (task-note append + first-note link insertion, ADR-0019) / `process_reorder` (in-note line-content permutation, ADR-0020) / `process_archive` (copy-then-delete move of completed tasks to the archive note, ADR-0021) — all reuse `atomic_write`/`atomic_create` (ADR-0009/0011/0019/0020/0021), the watch loop; the `ShutdownSignal`/`ShutdownHandle` pair; and the `flock` single-writer lock (`DaemonLockGuard`/`acquire_daemon_lock`/`LockOutcome`). The drain loop dispatches on `pending_actions.action_type`. Also handles `exclude_dirs` purge + filtered scanning. **lib + bin** — a `taski-daemon` binary *and* the library the unified launcher depends on. | `crates/taski-daemon/src/{lib,main,shutdown,lock}.rs`, `tests/` |
+| `taski-tui` | The `ratatui` client: polls the index, groups by folder+note/note/tag/priority/folder (`G` cycling), filters (status-cycle `f`, Today view `T`, Overdue `O`, text search `/`, file search `F`), renders, submits toggle (`Space`) / mark-for-today (`t`) / bullet toggle (`b`) / quick-add (`a`) / add-note (`n`, ADR-0019) / reorder (`m` move mode, ADR-0020) / archive (`A`, ADR-0021) / undo (`u`) actions, shows the context pane via the cached `note_contents` table, and opens the selected task's note in Obsidian via an `obsidian://` deep link (`o`, ADR-0015 — the TUI's first `std::process::Command` spawn). Never touches vault files. **lib + bin** — public entry points `run()` / `run_with_db(db)` / `run_combined(db, quit_hook)`; `main.rs` is a thin shim. Key internal modules: `App` (state machine), `build_view` (filter pipeline + HashMap grouping), `draw` (render), `run_loop` (input), `theme.rs` for the `Theme` + `LayoutPrefs` types resolved from config (ADR-0018). | `crates/taski-tui/src/{lib,main}.rs` |
 | `taski` | The **unified launcher** binary: runs the daemon (background thread) + TUI (main thread) together by default (`taski`), or either alone via `taski daemon` / `taski tui` subcommands. Attach-or-spawn + single-writer lock (ADRs 0007/0008). | `crates/taski/src/main.rs` |
 
 Supporting: `docs/` (PRD, tech, ADRs, setup, code reviews under `docs/cr/`, this file), `scripts/install-launchd.sh`
@@ -269,6 +269,7 @@ filter predicates within each bucket and emits `Header` + `Task` rows.
 | `a` | Quick-add: open text-entry modal; type task text, Enter appends `- [ ] <text> ➕ <today>` to the inbox note (`u` to undo) [ADR-0014] |
 | `n` | Add note: open text-entry modal; type a closing note, Enter appends it as a bullet under the task's `### notes-<id>` heading in a `## task-notes` section in the task's own note, and (first note only) inserts an aliased in-page link `[[#notes-<id>\|Notes]]` into the task line. No undo [ADR-0019] |
 | `m` | Move mode: enter on the selected task (flat single-note groups only), then `j`/`k`/`↑`/`↓` bubble it within its note; `Enter` commits the new order as one `reorder` write, `Esc` restores the original order. TUI-local until commit; index refresh suspended while moving. No undo in v1 [ADR-0020] |
+| `A` | Archive: move every completed (`[x]` done / `[-]` cancelled) flat task in the selected task's note out to the archive note (default `task-archive.md`, created if missing) in one keypress. Copy-then-delete: appends to the archive, then removes from the source. Flat-only; no undo in v1 [ADR-0021] |
 | `u` | Undo the last checkbox flip (incl. cancel), bullet toggle, or quick-add action |
 | `/` | Open text search prompt (matches `task.text`, case-insensitive) |
 | `F` | Open file/path search prompt (matches `task.note_path`) |
@@ -327,12 +328,14 @@ dropped+recreated and the index rebuilds from the vault.
 
 **`pending_actions`** — the TUI→daemon command queue. Lifecycle `pending → done | failed`.
 Each row carries `task_id`, an `action_type` (`checkbox`, `set_scheduled`, `toggle_bullet`,
-`undo`, `quick_add`, `quick_add_undo`, `add_note`, or `reorder`), and a `payload` (NULL for checkbox flips; the desired
+`undo`, `quick_add`, `quick_add_undo`, `add_note`, `reorder`, or `archive`), and a `payload` (NULL for checkbox flips; the desired
 date / NULL-to-unmark for `set_scheduled`; the prior checkbox char for undo; the task text for
 `quick_add`/`quick_add_undo` (with `note_path` = inbox path, `task_id` = 0 sentinel); the note text for
-`add_note` (ADR-0019; `task_id`/`note_path`/`line_number` identify the annotated task); and a comma-separated
+`add_note` (ADR-0019; `task_id`/`note_path`/`line_number` identify the annotated task); a comma-separated
 list of the involved task lines' 1-based line numbers in their new top-to-bottom order for `reorder` (ADR-0020;
-`task_id` = the moved anchor task, `note_path` = the note)). Checkbox rows
+`task_id` = the moved anchor task, `note_path` = the note); and `"<archive_rel>\t<l1,l2,…>"` — the archive
+destination tab-separated from the completed lines to move — for `archive` (ADR-0021; `note_path` = the
+source note, `task_id` = the first completed task as the hash anchor)). Checkbox rows
 also hold `expected_char`/`new_char`; date-action rows leave them empty and the daemon dispatches
 on `action_type`. On failure an `error` is recorded. Resolved rows older than 7 days are pruned
 on daemon startup (`ACTION_RETENTION_SECS`).
@@ -369,7 +372,7 @@ understanding the failure mode it prevents.**
    itself (`[ ]`→`[x]` stamps `✅ <today>`, `[x]`→`[ ]` clears it) — no new action type, no
    new gesture. Both amendments admit tokens under the unchanged grammar-provability gate:
    standard syntax + single insertion grammar + pure proptested oracle. Free-text edits and
-   creates/deletes remain rejected (arbitrary-note creation and mid-note insertion remain rejected; bounded append-only creation to a designated inbox was admitted by ADR-0014).
+   free-text edits remain rejected (arbitrary-note creation and mid-note insertion remain rejected; bounded append-only creation to a designated inbox was admitted by ADR-0014, and bounded deletion — only as the second half of a durable archival copy — by ADR-0021).
 
 4. **Refuse-on-conflict, never last-write-wins** ([ADR-0004](./adr/0004-refuse-on-conflict.md))
    — before renaming, re-read the note and re-hash; if it changed since scan, *refuse*
@@ -553,6 +556,25 @@ the frontmatter grammar is a load-bearing contract future parsing must respect.
     note** (the index refresh is suspended while moving so it can't clobber the local reorder). **No undo
     in v1** (re-enter move mode to revert) — though reorder is cleanly invertible. Replay-safe: a crash
     between write and resolve refuses on hash mismatch rather than double-applying.
+
+21. **Archive completed tasks — bounded archival (move by copy-then-delete)** ([ADR-0021](./adr/0021-archive-completed-tasks.md)) —
+    the `A` key moves every completed (`[x]` done / `[-]` cancelled) flat task in the selected task's note
+    into a designated archive note (default `task-archive.md`, created if missing) in one keypress. The
+    daemon's `process_archive` is **copy-then-delete**: **Phase A** durably appends the lines verbatim to
+    the archive (the ADR-0014 append-only creation gate, first-creation path for a missing archive), **then
+    Phase B** removes exactly those lines from the source via the pure `taski_core::remove_lines` oracle
+    (the deletion analogue of `permute_lines`) under the ADR-0004 TOCTOU guard, gated by the source's cached
+    `note_hash` (ADR-0006). Copying before deleting makes the only failure mode a recoverable duplicate
+    (the task in both files) — never a loss. Survivors keep their `text_hash` identity (ADR-0005,
+    **untouched**); archived tasks get fresh ids under the archive note. Opens a **fourth new gate class**
+    (bounded archival) — Taski's **first line deletion** and **first cross-note operation** — and **revokes**
+    the "deletion remain rejected" clause in ADRs 0014/0020 and the "cross-note movement remain rejected"
+    clause in ADR-0020, **bounded to archival**. New `archive` action_type (anchor/sentinel columns + a
+    tab-encoded payload, no schema bump). **v1 is flat-only** (notes with nested tasks refuse) and
+    **single-note**. **No undo in v1** (a recorded planned feature — archival is invertible). Cross-file
+    atomicity is impossible, so it is not transactional: a crash between Phase A and B can duplicate into
+    the archive (Phase B replay refuses on hash mismatch); the gate is "delete only what was durably copied
+    first."
 
 ---
 

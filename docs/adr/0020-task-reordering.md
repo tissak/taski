@@ -1,6 +1,6 @@
 # ADR-0020: Task reordering — a TUI-local move mode that commits a single in-note line-content permutation
 
-- **Status:** Accepted
+- **Status:** Accepted (the "deletion" and "cross-note movement remain rejected" clauses in this ADR's gate boundary were **revoked 2026-06-24 by [ADR-0021](./0021-archive-completed-tasks.md)** — bounded to its copy-then-delete archival operation, which reuses this ADR's whole-note-rewrite oracle pattern, flat-only eligibility, and replay-refuses property; this ADR's structural-reordering gate is otherwise unchanged)
 - **Date:** 2026-06-24
 - **Decides:** How Taski lets the user reorder tasks within a note from the TUI — an `m`-key "move mode" in which `j`/`k` (or `↑`/`↓`) bubble the selected task up/down among the other tasks in its note, `Enter` commits the new order as a single `reorder` write, and `Esc` cancels (restoring the original order). v1 is **flat-only**: move mode is offered only when the selected task's note has no nested (indented) tasks. **Amends [ADR-0003](./0003-checkbox-only-mvp.md)** for a sixth time and opens a **third gate class** — bounded structural reordering — and **revokes the "reordering remain rejected" clause** carried in the ADR-0014 and ADR-0019 gate boundaries.
 

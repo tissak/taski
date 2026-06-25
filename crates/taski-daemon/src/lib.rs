@@ -596,6 +596,11 @@ pub enum ApplyOutcome {
     /// task line, or the list is malformed/duplicated. Refused (defensive; the
     /// cached-hash guard should normally preclude it).
     ReorderInconsistent,
+    /// ADR-0021: an `archive` action's payload is inconsistent — malformed, the
+    /// archive path equals the source, or a listed line is not a flat closed
+    /// (`[x]`/`[-]`) task line in the source. Refused (defensive; the cached-hash
+    /// guard should normally preclude it).
+    ArchiveInconsistent,
 }
 
 /// Process every currently-pending action to completion, resolving each (`done` on
@@ -635,6 +640,13 @@ pub fn process_pending_actions(conn: &Connection, vault_root: &Path) -> Result<(
                 // write of the pure `permute_lines` result; needs `conn` to resolve
                 // the anchor task row + cached note hash.
                 "reorder" => process_reorder(conn, vault_root, action),
+                // ADR-0021: archive — move every completed (`[x]`/`[-]`) flat task
+                // line out of the source note and into the archive note, by durably
+                // copying the lines into the archive (Phase A, the ADR-0014 append
+                // gate) and then deleting them from the source (Phase B). Needs
+                // `conn` to resolve the anchor row + cached hash and to re-index the
+                // archive note (the drain loop re-indexes the source on `Applied`).
+                "archive" => process_archive(conn, vault_root, action),
                 // Unknown action_type: refuse with a distinct, accurate message.
                 // (NOT the checkbox `new_char` phrasing — there is no `new_char`
                 // here; this is an unrecognized write gesture.)
@@ -703,6 +715,9 @@ pub fn process_pending_actions(conn: &Connection, vault_root: &Path) -> Result<(
                         }
                         ApplyOutcome::ReorderInconsistent => {
                             "reorder no longer matches the note's task lines; action not applied"
+                        }
+                        ApplyOutcome::ArchiveInconsistent => {
+                            "archive no longer matches the note's completed task lines; action not applied"
                         }
                         ApplyOutcome::Applied => unreachable!(),
                     };
@@ -1521,6 +1536,176 @@ pub fn process_reorder(
         }
         WriteResult::Conflict => Ok(ApplyOutcome::ConflictNoteChanged),
     }
+}
+
+/// Execute one pending `archive` action (ADR-0021): move every completed (`[x]`
+/// done / `[-]` cancelled) flat task line named in the payload out of the source
+/// note and into the archive note. **Copy-then-delete**, two phases:
+///
+/// - **Phase A** durably appends the lines (verbatim) to the archive — the ADR-0014
+///   append-only creation gate, with [`atomic_create`]'s first-creation path when
+///   the archive does not yet exist.
+/// - **Phase B** removes exactly those lines from the source via the pure
+///   [`taski_core::remove_lines`] oracle under the ADR-0004 TOCTOU guard, gated by
+///   the source's ADR-0006 cached note hash.
+///
+/// Copying before deleting makes the only failure mode a recoverable duplicate (the
+/// task lands in both files) — never a loss. On success the archive note is
+/// re-indexed here; the drain loop re-indexes the source (`action.note_path`).
+pub fn process_archive(
+    conn: &Connection,
+    vault_root: &Path,
+    action: &PendingAction,
+) -> Result<ApplyOutcome> {
+    // 1. Anchor row (a claim, re-verified below) — same id→location fallback the
+    //    other processors use in case the surrogate id churned.
+    let row = match lookup_task_for_action(conn, action.task_id)? {
+        Some(row) => row,
+        None => match lookup_task_by_location(conn, &action.note_path, action.line_number)? {
+            Some(row) => row,
+            None => return Ok(ApplyOutcome::TaskNotFound),
+        },
+    };
+
+    // 2. Read the SOURCE note fresh.
+    let source_abs = vault_root.join(&row.note_path);
+    let source_bytes = match fs::read(&source_abs) {
+        Ok(b) => b,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(ApplyOutcome::TaskNotFound),
+        Err(e) => return Err(e).with_context(|| format!("reading note {source_abs:?}")),
+    };
+
+    // 3. Authoritative conflict check on the source via the cached note hash
+    //    (ADR-0006 + ADR-0004). Mismatch → refuse; nothing is touched.
+    let snapshot_hash = content_hash(&source_bytes);
+    if Some(&snapshot_hash) != row.note_hash.as_ref() {
+        return Ok(ApplyOutcome::ConflictNoteChanged);
+    }
+
+    // 4. Decode (Obsidian notes are UTF-8).
+    let source_content = match String::from_utf8(source_bytes) {
+        Ok(s) => s,
+        Err(_) => return Ok(ApplyOutcome::TaskLineMismatch),
+    };
+
+    // 5. Parse the payload: `"<archive_rel>\t<l1,l2,...>"`.
+    let Some((archive_rel, lines)) = parse_archive_payload(action.payload.as_deref()) else {
+        return Ok(ApplyOutcome::ArchiveInconsistent);
+    };
+    // A note cannot be its own archive (would re-append its own lines then delete).
+    if archive_rel == row.note_path {
+        return Ok(ApplyOutcome::ArchiveInconsistent);
+    }
+
+    // 6. Defensive validation: every listed line must be a flat (indent == 0)
+    //    *closed* (`[x]`/`[-]`) checkbox task in the source. (The hash guard should
+    //    already imply this; re-check rather than trust the payload.)
+    let closed_flat: std::collections::HashSet<usize> =
+        taski_core::parse_tasks(&source_content, &row.note_path)
+            .into_iter()
+            .filter(|t| t.indent == 0 && is_closed_task(t))
+            .map(|t| t.line_number)
+            .collect();
+    if !lines.iter().all(|ln| closed_flat.contains(ln)) {
+        return Ok(ApplyOutcome::ArchiveInconsistent);
+    }
+
+    // 7. Extract the verbatim block to archive (line contents, terminators stripped).
+    let block = taski_core::extract_lines(&source_content, &lines);
+
+    // ── Phase A: durably copy the block into the archive (ADR-0014 gate) ──────
+    let archive_abs = vault_root.join(&archive_rel);
+    match fs::read(&archive_abs) {
+        Ok(archive_bytes) => {
+            // Existing archive: append under the full TOCTOU guard.
+            let archive_hash = content_hash(&archive_bytes);
+            let archive_content = String::from_utf8(archive_bytes)
+                .with_context(|| format!("archive {archive_rel:?} is not valid UTF-8"))?;
+            let new_archive = append_archived_block(&archive_content, &block);
+            match atomic_write(&archive_abs, new_archive.as_bytes(), &archive_hash)? {
+                WriteResult::Written => {}
+                // Archive changed concurrently → abort; the SOURCE is untouched.
+                WriteResult::Conflict => return Ok(ApplyOutcome::ConflictNoteChanged),
+            }
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            // First-creation: no TOCTOU (a non-existent file has no state to
+            // conflict with — the bounded ADR-0014 exception).
+            let new_archive = append_archived_block("", &block);
+            atomic_create(&archive_abs, new_archive.as_bytes())?;
+        }
+        Err(e) => return Err(e).with_context(|| format!("reading archive {archive_rel:?}")),
+    }
+
+    // ── Phase B: delete the moved lines from the source (ADR-0004 TOCTOU) ─────
+    let new_source = taski_core::remove_lines(&source_content, &lines);
+    match atomic_write(&source_abs, new_source.as_bytes(), &snapshot_hash)? {
+        WriteResult::Written => {
+            // Re-index the archive here (the drain loop re-indexes the source).
+            if let Err(e) = index_note(conn, &archive_abs, vault_root) {
+                tracing::warn!(
+                    archive = %archive_rel, err = %e,
+                    "post-archive re-index of archive note failed; action still done"
+                );
+            }
+            tracing::info!(
+                source = %row.note_path, archive = %archive_rel, count = lines.len(),
+                "archived completed tasks"
+            );
+            Ok(ApplyOutcome::Applied)
+        }
+        // Source changed in the read→write window; the archive copy already landed,
+        // so the tasks sit in both files (no loss). Refuse the delete; retry later.
+        WriteResult::Conflict => Ok(ApplyOutcome::ConflictNoteChanged),
+    }
+}
+
+/// True iff a task is **closed** for archival (ADR-0021): `[x]`/`[X]` done, or `[-]`
+/// cancelled (modeled as `Status::Other("-")`, detected via the raw checkbox char).
+/// Open (`[ ]`) and in-progress (`[/]`) tasks are not closed and never archived.
+fn is_closed_task(t: &taski_core::Task) -> bool {
+    matches!(t.status, taski_core::Status::Done) || t.raw_checkbox_char == "-"
+}
+
+/// Append the archived `block` (line contents, no terminators) to `content`, each on
+/// its own `\n`-terminated line. Prepends a `\n` if `content` is non-empty and lacks
+/// a trailing newline, so the first archived line always starts on its own line. An
+/// empty `content` (first-creation) yields just the block. The archive append owns
+/// its line endings (LF), independent of the source's (ADR-0021 verbatim append).
+fn append_archived_block(content: &str, block: &[String]) -> String {
+    let mut out = content.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    for line in block {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Parse an `archive` payload (`"<archive_rel>\t<l1,l2,...>"`) into the archive
+/// destination and the 1-based line numbers to move. Returns `None` if the payload
+/// is missing, lacks the tab separator, has an empty archive path, or the line list
+/// is empty / malformed / contains a zero — the caller refuses with
+/// [`ApplyOutcome::ArchiveInconsistent`].
+fn parse_archive_payload(payload: Option<&str>) -> Option<(String, Vec<usize>)> {
+    let (archive, csv) = payload?.split_once('\t')?;
+    if archive.is_empty() {
+        return None;
+    }
+    let mut lines = Vec::new();
+    for part in csv.split(',') {
+        let n: usize = part.trim().parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        lines.push(n);
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some((archive.to_string(), lines))
 }
 
 /// Parse a `reorder` payload (`"3,1,2"`) into 1-based line numbers. Returns `None`

@@ -109,6 +109,9 @@ fn run_inner(db_override: Option<PathBuf>, quit_hook: Option<QuitHook>) -> Resul
     // ADR-0014: resolve the inbox path once (config → default) and thread it
     // into the loop so the `a` key modal knows where to enqueue the write.
     let inbox_path = taski_config::resolve_inbox_path(&cfg);
+    // ADR-0021: resolve the archive path (config → default) and thread it in so the
+    // `A` key knows where to move completed tasks.
+    let archive_path = taski_config::resolve_archive_path(&cfg);
     // Open-in-Obsidian (`o` key): resolve the vault name for `obsidian://` deep
     // links. An explicit `obsidian_vault` override wins; otherwise derive it from
     // the resolved vault path's basename. If no vault is configured at all this is
@@ -150,6 +153,7 @@ fn run_inner(db_override: Option<PathBuf>, quit_hook: Option<QuitHook>) -> Resul
         &conn,
         quit_hook.as_ref(),
         &inbox_path,
+        &archive_path,
         vault_name.as_deref(),
         use_advanced_uri,
         theme,
@@ -274,6 +278,15 @@ impl StatusFilter {
 /// title count in agreement (ADR-0016 follow-on).
 fn is_open_like(status: &Status) -> bool {
     matches!(status, Status::Open | Status::InProgress)
+}
+
+/// ADR-0021: whether a task is **closed** (done or cancelled) and thus archivable by
+/// the `A` gesture. `[x]`/`[X]` is `Status::Done`; `[-]` cancelled is parsed as
+/// `Status::Other("-")`, so it is detected via the raw checkbox char. Open (`[ ]`)
+/// and in-progress (`[/]`) tasks are never archived — the inbox stays focused on
+/// active work.
+fn is_completed(status: &Status, raw_checkbox_char: &str) -> bool {
+    matches!(status, Status::Done) || raw_checkbox_char == "-"
 }
 
 /// Grouping axis cycled with `G`: FolderNote → Note → Tag → Priority → Folder →
@@ -702,6 +715,10 @@ struct App {
     /// `run_inner` via `taski_config::resolve_inbox_path`. Defaults to
     /// `"task-inbox.md"` for tests that construct `App::new()` directly.
     inbox_path: String,
+    /// ADR-0021: the resolved archive path (vault-relative), threaded from
+    /// `run_inner` via `taski_config::resolve_archive_path`. The `A` key moves a
+    /// note's completed tasks here. Defaults to `"task-archive.md"` for tests.
+    archive_path: String,
     /// The Obsidian vault name used for `obsidian://` deep links (the `o` key).
     /// `None` when no vault is resolvable from config (the `o` gesture is then a
     /// logged no-op). Threaded from `run_inner`; defaults to `None` for tests.
@@ -784,6 +801,7 @@ impl App {
             move_task_id: 0,
             move_initial_ids: Vec::new(),
             inbox_path: "task-inbox.md".to_string(),
+            archive_path: "task-archive.md".to_string(),
             vault_name: None,
             use_advanced_uri: false,
             last_action: None,
@@ -1149,6 +1167,65 @@ impl App {
         }
         self.moving = false;
         self.ctx_scroll = 0;
+    }
+
+    /// ADR-0021: archive every completed (`[x]` done / `[-]` cancelled) flat task in
+    /// the selected task's note into the configured archive note (`A` key). One
+    /// `archive` action, one keypress — the copy-then-delete vault write is the
+    /// daemon's job (`enqueue_archive`); the TUI never touches files. Archives all of
+    /// the note's completed tasks regardless of the active status filter. Refused
+    /// (with a notice, no state change) when the cursor isn't on a task, the note has
+    /// nested tasks (flat-only in v1), or the note has no completed tasks.
+    fn archive_completed(&mut self, conn: &Connection) {
+        let Some(note_path) = self.selected_task().map(|t| t.note_path.clone()) else {
+            return;
+        };
+        // Flat-only: a content move can't carry a parent's children (same orphaning
+        // hazard reorder guards against, ADR-0020/0021).
+        if self
+            .tasks
+            .iter()
+            .any(|t| t.note_path == note_path && t.indent != 0)
+        {
+            self.notice = Some(
+                "Archive supports flat task lists only (v1); this note has subtasks".to_string(),
+            );
+            return;
+        }
+        // This note's completed flat task lines, in line order (top-to-bottom).
+        let mut completed: Vec<(i64, usize)> = self
+            .tasks
+            .iter()
+            .filter(|t| {
+                t.note_path == note_path
+                    && t.indent == 0
+                    && is_completed(&t.status, &t.raw_checkbox_char)
+            })
+            .map(|t| (t.id, t.line_number))
+            .collect();
+        completed.sort_by_key(|(_, ln)| *ln);
+        if completed.is_empty() {
+            self.notice = Some("No completed tasks to archive in this note".to_string());
+            return;
+        }
+        let archive = self.archive_path.clone();
+        if archive == note_path {
+            self.notice = Some("Archive path cannot be the source note".to_string());
+            return;
+        }
+        let anchor_id = completed[0].0;
+        let anchor_line = completed[0].1;
+        let lines: Vec<usize> = completed.iter().map(|(_, ln)| *ln).collect();
+        let count = lines.len();
+        let result =
+            db::enqueue_archive(conn, anchor_id, &note_path, anchor_line, &archive, &lines)
+                .context("enqueuing archive");
+        let ok = result.is_ok();
+        // `track_enqueued` clears `notice` on success, so set the confirmation after.
+        self.track_enqueued(result);
+        if ok {
+            self.notice = Some(format!("Archiving {count} completed task(s) → {archive}"));
+        }
     }
 
     /// Re-read the index from the DB, then rebuild the view and poll the resolution
@@ -1603,6 +1680,7 @@ fn run_loop(
     conn: &Connection,
     quit_hook: Option<&QuitHook>,
     inbox_path: &str,
+    archive_path: &str,
     vault_name: Option<&str>,
     use_advanced_uri: bool,
     theme: theme::Theme,
@@ -1612,6 +1690,8 @@ fn run_loop(
     // ADR-0014: thread the resolved inbox path from `run_inner` (which read
     // `Config`). `App::new()` defaults to `"task-inbox.md"` for tests.
     app.inbox_path = inbox_path.to_string();
+    // ADR-0021: thread the resolved archive path (the `A` key's destination).
+    app.archive_path = archive_path.to_string();
     // Open-in-Obsidian (`o` key): thread the resolved vault name + advanced-uri
     // flag from `run_inner`. `App::new()` defaults to `None` / `false` for tests.
     app.vault_name = vault_name.map(|s| s.to_string());
@@ -1806,6 +1886,12 @@ fn run_loop(
                 // files. Suppressed during a search prompt — `m` falls through to
                 // `push_search_char` in the search arms above, like `b`/`a`/`n`.
                 KeyCode::Char('m') => app.start_move(),
+                // ADR-0021 archive: `A` moves every completed (`[x]`/`[-]`) flat task
+                // in the selected task's note into the configured archive note. One
+                // keypress; the copy-then-delete vault write is the daemon's job via
+                // `enqueue_archive`. Suppressed during a search prompt — `A` falls
+                // through to `push_search_char` in the search arms above, like `a`.
+                KeyCode::Char('A') => app.archive_completed(conn),
                 KeyCode::Tab => app.expand_all(),
                 KeyCode::BackTab => app.collapse_all(),
                 // Uppercase J/K scroll the context pane (lowercase j/k move the task list).
@@ -2025,6 +2111,10 @@ fn friendly_failure_reason(error: &str) -> String {
         "the scheduled date on this line couldn't be parsed".to_string()
     } else if e.contains("could not be converted to a bullet") {
         "this line has no checkbox or bullet to toggle".to_string()
+    } else if e.contains("completed task lines") {
+        // ADR-0021: the archive-inconsistent phrase ("archive no longer matches the
+        // note's completed task lines ...").
+        "the completed tasks changed".to_string()
     } else if e.is_empty() {
         "it could not be applied".to_string()
     } else {
@@ -2063,6 +2153,9 @@ fn render_failure_notice(action: &PendingAction) -> String {
         // ADR-0019: add-note (n key). A refused note surfaces "Add note not
         // applied — … Press n to try again".
         "add_note" => ("Add note", "n"),
+        // ADR-0021: archive (A key). A refused archive surfaces "Archive not
+        // applied — … Press A to try again".
+        "archive" => ("Archive", "A"),
         // The default/checkbox path (done-toggle).
         _ => ("Toggle", "Space"),
     };
@@ -2772,6 +2865,7 @@ fn help_popup(theme: &theme::Theme) -> Paragraph<'static> {
             "m",
             "Move mode: reorder within note (Enter place / Esc cancel)",
         ),
+        row("A", "Archive note's completed tasks (→ archive note)"),
         row("o", "Open in Obsidian"),
         Line::raw(""),
         head("Search"),
@@ -3012,6 +3106,87 @@ mod tests {
         assert_eq!(task_row_ids(&app), vec![1, 2, 3], "original order restored");
         // The moved task (id 1) is re-selected at its restored position (row 1).
         assert_eq!(app.state.selected(), Some(1));
+    }
+
+    // ── ADR-0021 archive (A key) ───────────────────────────────────────────
+
+    /// Build an `App` whose single note mixes statuses, expanded, with the first
+    /// task row selected. `specs` is `(id, checkbox_char, line)` in line order.
+    fn app_with_statuses(note: &str, specs: &[(i64, &str, usize)]) -> App {
+        let mut app = App::new();
+        app.tasks = specs
+            .iter()
+            .map(|&(id, raw, ln)| task(id, raw, ln, note))
+            .collect();
+        app.rebuild();
+        app.expand_all();
+        app.state.select(Some(1)); // first task row (row 0 is the header)
+        app
+    }
+
+    #[test]
+    fn archive_completed_enqueues_done_and_cancelled_only() {
+        let conn = db::open(":memory:").unwrap();
+        // open, done, in-progress, cancelled — only [x] and [-] should archive.
+        let mut app = app_with_statuses(
+            "task-inbox.md",
+            &[(1, " ", 1), (2, "x", 2), (3, "/", 3), (4, "-", 4)],
+        );
+        app.archive_completed(&conn);
+
+        let pending = db::pending_actions(&conn).unwrap();
+        assert_eq!(pending.len(), 1);
+        let a = &pending[0];
+        assert_eq!(a.action_type, "archive");
+        assert_eq!(a.note_path, "task-inbox.md", "source note");
+        // Lines 2 ([x]) and 4 ([-]) move; payload = "<archive>\t2,4".
+        assert_eq!(a.payload.as_deref(), Some("task-archive.md\t2,4"));
+        assert_eq!(a.task_id, 2, "anchor is the first completed task");
+        assert_eq!(a.line_number, 2, "anchor line");
+        assert!(app.notice.as_deref().unwrap().contains("Archiving 2"));
+    }
+
+    #[test]
+    fn archive_completed_noop_when_nothing_completed() {
+        let conn = db::open(":memory:").unwrap();
+        let mut app = app_with_statuses("task-inbox.md", &[(1, " ", 1), (2, "/", 2)]);
+        app.archive_completed(&conn);
+        assert!(
+            db::pending_actions(&conn).unwrap().is_empty(),
+            "no completed tasks → nothing enqueued"
+        );
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("No completed tasks")
+        );
+    }
+
+    #[test]
+    fn archive_completed_refused_on_note_with_subtasks() {
+        let conn = db::open(":memory:").unwrap();
+        let mut app = App::new();
+        // An open parent (visible under the default Open filter, so it can be
+        // selected) with a nested done child makes the note non-flat.
+        let mut child = task(2, "x", 2, "task-inbox.md");
+        child.indent = 4;
+        app.tasks = vec![task(1, " ", 1, "task-inbox.md"), child];
+        app.rebuild();
+        app.expand_all();
+        app.state.select(Some(1));
+
+        app.archive_completed(&conn);
+        assert!(
+            db::pending_actions(&conn).unwrap().is_empty(),
+            "flat-only: a note with subtasks refuses archive"
+        );
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("flat task lists only")
+        );
     }
 
     #[test]

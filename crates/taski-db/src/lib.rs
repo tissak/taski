@@ -664,6 +664,43 @@ pub fn enqueue_reorder(
     Ok(conn.last_insert_rowid())
 }
 
+/// ADR-0021: enqueue an `archive` action that moves the completed (`[x]`/`[-]`) flat
+/// task lines `lines` (1-based, top-to-bottom) out of `source_note` and into
+/// `archive_path` (both vault-relative). `anchor_task_id`/`anchor_line` identify a
+/// task in the source note whose cached note hash (ADR-0006) gates the deletion.
+/// The `payload` tab-separates the archive destination from the comma-separated line
+/// numbers (no schema change — anchor/sentinel values in the existing columns, per
+/// ADR-0014/0019/0020).
+pub fn enqueue_archive(
+    conn: &Connection,
+    anchor_task_id: i64,
+    source_note: &str,
+    anchor_line: usize,
+    archive_path: &str,
+    lines: &[usize],
+) -> rusqlite::Result<i64> {
+    let csv = lines
+        .iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let payload = format!("{archive_path}\t{csv}");
+    conn.execute(
+        "INSERT INTO pending_actions
+            (task_id, note_path, line_number, expected_char, new_char, state,
+             created_at, action_type, payload)
+         VALUES (?1, ?2, ?3, '', '', 'pending', ?4, 'archive', ?5)",
+        rusqlite::params![
+            anchor_task_id,
+            source_note,
+            anchor_line as i64,
+            unix_now(),
+            payload
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
 /// All actions still awaiting processing, oldest first.
 pub fn pending_actions(conn: &Connection) -> rusqlite::Result<Vec<PendingAction>> {
     let mut stmt = conn.prepare(
@@ -1333,6 +1370,31 @@ mod tests {
         );
         assert_eq!(a.expected_char, "", "unused for reorder");
         assert_eq!(a.new_char, "", "unused for reorder");
+        assert_eq!(a.state, "pending");
+    }
+
+    /// ADR-0021: `enqueue_archive` round-trips with the anchor task in `task_id`,
+    /// the source note in `note_path`, and the archive destination tab-separated
+    /// from the comma-separated line numbers in `payload`.
+    #[test]
+    fn enqueue_archive_round_trips() {
+        let conn = open(":memory:").unwrap();
+
+        let id = enqueue_archive(&conn, 4, "task-inbox.md", 2, "task-archive.md", &[2, 5]).unwrap();
+
+        let pending = pending_actions(&conn).unwrap();
+        let a = pending.iter().find(|a| a.id == id).unwrap();
+        assert_eq!(a.action_type, "archive");
+        assert_eq!(a.task_id, 4, "anchor task id");
+        assert_eq!(a.note_path, "task-inbox.md", "source note");
+        assert_eq!(a.line_number, 2, "anchor line");
+        assert_eq!(
+            a.payload.as_deref(),
+            Some("task-archive.md\t2,5"),
+            "archive path + lines in payload"
+        );
+        assert_eq!(a.expected_char, "", "unused for archive");
+        assert_eq!(a.new_char, "", "unused for archive");
         assert_eq!(a.state, "pending");
     }
 

@@ -123,6 +123,10 @@ pub struct Config {
     /// (`a` key) appends to. Defaults to `"task-inbox.md"` via
     /// [`resolve_inbox_path`]. `None` = default.
     pub inbox_path: Option<String>,
+    /// ADR-0021: path (relative to vault root) of the archive note that the
+    /// archive gesture (`A` key) moves completed tasks into. Defaults to
+    /// `"task-archive.md"` via [`resolve_archive_path`]. `None` = default.
+    pub archive_path: Option<String>,
     /// Optional override of the vault name used for `obsidian://` deep links (the
     /// `o` TUI key). Defaults to the basename of [`Config::vault`]. Set this only
     /// if the Obsidian-registered vault name differs from the vault folder name.
@@ -238,6 +242,16 @@ pub fn resolve_inbox_path(cfg: &Config) -> String {
         .to_string()
 }
 
+/// ADR-0021: resolve the archive path (relative to vault root) from the config,
+/// falling back to the compiled default `"task-archive.md"`. Never errors. Mirrors
+/// [`resolve_inbox_path`]; the archive note is created on first use by the daemon.
+pub fn resolve_archive_path(cfg: &Config) -> String {
+    cfg.archive_path
+        .as_deref()
+        .unwrap_or("task-archive.md")
+        .to_string()
+}
+
 /// Render a ready-to-use config file body for `taski-daemon --init-config`. If `vault`
 /// is given it is baked in as an active key; otherwise a commented placeholder is
 /// emitted so the user knows to fill it in. `db` is always written (the caller
@@ -263,6 +277,11 @@ pub fn template(vault: Option<&str>, db: &str) -> String {
          # ADR-0014: inbox note for the quick-add (`a` key) feature. Appends\n\
          # `- [ ] <text> ➕ <today>` here. Defaults to \"task-inbox.md\".\n\
          # inbox_path = \"task-inbox.md\"\n\
+         \n\
+         # ADR-0021: archive note for the archive-completed (`A` key) gesture. Moves\n\
+         # done/cancelled tasks out of the working note into here. Defaults to\n\
+         # \"task-archive.md\". Created on first use.\n\
+         # archive_path = \"task-archive.md\"\n\
          \n\
          # Optional: override the vault name used for `obsidian://` deep links (the `o` TUI key).\n\
          # Defaults to the basename of `vault`. Set this only if your Obsidian-registered vault\n\
@@ -361,6 +380,7 @@ mod tests {
             db: None,
             exclude_dirs: vec![],
             inbox_path: None,
+            archive_path: None,
             obsidian_vault: None,
             use_advanced_uri: false,
             theme: None,
@@ -377,6 +397,7 @@ mod tests {
             db: None,
             exclude_dirs: vec![],
             inbox_path: None,
+            archive_path: None,
             obsidian_vault: None,
             use_advanced_uri: false,
             theme: None,
@@ -402,6 +423,7 @@ mod tests {
             db: Some("/from/config.db".into()),
             exclude_dirs: vec![],
             inbox_path: None,
+            archive_path: None,
             obsidian_vault: None,
             use_advanced_uri: false,
             theme: None,
@@ -420,6 +442,7 @@ mod tests {
             db: Some("/from/config.db".into()),
             exclude_dirs: vec![],
             inbox_path: None,
+            archive_path: None,
             obsidian_vault: None,
             use_advanced_uri: false,
             theme: None,
