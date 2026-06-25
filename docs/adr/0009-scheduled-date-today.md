@@ -1,6 +1,6 @@
 # ADR-0009: Scheduled-date metadata + "mark for today"
 
-- **Status:** Accepted
+- **Status:** Accepted (Phase 1 §5 "Today" view scope amended 2026-06-25 by [ADR-0022](./0022-today-view-includes-due-today.md) — widened from scheduled-only to scheduled-or-due == today; read-path only, Phase 2 write path untouched)
 - **Date:** 2026-06-20
 - **Decides:** How Taski surfaces and sets the Obsidian Tasks-plugin "scheduled" date (`⏳`), and the "mark a task for today" triage gesture. **Amends [ADR-0003](./0003-checkbox-only-mvp.md)** (write-back scope) for the Phase 2 write path.
 

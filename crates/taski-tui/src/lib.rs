@@ -458,11 +458,11 @@ impl DisplayRow {
 /// Headers always carry the true open/total counts (from the full group, ignoring the
 /// filter); task rows are emitted only when the group is expanded.
 ///
-/// `today_only` (ADR-0009 Phase 1) adds an orthogonal, stricter predicate on top of
-/// `filter`: when true, only tasks whose `scheduled_date == Some(today)` are visible.
-/// It is kept independent of `filter` (today-ness vs open/done) so the two compose —
-/// e.g. `today_only + Open` = today's open work. `today` is a `YYYY-MM-DD` string; it
-/// is only consulted when `today_only` is true.
+/// `today_only` (ADR-0009 Phase 1, widened by ADR-0022) adds an orthogonal, stricter
+/// predicate on top of `filter`: when true, only tasks whose `scheduled_date == today`
+/// OR `due_date == today` are visible. It is kept independent of `filter` (today-ness
+/// vs open/done) so the two compose — e.g. `today_only + Open` = today's open work.
+/// `today` is a `YYYY-MM-DD` string; it is only consulted when `today_only` is true.
 ///
 /// `overdue_only` adds a fifth orthogonal predicate: when true, only tasks whose
 /// `due_date` is set and strictly before `today` are visible. A task with no
@@ -489,8 +489,11 @@ fn build_view(
     overdue_only: bool,
     group_by: GroupBy,
 ) -> Vec<DisplayRow> {
-    let scheduled_today =
-        |t: &Task| -> bool { !today_only || t.scheduled_date.as_deref() == Some(today) };
+    let matches_today = |t: &Task| -> bool {
+        !today_only
+            || t.scheduled_date.as_deref() == Some(today)
+            || t.due_date.as_deref() == Some(today)
+    };
     let matches_search = |t: &Task| -> bool {
         search_query.is_empty() || t.text.to_lowercase().contains(&search_query.to_lowercase())
     };
@@ -504,7 +507,7 @@ fn build_view(
         |t: &Task| -> bool { !overdue_only || t.due_date.as_deref().is_some_and(|d| d < today) };
     let passes_filters = |t: &Task| -> bool {
         filter.matches(&t.status)
-            && scheduled_today(t)
+            && matches_today(t)
             && matches_search(t)
             && matches_file(t)
             && not_overdue(t)
@@ -658,8 +661,9 @@ struct App {
     /// new task). It survives index refreshes so a scroll isn't undone ~750ms later.
     ctx_scroll: i32,
     /// ADR-0009 Phase 1: when true, `build_view` additionally restricts the list to
-    /// tasks whose `scheduled_date == today`. Independent of `filter` (today-ness and
-    /// open/done are orthogonal axes): `today_only + Open` = today's open work.
+    /// tasks whose `scheduled_date == today` OR `due_date == today` (ADR-0022 widened
+    /// this from scheduled-only). Independent of `filter` (today-ness and open/done
+    /// are orthogonal axes): `today_only + Open` = today's open work.
     /// Toggled with `T` (lowercase `t` is reserved for the Phase 2 mark gesture).
     today_only: bool,
     /// The wall-clock "today" as `YYYY-MM-DD`, derived via `taski_core::ymd_from_unix`
@@ -1292,10 +1296,11 @@ impl App {
         self.ctx_scroll = 0;
     }
 
-    /// `T`: toggle the ADR-0009 "Today" view — when on, `build_view` additionally
-    /// restricts the list to tasks whose `scheduled_date == today`. Independent of
-    /// the `f` status-cycle. Lowercase `t` is intentionally NOT bound (reserved for
-    /// the Phase 2 mark gesture).
+    /// `T`: toggle the ADR-0009 "Today" view (widened by ADR-0022) — when on,
+    /// `build_view` additionally restricts the list to tasks whose
+    /// `scheduled_date == today` OR `due_date == today`. Independent of the `f`
+    /// status-cycle. Lowercase `t` is intentionally NOT bound (reserved for the
+    /// Phase 2 mark gesture).
     fn toggle_today(&mut self) {
         self.today_only = !self.today_only;
         self.rebuild();
@@ -1838,12 +1843,14 @@ fn run_loop(
                 // first non-checkbox vault write. Uppercase `T` toggles the read-only
                 // Today view (below).
                 KeyCode::Char('t') => app.submit_set_scheduled(conn),
-                // ADR-0009 Phase 1: `T` toggles the Today view (read-only). Lowercase
-                // `t` is the Phase 2 mark-for-today write gesture (above).
+                // ADR-0009 Phase 1 (widened by ADR-0022): `T` toggles the Today view
+                // (read-only) — tasks whose `scheduled_date == today` OR
+                // `due_date == today`. Lowercase `t` is the Phase 2 mark-for-today
+                // write gesture (above).
                 KeyCode::Char('T') => app.toggle_today(),
                 // Overdue filter (`O`): toggle the "past-due only" view. A 5th
                 // orthogonal filter axis (date-based, like `T` but for `due_date <
-                // today` instead of `scheduled_date == today`).
+                // today` instead of `scheduled_date == today` OR `due_date == today`).
                 KeyCode::Char('O') => app.toggle_overdue(),
                 // ADR-0011: `b` toggles checkbox ↔ bullet; `u` undoes last write.
                 KeyCode::Char('b') => app.submit_bullet_toggle(conn),
@@ -2290,7 +2297,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
             // ADR-0010: search or file search yielded no matches.
             "No tasks match the current search."
         } else if app.today_only {
-            "No tasks scheduled for today. Press `T` to leave the Today view."
+            "No tasks scheduled or due today. Press `T` to leave the Today view."
         } else if app.overdue_only {
             "No overdue tasks — nothing past its due date. Press `O` to leave the overdue view."
         } else {
@@ -2844,7 +2851,7 @@ fn help_popup(theme: &theme::Theme) -> Paragraph<'static> {
         Line::raw(""),
         head("Filter & view"),
         row("f", "Cycle status filter (All / Open / Done)"),
-        row("T", "Today view (scheduled == today)"),
+        row("T", "Today view (scheduled or due == today)"),
         row("O", "Overdue view (due < today)"),
         row(
             "G",
@@ -4758,10 +4765,12 @@ mod tests {
         );
     }
 
-    // --- ADR-0009 Phase 1: "Today" view (scheduled_date == today) ----------
+    // --- ADR-0009 Phase 1 (widened by ADR-0022): "Today" view (scheduled_date == today OR due_date == today) ---
 
     /// With `today_only` on, `build_view` keeps only tasks whose `scheduled_date`
-    /// matches `today`, across notes; tasks with other/None scheduled dates drop out.
+    /// OR `due_date` matches `today` (ADR-0022 widened this from scheduled-only),
+    /// across notes; tasks with neither matching date drop out. (This case only
+    /// exercises scheduled dates.)
     #[test]
     fn today_only_keeps_only_scheduled_today_tasks() {
         let tasks = vec![
@@ -4882,6 +4891,97 @@ mod tests {
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(header(&rows[0]).0, "alpha.md");
+    }
+
+    /// ADR-0022: a task whose `due_date == today` (and has no scheduled date) is kept
+    /// by the Today view; tasks due tomorrow, due yesterday (overdue, a separate `O`
+    /// axis), or with no dates are dropped.
+    #[test]
+    fn today_only_also_keeps_due_today_tasks() {
+        let tasks = vec![
+            task_with_due(1, " ", 1, "alpha.md", "2026-06-20"), // due today -> kept
+            task_with_due(2, " ", 1, "beta.md", "2026-06-21"),  // due tomorrow -> dropped
+            task_with_due(3, " ", 1, "gamma.md", "2026-06-19"), // overdue -> dropped (not today)
+            task(4, " ", 1, "delta.md"),                        // no dates -> dropped
+        ];
+        let expanded = HashSet::new();
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            true,
+            "2026-06-20",
+            "",
+            "",
+            false,
+            GroupBy::FolderNote,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(header(&rows[0]).0, "alpha.md");
+    }
+
+    /// ADR-0022: scheduled-today and due-today tasks both surface under Today, even in
+    /// the same note; a task with neither date is dropped.
+    #[test]
+    fn today_only_keeps_both_scheduled_today_and_due_today() {
+        let tasks = vec![
+            task_with_scheduled(1, " ", 1, "alpha.md", "2026-06-20"), // scheduled today
+            task_with_due(2, " ", 2, "alpha.md", "2026-06-20"),       // due today
+            task(3, " ", 3, "alpha.md"),                              // neither
+        ];
+        let expanded = HashSet::from(["alpha.md".to_string()]);
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            true,
+            "2026-06-20",
+            "",
+            "",
+            false,
+            GroupBy::FolderNote,
+        );
+        assert_eq!(rows.len(), 3, "header + the two today tasks");
+        let ids: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| match r {
+                DisplayRow::Task { task } => Some(task.id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    /// ADR-0022: a single task carrying BOTH `scheduled == today` AND `due == today`
+    /// appears exactly once under Today (one row, one bucket — never double-counted,
+    /// even though it satisfies `matches_today` via two clauses).
+    #[test]
+    fn today_only_single_task_with_both_dates_appears_once() {
+        let mut t = task_with_scheduled(1, " ", 1, "alpha.md", "2026-06-20");
+        t.due_date = Some("2026-06-20".to_string());
+        let tasks = vec![t, task(2, " ", 2, "alpha.md")];
+        let expanded = HashSet::from(["alpha.md".to_string()]);
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            true,
+            "2026-06-20",
+            "",
+            "",
+            false,
+            GroupBy::FolderNote,
+        );
+        // header + exactly one task row (id 1); not duplicated by matching twice.
+        assert_eq!(rows.len(), 2);
+        let ids: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| match r {
+                DisplayRow::Task { task } => Some(task.id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec![1]);
     }
 
     /// `row_to_item` renders the `⏳ <date>` suffix, and bolds it when the date is
@@ -5209,8 +5309,11 @@ mod tests {
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 2));
     }
 
-    /// `overdue_only` is orthogonal to `today_only`: both on → tasks that are
-    /// BOTH due < today AND scheduled == today (the AND composes).
+    /// `overdue_only` is orthogonal to `today_only`: both on → tasks that are BOTH
+    /// overdue (`due < today`) AND today-matching (`scheduled == today` OR `due == today`,
+    /// per ADR-0022). Those two due-axis conditions are disjoint, so the AND can only
+    /// resolve via scheduled == today — as this fixture exercises (task 1 is past-due
+    /// + scheduled-today).
     #[test]
     fn overdue_only_orthogonal_to_today_filter() {
         // A task that has BOTH a past due_date AND today's scheduled_date —
