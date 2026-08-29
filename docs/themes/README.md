@@ -11,6 +11,7 @@ section) and restart Taski.
 | [Tokyo Night](./tokyo-night.md) | dark, truecolor |
 | [Nord](./nord.md) | dark, truecolor |
 | [Gruvbox Dark](./gruvbox-dark.md) | dark, truecolor |
+| [Retro 82](./retro-82.md) | dark, truecolor |
 | [Light Terminal](./light.md) | light, named colors |
 
 ## How themes work
