@@ -27,6 +27,7 @@ clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 ctrlc = "3"
 fs2 = "0.4"
+libc = "0.2"
 notify = "8"
 notify-debouncer-mini = "0.6"
 proptest = "1"

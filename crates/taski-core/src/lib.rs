@@ -838,6 +838,19 @@ pub fn ymd_from_unix(secs: i64) -> String {
     civil_from_days(days)
 }
 
+/// [`ymd_from_unix`], shifted into a local timezone by `utc_offset_secs`
+/// (positive east of UTC, negative west — e.g. `8 * 3600` for AWST).
+///
+/// The offset is a *caller-supplied argument*, keeping this function pure
+/// (same convention as `taski_config::config_path_from` for env values):
+/// probing the system's current offset is the caller's (impure) job — in
+/// Taski, `taski_db::local_utc_offset_secs()`. ADR-0024: "today" for the
+/// Today/Overdue views and the `⏳`/`✅`/`❌`/`➕` stamps is the user's
+/// **local** calendar date, not the UTC date.
+pub fn ymd_from_unix_local(secs: i64, utc_offset_secs: i64) -> String {
+    ymd_from_unix(secs + utc_offset_secs)
+}
+
 /// Howard Hinnant's `civil_from_days`: convert a count of days since
 /// 1970-01-01 into a `(year, month, day)` Gregorian calendar date. Returns the
 /// formatted `YYYY-MM-DD`. All arithmetic is in `i64` to avoid unsigned
@@ -1755,6 +1768,44 @@ plain text
     fn ymd_from_unix_pre_epoch_floor_division() {
         // One second before the epoch lands on 1969-12-31 (floor toward -inf).
         assert_eq!(ymd_from_unix(-1), "1969-12-31");
+    }
+
+    // --- ymd_from_unix_local unit tests (ADR-0024) --------------------------
+
+    #[test]
+    fn ymd_from_unix_local_zero_offset_matches_utc() {
+        // Offset 0 is exactly the UTC conversion.
+        assert_eq!(
+            ymd_from_unix_local(1_781_913_600, 0),
+            ymd_from_unix(1_781_913_600)
+        );
+    }
+
+    #[test]
+    fn ymd_from_unix_local_east_of_utc_rolls_forward() {
+        // 2026-06-19 16:00 UTC is 2026-06-20 00:00 at UTC+8 (AWST): the local
+        // date has rolled forward past the UTC date.
+        assert_eq!(
+            ymd_from_unix_local(1_781_913_600 - 8 * 3600, 8 * 3600),
+            "2026-06-20"
+        );
+        // One second earlier is local 2026-06-19 23:59:59.
+        assert_eq!(
+            ymd_from_unix_local(1_781_913_600 - 8 * 3600 - 1, 8 * 3600),
+            "2026-06-19"
+        );
+    }
+
+    #[test]
+    fn ymd_from_unix_local_west_of_utc_rolls_back() {
+        // 2026-06-20 00:00 UTC is still 2026-06-19 17:00 at UTC-7 (MST).
+        assert_eq!(ymd_from_unix_local(1_781_913_600, -7 * 3600), "2026-06-19");
+    }
+
+    #[test]
+    fn ymd_from_unix_local_handles_pre_epoch_with_offset() {
+        // -1s UTC is 1969-12-31; at UTC+8 that instant is already 1970-01-01.
+        assert_eq!(ymd_from_unix_local(-1, 8 * 3600), "1970-01-01");
     }
 
     // --- rewrite_scheduled unit tests (ADR-0009 Phase 2) -------------------

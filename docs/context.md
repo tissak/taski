@@ -1,6 +1,6 @@
 # Taski — Engineering Context & Onboarding
 
-*Onboarding guide for new engineers. Last updated: 2026-06-24 (post-v0.4 — adds Tier 1 metadata parsing [tags, priority, start/created/done/cancelled dates], Tier 2 views [overdue `O`, group-by cycling `G`], the `✅` done-date stamp on toggle [ADR-0012], the `❌` cancelled-date stamp on cancel [ADR-0013], the `➕` quick-add inbox creation [ADR-0014], the `o` open-in-Obsidian deep-link gesture [ADR-0015], the `i` in-progress toggle gesture [ADR-0016], and the `taski-skip` frontmatter opt-out [ADR-0017]; user-configurable TUI theming + per-panel density knobs [ADR-0018], followed by a global `bold` style toggle [off by default — color contrast carries emphasis] and a finer note-grouping split [`folder+note` / `note` / `folder`], and the `n` add-note task-annotation gesture [grouped `## task-notes` section + aliased in-page link, ADR-0019], and the `m` move-mode task-reordering gesture [TUI-local reorder committed as one in-note line-content permutation, ADR-0020], and the `A` archive-completed gesture [copy-then-delete move of a note's done/cancelled tasks into a designated archive note, ADR-0021], and the `T` Today view widened to also surface due-today tasks [scheduled OR due == today, ADR-0022]; 442 tests across 6 crates).*
+*Onboarding guide for new engineers. Last updated: 2026-09-07 (post-v0.4 — adds Tier 1 metadata parsing [tags, priority, start/created/done/cancelled dates], Tier 2 views [overdue `O`, group-by cycling `G`], the `✅` done-date stamp on toggle [ADR-0012], the `❌` cancelled-date stamp on cancel [ADR-0013], the `➕` quick-add inbox creation [ADR-0014], the `o` open-in-Obsidian deep-link gesture [ADR-0015], the `i` in-progress toggle gesture [ADR-0016], and the `taski-skip` frontmatter opt-out [ADR-0017]; user-configurable TUI theming + per-panel density knobs [ADR-0018], followed by a global `bold` style toggle [off by default — color contrast carries emphasis] and a finer note-grouping split [`folder+note` / `note` / `folder`], and the `n` add-note task-annotation gesture [grouped `## task-notes` section + aliased in-page link, ADR-0019], and the `m` move-mode task-reordering gesture [TUI-local reorder committed as one in-note line-content permutation, ADR-0020], and the `A` archive-completed gesture [copy-then-delete move of a note's done/cancelled tasks into a designated archive note, ADR-0021], and the `T` Today view widened to also surface due-today tasks [scheduled OR due == today, ADR-0022], and the `O` Overdue view widened to also surface past-scheduled tasks [due OR scheduled < today, ADR-0023], and "today" redefined as the user's local calendar date everywhere — views and stamps — instead of UTC [ADR-0024]; 448 tests across 6 crates).*
 
 This document is the "operating manual" for working on Taski: what it is, how it's
 built, the decisions that are load-bearing (and must not be casually undone), and the
@@ -42,7 +42,7 @@ Cargo workspace, edition 2024, six crates. Dependencies point downward only (no 
 
 | Crate | Responsibility | Key file(s) |
 |---|---|---|
-| `taski-core` | **Pure** domain: `Task`/`Status`/`Priority` types, the Markdown parser (`parse_tasks`, fence-aware), emoji extraction (`extract_due_date` 📅/📆/🗓, `extract_scheduled_date` ⏳, `extract_start_date` 🛫, `extract_created_date` ➕, `extract_done_date` ✅, `extract_cancelled_date` ❌ — all via shared `extract_emoji_date`; plus `extract_priority` 🔺/⏫/🔼/🔽/⏬ and `extract_tags` `#tag`), the pure `rewrite_scheduled` line-rewrite oracle (ADR-0009 Phase 2), `inbox_line_for` construction oracle (ADR-0014), the task-note oracles `insert_notes_link`/`notes_link_id`/`note_bullet_for` (ADR-0019), the pure `permute_lines` reorder oracle (ADR-0020), the pure `remove_lines`/`extract_lines` archive oracles (ADR-0021), and pure `ymd_from_unix` (today's date, no date crate). No FS, no I/O, no deps on other taski crates. | `crates/taski-core/src/lib.rs` |
+| `taski-core` | **Pure** domain: `Task`/`Status`/`Priority` types, the Markdown parser (`parse_tasks`, fence-aware), emoji extraction (`extract_due_date` 📅/📆/🗓 due, `extract_scheduled_date` ⏳, `extract_start_date` 🛫, `extract_created_date` ➕, `extract_done_date` ✅, `extract_cancelled_date` ❌ — all via shared `extract_emoji_date`; plus `extract_priority` 🔺/⏫/🔼/🔽/⏬ and `extract_tags` `#tag`), the pure `rewrite_scheduled` line-rewrite oracle (ADR-0009 Phase 2), `inbox_line_for` construction oracle (ADR-0014), the task-note oracles `insert_notes_link`/`notes_link_id`/`note_bullet_for` (ADR-0019), the pure `permute_lines` reorder oracle (ADR-0020), the pure `remove_lines`/`extract_lines` archive oracles (ADR-0021), and pure `ymd_from_unix`/`ymd_from_unix_local` (today's date — UTC and offset-shifted local, ADR-0024; no date crate). No FS, no I/O, no deps on other taski crates. | `crates/taski-core/src/lib.rs` |
 | `taski-config` | TOML config loading (`~/.config/taski/config.toml`) + CLI→config→default precedence + the `template()` renderer for `--init-config`. Fields include `exclude_dirs` for skipping vault subdirectory trees, `inbox_path` for the quick-add target note (ADR-0014), `archive_path` for the archive-completed target note (ADR-0021), and `obsidian_vault`/`use_advanced_uri` for the open-in-Obsidian deep link (ADR-0015), and `ThemeConfig`/`UiConfig` for TUI theming and per-panel density (ADR-0018). Keeps FS/TOML out of `taski-core`. | `crates/taski-config/src/lib.rs` |
 | `taski-db` | The canonical SQLite schema, `open()` (WAL + schema + dir creation), and all read/write APIs (`all_tasks`, `reconcile_note`, `enqueue_action` / `enqueue_set_scheduled` / `enqueue_bullet_toggle`, `pending_actions`, `prune_old_actions`, `delete_tasks_for_excluded_dirs`, …). Owns `tasks` + `pending_actions` + `note_contents`. | `crates/taski-db/src/lib.rs` |
 | `taski-daemon` | The watcher/scanner + **sole writer to the vault**: the reusable engine `run_daemon(opts, shutdown, lock)`, plus `scan_vault`, `index_note`, `process_action` (checkbox flips) / `process_metadata_action` (`⏳` writes) / `process_bullet_action` (checkbox↔bullet toggle) / `process_quick_add` (inbox append, ADR-0014) / `process_add_note` (task-note append + first-note link insertion, ADR-0019) / `process_reorder` (in-note line-content permutation, ADR-0020) / `process_archive` (copy-then-delete move of completed tasks to the archive note, ADR-0021) — all reuse `atomic_write`/`atomic_create` (ADR-0009/0011/0019/0020/0021), the watch loop; the `ShutdownSignal`/`ShutdownHandle` pair; and the `flock` single-writer lock (`DaemonLockGuard`/`acquire_daemon_lock`/`LockOutcome`). The drain loop dispatches on `pending_actions.action_type`. Also handles `exclude_dirs` purge + filtered scanning. **lib + bin** — a `taski-daemon` binary *and* the library the unified launcher depends on. | `crates/taski-daemon/src/{lib,main,shutdown,lock}.rs`, `tests/` |
@@ -205,8 +205,8 @@ filter can only reduce the visible set:
 | Axis | Gesture | Scope |
 |---|---|---|
 | Status cycle | `f` | `All` → `Open` → `Done` → `All`. `Open` = active (not-done) tasks — both `Open` and `InProgress` show alongside each other and count toward the open/total counts (ADR-0016 follow-on); `Done`/other states appear only under `All` |
-| Today view | `T` | Tasks whose `scheduled_date == today` OR `due_date == today` (ADR-0022). Disjoint from `O` Overdue (`due < today`) — the two stay orthogonal |
-| Overdue view | `O` | Tasks whose `due_date` is set and `< today` (purely date-based; composes with status — `O`+Open = open past-due, `O`+Done = completed-was-overdue) |
+| Today view | `T` | Tasks whose `scheduled_date == today` OR `due_date == today` (ADR-0022). Orthogonal to `O` Overdue; on any single date axis the two are disjoint (equality vs strictly-before) — they can only match cross-axis (e.g. due `< today` ∧ scheduled `== today`) |
+| Overdue view | `O` | Tasks whose `due_date` OR `scheduled_date` is set and `< today` (ADR-0023 widened from due-only, so a past-`⏳` task no longer vanishes; purely date-based; composes with status — `O`+Open = open past-due, `O`+Done = completed-was-overdue) |
 | Text search | `/` | Case-insensitive substring of `task.text` |
 | File search | `F` | Case-insensitive substring of `task.note_path` |
 
@@ -238,7 +238,7 @@ fn build_view(
     today: &str,                 // today's date string
     search_query: &str,          // text search
     file_query: &str,            // file/path search
-    overdue_only: bool,          // O — due_date < today
+    overdue_only: bool,          // O — due_date < today OR scheduled_date < today (ADR-0023)
     group_by: GroupBy,           // G — FolderNote / Note / Tag / Priority / Folder
 ) -> Vec<DisplayRow>
 ```
@@ -260,7 +260,7 @@ filter predicates within each bucket and emits `Header` + `Task` rows.
 | `Tab` / `⇧Tab` | Expand all / collapse all groups |
 | `f` | Cycle status filter: All → Open → Done → All (`Open` shows active/not-done tasks — both `Open` and `InProgress`) |
 | `T` | Toggle Today view (tasks scheduled or due today; ADR-0022) |
-| `O` | Toggle Overdue view (tasks whose `due_date < today`) |
+| `O` | Toggle Overdue view (tasks whose `due_date` or `scheduled_date` `< today`; ADR-0023) |
 | `G` | Cycle grouping axis: folder+note → note → tag → priority → folder → folder+note |
 | `t` | Mark/unmark selected task for today (writes `⏳ <today>`) |
 | `b` | Toggle selected task between checkbox (`- [ ]`) and bullet (`-`) format |
@@ -406,8 +406,10 @@ understanding the failure mode it prevents.**
    `scheduled_date == today`; [ADR-0022](./adr/0022-today-view-includes-due-today.md)
    widened it to `scheduled_date == today` OR `due_date == today` (a read-path change that
    does not touch the Phase 2 write gesture). It stays orthogonal to the `f` status-cycle
-   and disjoint from the `O` Overdue view (`due < today`). "Today" is computed by the
-   pure `taski_core::ymd_from_unix` (no date crate). Two 256-case proptests guard the write.
+   and to the `O` Overdue view (disjoint per date axis; see ADR-0023). "Today" is computed
+   by the pure `taski_core::ymd_from_unix_local` with the system-local UTC offset from
+   `taski_db::local_utc_offset_secs` (no date crate; local-time semantics per
+   [ADR-0024](./adr/0024-local-timezone-today.md)). Two 256-case proptests guard the write.
 
 9. **Text and file search in the TUI** ([ADR-0010](./adr/0010-text-search.md)) —
    Two independent modal search gestures: `/` for case-insensitive substring of
@@ -578,6 +580,31 @@ the frontmatter grammar is a load-bearing contract future parsing must respect.
     atomicity is impossible, so it is not transactional: a crash between Phase A and B can duplicate into
     the archive (Phase B replay refuses on hash mismatch); the gate is "delete only what was durably copied
     first."
+
+22. **Today view includes due-today** ([ADR-0022](./adr/0022-today-view-includes-due-today.md)) —
+    the `T` Today predicate widened from `scheduled_date == today` to
+    `scheduled_date == today` OR `due_date == today`, closing the gap where a due-today
+    task appeared in *neither* date view on its due day. Strict equality (not `<=`) was
+    chosen with the user: Today stays "happening today"; overdue does **not** roll up into
+    Today. Read-path only.
+
+23. **Overdue view includes past-scheduled** ([ADR-0023](./adr/0023-overdue-includes-past-scheduled.md)) —
+    the `O` Overdue predicate widened from `due_date < today` to `due_date < today` OR
+    `scheduled_date < today`. A task triaged to a past day via `⏳` (e.g. the `t`
+    gesture) and left unfinished no longer vanishes from both date views — it surfaces in
+    Overdue. **Reverses ADR-0022's deferred overdue-roll-up non-goal, on the Overdue side
+    only** (Today-side roll-up stays rejected). `🛫` start dates stay excluded.
+    Read-path only.
+
+24. **"Today" is the user's local calendar date** ([ADR-0024](./adr/0024-local-timezone-today.md)) —
+    every computed date (the `T`/`O` boundaries and the `⏳`/`✅`/`❌`/`➕` stamp dates)
+    previously came from `ymd_from_unix`, which is a **UTC** conversion — for a UTC+8
+    user, "today" lagged local midnight by 8 hours and morning stamps carried yesterday's
+    date. Fixed by a pure `ymd_from_unix_local(secs, offset)` in `taski-core` (offset as
+    an *argument* — the established purity convention) plus one impure probe,
+    `taski_db::local_utc_offset_secs()` (`libc` `localtime_r`+`tzset`; non-unix → 0).
+    No schema bump; previously-written stamps are not migrated. New explicit `libc` dep
+    in `taski-db` (recorded in `tech.md`).
 
 ---
 
@@ -759,7 +786,7 @@ These are the things that aren't obvious from reading the code and will cost you
 | `taski-daemon/tests/writeback.rs` + `writeback_proptest.rs` + `metadata_writeback_proptest.rs` + `done_date_writeback_proptest.rs` + `cancelled_date_writeback_proptest.rs` + `quick_add_writeback_proptest.rs` | The safety contract: atomic_write commits on match, refuses on conflict, never corrupts; `⏳` metadata write-back "never corrupts" (256-case ADR-0009 Phase 2, oracle = `rewrite_scheduled`); `✅` done-date-on-toggle stamp "never corrupts" (256-case ADR-0012, oracle = `rewrite_done_date`, CRLF assertion, VS16 guards); `❌` cancelled-date-on-cancel stamp "never corrupts" (256-case ADR-0013, oracle = `rewrite_cancelled_date`; also exercises cross-state `✅`-clearing); quick-add append/create "never corrupts" (256-case ADR-0014, oracle = `inbox_line_for`; also covers first-creation and undo removal). Also covers `toggle_bullet` and `undo` action types (ADR-0011). |
 | `taski-daemon/src/lock.rs` unit tests | The `flock` single-writer lock: acquire/refuse outcome, lock-path derivation. |
 | `taski-daemon` unit tests in `lib.rs` | `should_exclude_entry`, `path_matches_exclude`, `scan_vault_with_exclude_dirs_skips_matching_directory` — exclude-dir filtering in WalkDir and watcher events. |
-| `taski-tui` unit tests (in `lib.rs`) | View model: grouping (folder+note/note/tag/priority/folder via `G`, incl. the filename-only `note` merge, tag fan-out + group ordering), collapse, five-axis filter composition (status + today + overdue + text search + file search), display-index↔Task mapping, selection reconciliation (incl. duplicate task_ids under tag grouping), failure-notice surfacing, context-pane render/scroll/toggle + `context_view` centering (headless `TestBackend` smoke), and the pure `obsidian_url` + `percent_encode_query` deep-link builder (native vs advanced, RFC 3986 component encoding incl. unicode; ADR-0015), and the `?` help-overlay modal dispatch (`help_dismisses_on`) + headless `TestBackend` render smoke; `Theme::default()` byte-equality with today's palette, per-role fallback on bad `ColorSpec`, `LayoutPrefs` clamp range, `TestBackend` buffer assertions on a non-default theme + a 60/40 pane split; `split_note_header` path/filename split + a `TestBackend` assertion that Note headers dim the dir prefix (`path_prefix`) while the filename keeps the default fg (not dimmed, not bold — the global `bold` toggle is off by default); an end-to-end `TestBackend` check that a configured `accent` hex reaches rendered cells; and that a configured `background` fills every cell while `Reset` (default) paints none (ADR-0018). |
+| `taski-tui` unit tests (in `lib.rs`) | View model: grouping (folder+note/note/tag/priority/folder via `G`, incl. the filename-only `note` merge, tag fan-out + group ordering), collapse, five-axis filter composition (status + today + overdue + text search + file search; overdue covers the past-scheduled arm per ADR-0023 and both `T`+`O` cross-axis cases), display-index↔Task mapping, selection reconciliation (incl. duplicate task_ids under tag grouping), failure-notice surfacing, context-pane render/scroll/toggle + `context_view` centering (headless `TestBackend` smoke), and the pure `obsidian_url` + `percent_encode_query` deep-link builder (native vs advanced, RFC 3986 component encoding incl. unicode; ADR-0015), and the `?` help-overlay modal dispatch (`help_dismisses_on`) + headless `TestBackend` render smoke; `Theme::default()` byte-equality with today's palette, per-role fallback on bad `ColorSpec`, `LayoutPrefs` clamp range, `TestBackend` buffer assertions on a non-default theme + a 60/40 pane split; `split_note_header` path/filename split + a `TestBackend` assertion that Note headers dim the dir prefix (`path_prefix`) while the filename keeps the default fg (not dimmed, not bold — the global `bold` toggle is off by default); an end-to-end `TestBackend` check that a configured `accent` hex reaches rendered cells; and that a configured `background` fills every cell while `Reset` (default) paints none (ADR-0018). |
 | `taski-db` unit tests | `delete_tasks_for_excluded_dirs` — verifies exact-match and prefix-match SQL purges the right rows. |
 | `taski` (unified launcher) | No unit tests by design — it's thin dispatch over the two libraries. Correctness is runtime-verified (combined spawn, attach-when-held, refuse-when-held, quit-drain); see the smokes described in ADRs 0007/0008. |
 
@@ -831,12 +858,13 @@ A holistic review triaged these as low-value for a personal single-user tool. Th
   the admissible set under that gate.
 - **Case-sensitive search toggle** — search is case-insensitive; a future config toggle
   could make it case-sensitive. Not needed for MVP (ADR-0010).
-- **Search by date fields beyond Overdue/Today** — `O` (overdue: `due_date < today`) and
-  `T` (today: `scheduled_date == today` OR `due_date == today`, widened by ADR-0022) cover
-  the common date-filter cases; arbitrary date-range search (e.g. "due this week") is a
-  natural extension but deferred. The full `happens today` union (overdue roll-up / `<=
-  today`) is also still deferred — ADR-0022 adopted only the due-today half. Text (`/`)
-  and file (`F`) search remain substring-only.
+- **Search by date fields beyond Overdue/Today** — `O` (overdue: `due_date < today` OR
+  `scheduled_date < today`, widened by ADR-0023) and `T` (today: `scheduled_date == today`
+  OR `due_date == today`, widened by ADR-0022) cover the common date-filter cases;
+  arbitrary date-range search (e.g. "due this week") is a natural extension but deferred.
+  The Today-side `<= today` roll-up is still rejected (ADR-0022), and `🛫` start dates
+  are in neither date view (ADR-0023). Text (`/`) and file (`F`) search remain
+  substring-only.
 - **Undo of `t` (mark-for-today)** — explicitly excluded from undo scope; `t` is already
   idempotent (ADR-0011).
 - **External change detection for undo** — undo only reverses the last TUI action, not
@@ -873,8 +901,13 @@ If you pick one up, record the decision and update this list.
   that writes `⏳ <today>` into the note line (ADR-0009).
 - **Today view** — the `T`-key toggled filter that shows only tasks whose
   `scheduled_date == today` OR `due_date == today` (ADR-0022 widened this from
-  scheduled-only; computed by `taski_core::ymd_from_unix`). Orthogonal to the `f`
-  status-cycle and disjoint from the `O` Overdue view (`due < today`).
+  scheduled-only; "today" computed by `taski_core::ymd_from_unix_local` +
+  `taski_db::local_utc_offset_secs`, ADR-0024). Orthogonal to the `f`
+  status-cycle and to the `O` Overdue view (disjoint per date axis; ADR-0023).
+- **Overdue view** — the `O`-key toggled filter that shows only tasks whose
+  `due_date < today` OR `scheduled_date < today` (ADR-0023 widened this from
+  due-only, so unfinished `⏳`-marked tasks roll into it instead of vanishing).
+  Orthogonal to the `f` status-cycle and to the `T` Today view.
 - **Mark-for-today** — the `t` toggle gesture on a selected task. Idempotent: if the task
   already has `⏳ today`, pressing `t` removes it (writes `NULL`). The TUI enqueues a
   `set_scheduled` `pending_actions` row; the daemon dispatches to

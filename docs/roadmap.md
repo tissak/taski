@@ -63,7 +63,7 @@ All read-path (TUI `build_view` extensions). Two of four views are shipped; the 
 
 | View | Gesture | What it shows | Depends on | Status |
 |---|---|---|---|---|
-| **Overdue** | `O` | tasks with `due_date < today` (purely date-based; composes with status/today/search) | due date (have it) | ✅ shipped |
+| **Overdue** | `O` | tasks with `due_date < today` OR `scheduled_date < today` (ADR-0023 widened from due-only; purely date-based; composes with status/today/search) | due/scheduled dates (have them) | ✅ shipped |
 | **Group-by cycling** | `G` | cycle group axis: note → tag → priority → folder → note (tag fans out; date axis deferred) | tags / priority | ✅ shipped |
 | **"Happens"** | (toggle) | start ∪ scheduled ∪ due — broader and more useful than Today | start date | open |
 | **Urgency-score sort** | sort mode | composite (due proximity + priority) — the Tasks plugin's default ordering | priority | open |

@@ -217,12 +217,8 @@ fn two_flips_same_note_both_applied_m1() {
     // ADR-0012: each `[ ]→[x]` flip also stamps `✅ <today>` (wall-clock). The M1
     // invariant under test — both flips apply despite sharing the note — is
     // orthogonal to the stamp; we just account for it in the expected bytes.
-    let today = taski_core::ymd_from_unix(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64,
-    );
+    // `local_today` is the daemon's own date derivation (ADR-0024, local date).
+    let today = taski_daemon::local_today();
     assert_eq!(
         fs::read_to_string(&note).unwrap(),
         format!("- [x] a ✅ {today}\n- [x] b ✅ {today}\n"),
@@ -803,13 +799,9 @@ fn done_date_stamped_via_process_pending_actions_end_to_end() {
     db::enqueue_action(&conn, t.id, &t.note_path, t.line_number, " ", "x").expect("enqueue");
     process_pending_actions(&conn, root).expect("drain");
 
-    // The real wall-clock today (whatever date the test runs on).
-    let today = taski_core::ymd_from_unix(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64,
-    );
+    // The real wall-clock today (whatever local date the test runs on) —
+    // the daemon's own derivation, so the two can't drift (ADR-0024).
+    let today = taski_daemon::local_today();
 
     let on_disk = fs::read_to_string(&note).unwrap();
     assert!(

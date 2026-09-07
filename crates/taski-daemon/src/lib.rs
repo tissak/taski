@@ -737,13 +737,23 @@ pub fn process_pending_actions(conn: &Connection, vault_root: &Path) -> Result<(
     Ok(())
 }
 
+/// The daemon's wall-clock "today" as `YYYY-MM-DD`: the pure
+/// [`taski_core::ymd_from_unix_local`] shifted by the system-local UTC offset
+/// (ADR-0024 — the user's local calendar date, not UTC). Single shared
+/// definition for the three wall-clock wrappers *and* the integration tests
+/// that assert byte-exact stamps against the real clock, so the two can
+/// never drift.
+pub fn local_today() -> String {
+    taski_core::ymd_from_unix_local(unix_now(), taski_db::local_utc_offset_secs())
+}
+
 /// Execute one pending checkbox flip per ADR-0002/0004/0005, **composing the
 /// ADR-0012 `✅` done-date stamp into the same byte buffer as the flip** (one
 /// write, one hash, one rename). The vault is mutated **only** on a successful
 /// [`ApplyOutcome::Applied`]; every other path leaves it untouched.
 ///
-/// This is the wall-clock wrapper: it derives `<today>` via the pure
-/// [`taski_core::ymd_from_unix`] and delegates to [`process_action_at`].
+/// This is the wall-clock wrapper: it derives `<today>` via [`local_today`]
+/// (local date, ADR-0024) and delegates to [`process_action_at`].
 /// Deterministic tests call [`process_action_at`] directly with a fixed date.
 ///
 /// See [`process_action_at`] for the full sequence.
@@ -752,7 +762,7 @@ pub fn process_action(
     vault_root: &Path,
     action: &PendingAction,
 ) -> Result<ApplyOutcome> {
-    let today = taski_core::ymd_from_unix(unix_now());
+    let today = local_today();
     process_action_at(conn, vault_root, action, &today)
 }
 
@@ -1221,7 +1231,7 @@ pub fn process_bullet_action(
 /// via [`atomic_create`] (temp → fsync → rename, no TOCTOU re-hash — a
 /// non-existent file has no state to conflict with; bounded ADR-0004 exception).
 pub fn process_quick_add(vault_root: &Path, action: &PendingAction) -> Result<ApplyOutcome> {
-    let today = taski_core::ymd_from_unix(unix_now());
+    let today = local_today();
     process_quick_add_at(vault_root, action, &today)
 }
 
@@ -1300,7 +1310,7 @@ pub fn process_quick_add_at(
 /// `process_quick_add` wrote. This is the wall-clock wrapper; deterministic tests
 /// call [`process_quick_add_undo_at`].
 pub fn process_quick_add_undo(vault_root: &Path, action: &PendingAction) -> Result<ApplyOutcome> {
-    let today = taski_core::ymd_from_unix(unix_now());
+    let today = local_today();
     process_quick_add_undo_at(vault_root, action, &today)
 }
 
@@ -1952,10 +1962,9 @@ fn line_byte_range(bytes: &[u8], line_number: usize) -> Option<std::ops::Range<u
     }
     let mut start = 0usize;
     for _ in 1..line_number {
-        match bytes[start..].iter().position(|&b| b == b'\n') {
-            Some(pos) => start += pos + 1,
-            None => return None, // fewer lines than requested
-        }
+        // `?`: no newline left means fewer lines than requested.
+        let pos = bytes[start..].iter().position(|&b| b == b'\n')?;
+        start += pos + 1;
     }
     let end = bytes[start..]
         .iter()

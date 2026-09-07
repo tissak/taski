@@ -181,18 +181,21 @@ fn restore_terminal() -> Result<()> {
 }
 
 /// Derive "today" as a `YYYY-MM-DD` string from the wall clock, via the pure
-/// `taski_core::ymd_from_unix` (no date crate — ADR-0009 Phase 1). The TUI calls
-/// this on `App` construction and on each index refresh so a session spanning
-/// midnight keeps the Today view correct. Falls back to the epoch on a
-/// pre-epoch clock (matching `taski_core`'s convention).
+/// `taski_core::ymd_from_unix_local` shifted by the system-local UTC offset
+/// (no date crate — ADR-0009 Phase 1; local-time semantics ADR-0024). The TUI
+/// calls this on `App` construction and on each index refresh so a session
+/// spanning **local** midnight keeps the Today/Overdue views correct. Falls
+/// back to the epoch on a pre-epoch clock (matching `taski_core`'s
+/// convention); a non-unix host reports a UTC offset of 0.
 fn today_string() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    // `ymd_from_unix` is re-exported by `taski-db` so the TUI takes no direct
-    // `taski-core` dependency (the established re-export pattern).
-    db::ymd_from_unix(secs)
+    // `ymd_from_unix_local` and `local_utc_offset_secs` are re-exported (or
+    // defined) by `taski-db` so the TUI takes no direct `taski-core`
+    // dependency (the established re-export pattern).
+    db::ymd_from_unix_local(secs, db::local_utc_offset_secs())
 }
 
 /// Percent-encode a string for use as a query parameter value in an `obsidian://`
@@ -465,12 +468,15 @@ impl DisplayRow {
 /// `today` is a `YYYY-MM-DD` string; it is only consulted when `today_only` is true.
 ///
 /// `overdue_only` adds a fifth orthogonal predicate: when true, only tasks whose
-/// `due_date` is set and strictly before `today` are visible. A task with no
-/// `due_date` is never overdue. Purely date-based (does NOT additionally require
-/// `status == Open` — that's the status filter's job) so it composes predictably:
-/// `overdue_only + Open` = open past-due; `overdue_only + Done` = completed-was-
-/// overdue review. String comparison `d < today` is valid for `YYYY-MM-DD`
-/// (lexicographic == chronological for zero-padded ISO dates).
+/// `due_date` **or** `scheduled_date` is set and strictly before `today` are
+/// visible (ADR-0023 widened this from due-only: an unfinished task marked for
+/// a past day via `⏳` must not vanish — it is overdue too). A task with
+/// neither date is never overdue. Purely date-based (does NOT additionally
+/// require `status == Open` — that's the status filter's job) so it composes
+/// predictably: `overdue_only + Open` = open past-due/past-scheduled;
+/// `overdue_only + Done` = completed-was-overdue review. String comparison
+/// `d < today` is valid for `YYYY-MM-DD` (lexicographic == chronological for
+/// zero-padded ISO dates).
 //
 // `too_many_arguments`: each parameter is an independent filter/grouping axis (status,
 // today, search, file, overdue, group-by) plus its required context (tasks, expanded,
@@ -503,8 +509,11 @@ fn build_view(
                 .to_lowercase()
                 .contains(&file_query.to_lowercase())
     };
-    let not_overdue =
-        |t: &Task| -> bool { !overdue_only || t.due_date.as_deref().is_some_and(|d| d < today) };
+    let not_overdue = |t: &Task| -> bool {
+        !overdue_only
+            || t.due_date.as_deref().is_some_and(|d| d < today)
+            || t.scheduled_date.as_deref().is_some_and(|d| d < today)
+    };
     let passes_filters = |t: &Task| -> bool {
         filter.matches(&t.status)
             && matches_today(t)
@@ -684,7 +693,8 @@ struct App {
     /// Whether the `F` file-search prompt is active.
     file_searching: bool,
     /// Overdue filter (`O`): when true, `build_view` additionally restricts the
-    /// list to tasks whose `due_date` is set and strictly before `today`.
+    /// list to tasks whose `due_date` **or** `scheduled_date` is set and
+    /// strictly before `today` (ADR-0023 widened this from due-only).
     /// Independent of `filter`, `today_only`, and the search axes (orthogonal).
     /// Purely date-based — does NOT additionally require `status == Open`.
     overdue_only: bool,
@@ -1308,11 +1318,11 @@ impl App {
     }
 
     /// `O`: toggle the overdue filter — when on, `build_view` additionally
-    /// restricts the list to tasks whose `due_date` is set and strictly before
-    /// `today`. Independent of `today_only` and the status filter (orthogonal
-    /// axes): `O + Open` = open past-due; `O + Done` = completed-was-overdue
-    /// review; `O + All` = all past-due. A task with no `due_date` is never
-    /// overdue.
+    /// restricts the list to tasks whose `due_date` **or** `scheduled_date`
+    /// is set and strictly before `today` (ADR-0023). Independent of
+    /// `today_only` and the status filter (orthogonal axes): `O + Open` = open
+    /// past-due/past-scheduled; `O + Done` = completed-was-overdue review;
+    /// `O + All` = all overdue. A task with neither date is never overdue.
     fn toggle_overdue(&mut self) {
         self.overdue_only = !self.overdue_only;
         self.rebuild();
@@ -1849,8 +1859,9 @@ fn run_loop(
                 // write gesture (above).
                 KeyCode::Char('T') => app.toggle_today(),
                 // Overdue filter (`O`): toggle the "past-due only" view. A 5th
-                // orthogonal filter axis (date-based, like `T` but for `due_date <
-                // today` instead of `scheduled_date == today` OR `due_date == today`).
+                // orthogonal filter axis (date-based, like `T` but for
+                // `due < today` OR `scheduled < today` (ADR-0023) instead of
+                // `scheduled == today` OR `due == today`).
                 KeyCode::Char('O') => app.toggle_overdue(),
                 // ADR-0011: `b` toggles checkbox ↔ bullet; `u` undoes last write.
                 KeyCode::Char('b') => app.submit_bullet_toggle(conn),
@@ -2299,7 +2310,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         } else if app.today_only {
             "No tasks scheduled or due today. Press `T` to leave the Today view."
         } else if app.overdue_only {
-            "No overdue tasks — nothing past its due date. Press `O` to leave the overdue view."
+            "No overdue tasks — nothing past its due or scheduled date. Press `O` to leave the overdue view."
         } else {
             match app.filter {
                 StatusFilter::Open => "No open tasks. Press `f` to change the filter.",
@@ -2852,7 +2863,7 @@ fn help_popup(theme: &theme::Theme) -> Paragraph<'static> {
         head("Filter & view"),
         row("f", "Cycle status filter (All / Open / Done)"),
         row("T", "Today view (scheduled or due == today)"),
-        row("O", "Overdue view (due < today)"),
+        row("O", "Overdue view (due or scheduled < today)"),
         row(
             "G",
             "Cycle group-by (folder+note / note / tag / priority / folder)",
@@ -5190,7 +5201,7 @@ mod tests {
         );
     }
 
-    // --- Overdue filter (`O`): due_date < today ---------------------------
+    // --- Overdue filter (`O`): (due or scheduled) < today (ADR-0023) -------
 
     /// With `overdue_only` on, `build_view` keeps only tasks whose `due_date`
     /// is set and strictly before `today`. Tasks due today, due in the future,
@@ -5241,6 +5252,33 @@ mod tests {
             GroupBy::FolderNote,
         );
         assert!(rows.is_empty(), "none are past-due");
+    }
+
+    /// ADR-0023: with `overdue_only` on, a task whose `scheduled_date` alone
+    /// is in the past (no due date — e.g. marked for a past day via `t`) is
+    /// overdue too. Scheduled-today and future-scheduled tasks are not.
+    #[test]
+    fn overdue_only_keeps_past_scheduled_tasks() {
+        let tasks = vec![
+            task_with_scheduled(1, " ", 1, "alpha.md", "2026-06-18"), // past scheduled
+            task_with_scheduled(2, " ", 1, "beta.md", "2026-06-20"),  // scheduled today
+            task_with_scheduled(3, " ", 1, "gamma.md", "2026-06-22"), // future scheduled
+        ];
+        let expanded = HashSet::new();
+        let rows = build_view(
+            &tasks,
+            StatusFilter::All,
+            &expanded,
+            false,
+            "2026-06-20",
+            "",
+            "",
+            true,
+            GroupBy::FolderNote,
+        );
+        // Only alpha.md (past-scheduled) survives; one collapsed header.
+        assert_eq!(rows.len(), 1);
+        assert_eq!(header(&rows[0]).0, "alpha.md");
     }
 
     /// With `overdue_only` off, no date-based filtering happens (beyond the
@@ -5309,25 +5347,31 @@ mod tests {
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 2));
     }
 
-    /// `overdue_only` is orthogonal to `today_only`: both on → tasks that are BOTH
-    /// overdue (`due < today`) AND today-matching (`scheduled == today` OR `due == today`,
-    /// per ADR-0022). Those two due-axis conditions are disjoint, so the AND can only
-    /// resolve via scheduled == today — as this fixture exercises (task 1 is past-due
-    /// + scheduled-today).
+    /// `overdue_only` is orthogonal to `today_only`: both on → tasks that are
+    /// BOTH overdue (`due < today` OR `scheduled < today`, per ADR-0023) AND
+    /// today-matching (`scheduled == today` OR `due == today`, per ADR-0022).
+    /// On either single date axis the equality and less-than conditions are
+    /// disjoint, so the AND can only resolve "cross-axis": past-due +
+    /// scheduled-today (as this fixture exercises, task 1) or past-scheduled +
+    /// due-today (the mirror case, task 4 below).
     #[test]
     fn overdue_only_orthogonal_to_today_filter() {
         // A task that has BOTH a past due_date AND today's scheduled_date —
         // it passes both filters.
         let mut t = task_with_due(1, " ", 1, "alpha.md", "2026-06-18");
         t.scheduled_date = Some("2026-06-20".to_string());
+        // Mirror cross case: past scheduled_date + due today (ADR-0023).
+        let mut t4 = task_with_due(4, " ", 4, "alpha.md", "2026-06-20");
+        t4.scheduled_date = Some("2026-06-18".to_string());
         let tasks = vec![
             t,                                                        // both
             task_with_due(2, " ", 2, "alpha.md", "2026-06-18"), // past due, not scheduled today
             task_with_scheduled(3, " ", 3, "alpha.md", "2026-06-20"), // scheduled today, no past due
+            t4,                                                       // both (mirror)
         ];
         let expanded = HashSet::from(["alpha.md".to_string()]);
 
-        // Both filters on -> only task 1 (past due AND scheduled today).
+        // Both filters on -> tasks 1 and 4 (each matches both filters).
         let rows = build_view(
             &tasks,
             StatusFilter::All,
@@ -5339,8 +5383,9 @@ mod tests {
             true,
             GroupBy::FolderNote,
         );
-        assert_eq!(rows.len(), 2, "header + one task matching both filters");
+        assert_eq!(rows.len(), 3, "header + two tasks matching both filters");
         assert!(matches!(&rows[1], DisplayRow::Task { task } if task.id == 1));
+        assert!(matches!(&rows[2], DisplayRow::Task { task } if task.id == 4));
     }
 
     /// `toggle_overdue` flips the flag and rebuilds the view.

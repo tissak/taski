@@ -12,9 +12,54 @@ use rusqlite::Connection;
 
 // Re-export the shared domain types so downstream crates (e.g. the TUI) can depend on
 // `taski-db` alone without a direct `taski-core` dependency. This also brings `Status`
-// and `Task` into scope within this module. `ymd_from_unix` is re-exported for the
-// TUI's "today" derivation (ADR-0009 Phase 1).
-pub use taski_core::{Priority, Status, Task, ymd_from_unix};
+// and `Task` into scope within this module. `ymd_from_unix` / `ymd_from_unix_local`
+// are re-exported for the "today" derivation (ADR-0009 Phase 1; local-time ADR-0024).
+pub use taski_core::{Priority, Status, Task, ymd_from_unix, ymd_from_unix_local};
+
+/// The system's current local UTC offset in seconds (positive east of UTC,
+/// negative west — e.g. `+28_800` for AWST), probed via `localtime_r(3)`.
+///
+/// ADR-0024: "today" everywhere in Taski (the Today/Overdue view boundaries
+/// and the `⏳`/`✅`/`❌`/`➕` stamp dates) is the user's **local** calendar
+/// date. The pure [`ymd_from_unix_local`] takes the offset as an argument;
+/// this is the one impure probe that supplies it. Lives here (not in
+/// `taski-core`, which must stay free of I/O and env probing, and not
+/// duplicated in the TUI and daemon) because both consumers already depend on
+/// this crate — the same rationale as the `ymd_from_unix` re-export above.
+///
+/// Calls `tzset(3)` first so a changed `TZ` environment is honored (glibc's
+/// `localtime_r` does not re-read it on its own). Non-unix targets fall back
+/// to `0` (UTC — the pre-ADR-0024 behavior).
+pub fn local_utc_offset_secs() -> i64 {
+    #[cfg(unix)]
+    {
+        // The libc crate does not expose `tzset(3)`; declare it so a changed
+        // `TZ` environment is honored before the probe (glibc's
+        // `localtime_r` does not re-read it on its own).
+        unsafe extern "C" {
+            fn tzset();
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let t = now as libc::time_t;
+        // Safety: both calls take a valid pointer to our own storage and do
+        // not retain it beyond the call.
+        unsafe {
+            tzset();
+            if libc::localtime_r(&t, &mut tm).is_null() {
+                return 0;
+            }
+        }
+        tm.tm_gmtoff as i64
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
 
 /// The canonical schema v7. v2 added surrogate rowid identity + content-hash
 /// reconciliation (ADR-0005); v3 added the `note_contents` cache that backs the
@@ -879,6 +924,21 @@ mod tests {
             cancelled_date: None,
             updated_at: 123,
         }
+    }
+
+    /// ADR-0024 smoke: the offset probe returns something zone-shaped — a
+    /// whole number of quarter-hours within ±24h (every real modern zone,
+    /// incl. the +05:45/+08:45 outliers, satisfies this). The exact value is
+    /// TZ-dependent, so only the shape is pinned; the date math itself is
+    /// covered by `ymd_from_unix_local` tests in `taski-core`.
+    #[test]
+    fn local_utc_offset_secs_is_zone_shaped() {
+        let off = local_utc_offset_secs();
+        assert!(
+            off > -24 * 3600 && off < 24 * 3600,
+            "offset {off} out of range"
+        );
+        assert_eq!(off % 900, 0, "offset {off} not a multiple of 15 minutes");
     }
 
     #[test]

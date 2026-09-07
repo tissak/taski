@@ -9,6 +9,7 @@ license.workspace = true
 taski-core.workspace = true
 rusqlite.workspace = true
 anyhow.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
