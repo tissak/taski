@@ -18,12 +18,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::{execute, terminal::EnterAlternateScreen, terminal::LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::{Buffer, CellDiffOption};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
@@ -998,15 +998,17 @@ struct App {
     /// call `rebuild()` (no filter to recompute — it's a creation modal, not a
     /// filter).
     quick_adding: bool,
-    /// ADR-0014: the text typed so far in the quick-add modal.
-    quick_add_query: String,
+    /// ADR-0014: the text typed so far in the quick-add dialog.
+    quick_add_query: TextInput,
     /// ADR-0019: when true, the add-note text-entry modal is active (the `n`
     /// key). Keystrokes accumulate in `note_query`. Mirrors `quick_adding`, but
     /// the action targets the selected task (append a note + add an in-page link)
     /// rather than creating a new inbox task.
     adding_note: bool,
-    /// ADR-0019: the note text typed so far in the add-note modal.
-    note_query: String,
+    /// ADR-0019: the note text typed so far in the add-note dialog.
+    note_query: TextInput,
+    /// Text width of the open entry dialog at the last draw, for `↑`/`↓`.
+    input_width: usize,
     /// ADR-0020: when true, move mode is active (the `m` key). `j`/`k` bubble the
     /// selected task up/down among its note's tasks by swapping rows locally;
     /// `Enter` commits the new order as one `reorder` action, `Esc` restores the
@@ -1107,9 +1109,10 @@ impl App {
             file_searching: false,
             overdue_only: false,
             quick_adding: false,
-            quick_add_query: String::new(),
+            quick_add_query: TextInput::default(),
             adding_note: false,
-            note_query: String::new(),
+            note_query: TextInput::default(),
+            input_width: 60,
             moving: false,
             move_task_id: 0,
             move_initial_ids: Vec::new(),
@@ -1249,16 +1252,6 @@ impl App {
         self.quick_add_query.clear();
     }
 
-    /// Append a character to the quick-add query.
-    fn push_quick_add_char(&mut self, c: char) {
-        self.quick_add_query.push(c);
-    }
-
-    /// Pop the last character (Backspace).
-    fn pop_quick_add_char(&mut self) {
-        self.quick_add_query.pop();
-    }
-
     /// Cancel quick-add: clear the query, exit the modal.
     fn clear_quick_add(&mut self) {
         self.quick_adding = false;
@@ -1270,7 +1263,7 @@ impl App {
     /// Records `LastAction::QuickAdd` so `u` can undo. Exits the modal on both
     /// success and empty-text.
     fn submit_quick_add(&mut self, conn: &Connection) {
-        let text = self.quick_add_query.trim();
+        let text = self.quick_add_query.text.trim();
         if text.is_empty() {
             self.clear_quick_add();
             return;
@@ -1304,16 +1297,6 @@ impl App {
         self.note_query.clear();
     }
 
-    /// Append a character to the note query.
-    fn push_note_char(&mut self, c: char) {
-        self.note_query.push(c);
-    }
-
-    /// Pop the last character (Backspace).
-    fn pop_note_char(&mut self) {
-        self.note_query.pop();
-    }
-
     /// Cancel add-note: clear the query, exit the modal.
     fn clear_add_note(&mut self) {
         self.adding_note = false;
@@ -1325,7 +1308,7 @@ impl App {
     /// just dismisses the modal). No undo in v1 (no `LastAction` recorded). The
     /// daemon performs the vault write (note append + first-note link insertion).
     fn submit_add_note(&mut self, conn: &Connection) {
-        let text = self.note_query.trim();
+        let text = self.note_query.text.trim();
         if text.is_empty() {
             self.clear_add_note();
             return;
@@ -2148,10 +2131,9 @@ fn run_loop(
             // creation modal, not a filter).
             match key.code {
                 KeyCode::Esc => app.clear_quick_add(),
+                KeyCode::Char('c') if ctrl => app.clear_quick_add(),
                 KeyCode::Enter => app.submit_quick_add(conn),
-                KeyCode::Backspace => app.pop_quick_add_char(),
-                KeyCode::Char(c) => app.push_quick_add_char(c),
-                _ => {}
+                _ => edit_input(&mut app.quick_add_query, key, app.input_width),
             }
         } else if app.adding_note {
             // ADR-0019: add-note modal (n key). Keystrokes build the note; Enter
@@ -2159,10 +2141,9 @@ fn run_loop(
             // Like quick-add it does NOT call `rebuild()` (no filter to recompute).
             match key.code {
                 KeyCode::Esc => app.clear_add_note(),
+                KeyCode::Char('c') if ctrl => app.clear_add_note(),
                 KeyCode::Enter => app.submit_add_note(conn),
-                KeyCode::Backspace => app.pop_note_char(),
-                KeyCode::Char(c) => app.push_note_char(c),
-                _ => {}
+                _ => edit_input(&mut app.note_query, key, app.input_width),
             }
         } else if app.moving {
             // ADR-0020: move mode (m key) is MODAL. `j`/`k`/`↑`/`↓` bubble the
@@ -2819,27 +2800,23 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Span::styled(cursor, Style::default().add_modifier(Modifier::SLOW_BLINK)),
         ]))
         .style(Style::new())
-    } else if app.quick_adding {
-        // ADR-0014: quick-add modal prompt. Mirrors the search/file-search prompt
-        // layout but uses a "+" prefix (the `➕` creation emoji used in the written
-        // task line) and shows which inbox the write targets.
-        let cursor = if (app.quick_add_query.len() as u16) < footer_area.width.saturating_sub(12) {
-            "█"
-        } else {
-            ""
-        };
+    } else if app.quick_adding || app.adding_note {
+        // The text itself is in the entry dialog; the footer lists its keys.
+        let key = |k: &'static str| Span::styled(k, Style::default().fg(app.theme.warning));
         Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!(" + to {}  ", app.inbox_path),
-                Style::default().fg(app.theme.accent),
-            ),
-            Span::styled(
-                app.quick_add_query.clone(),
-                Style::default().fg(app.theme.success),
-            ),
-            Span::styled(cursor, Style::default().add_modifier(Modifier::SLOW_BLINK)),
+            Span::raw(" "),
+            key("Enter"),
+            Span::raw(" save  ·  "),
+            key("Esc"),
+            Span::raw(" cancel  ·  "),
+            key("←→↑↓"),
+            Span::raw(" move  ·  "),
+            key("^A/^E"),
+            Span::raw(" start/end  ·  "),
+            key("^W/^U/^K"),
+            Span::raw(" delete word/to start/to end "),
         ]))
-        .style(Style::new())
+        .style(Style::new().add_modifier(Modifier::DIM))
     } else if app.moving {
         // ADR-0020: move-mode indicator. No text entry — just the live gesture help.
         Paragraph::new(Line::from(vec![
@@ -2856,23 +2833,6 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Span::raw(" place  ·  "),
             Span::styled("Esc", Style::default().fg(app.theme.warning)),
             Span::raw(" cancel "),
-        ]))
-        .style(Style::new())
-    } else if app.adding_note {
-        // ADR-0019: add-note modal prompt. Mirrors the quick-add layout but uses a
-        // "note" label — the write targets the selected task's note, not the inbox.
-        let cursor = if (app.note_query.len() as u16) < footer_area.width.saturating_sub(12) {
-            "█"
-        } else {
-            ""
-        };
-        Paragraph::new(Line::from(vec![
-            Span::styled(" note  ", Style::default().fg(app.theme.accent)),
-            Span::styled(
-                app.note_query.clone(),
-                Style::default().fg(app.theme.success),
-            ),
-            Span::styled(cursor, Style::default().add_modifier(Modifier::SLOW_BLINK)),
         ]))
         .style(Style::new())
     } else {
@@ -2901,6 +2861,13 @@ fn draw(frame: &mut Frame, app: &mut App) {
         .style(Style::new().add_modifier(Modifier::DIM))
     };
     frame.render_widget(footer, footer_area);
+
+    if app.quick_adding {
+        let title = format!(" + Add task → {} ", app.inbox_path);
+        app.input_width = draw_input_dialog(frame, area, &title, &app.quick_add_query, &app.theme);
+    } else if app.adding_note {
+        app.input_width = draw_input_dialog(frame, area, " Add note ", &app.note_query, &app.theme);
+    }
 
     // The help overlay is rendered LAST so it floats on top of everything else
     // (list, notice, footer). `Clear` wipes the cells beneath so the popup's
@@ -3265,6 +3232,199 @@ fn help_dismisses_on(key: KeyCode) -> bool {
 /// the popup's width / height as a percentage (0–100) of `area`; the rect is
 /// centered on both axes. The well-known ratatui idiom: split the area into
 /// [margin | content | margin] on each axis and take the middle chunk.
+/// One line of text typed in an entry dialog (`a` quick-add, `n` add-note) with a
+/// char-indexed cursor. Never holds a newline — a task is one line; the dialog
+/// soft-wraps it for display.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct TextInput {
+    text: String,
+    /// Cursor position, in chars.
+    cursor: usize,
+}
+
+fn char_width(c: char) -> usize {
+    Span::raw(c.to_string()).width()
+}
+
+impl TextInput {
+    fn len(&self) -> usize {
+        self.text.chars().count()
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn byte(&self, char_idx: usize) -> usize {
+        self.text
+            .char_indices()
+            .nth(char_idx)
+            .map_or(self.text.len(), |(b, _)| b)
+    }
+
+    fn insert(&mut self, c: char) {
+        let b = self.byte(self.cursor);
+        self.text.insert(b, c);
+        self.cursor += 1;
+    }
+
+    /// Delete the chars in `[from, to)`, leaving the cursor at `from`.
+    fn delete(&mut self, from: usize, to: usize) {
+        let (a, b) = (self.byte(from), self.byte(to));
+        self.text.replace_range(a..b, "");
+        self.cursor = from;
+    }
+
+    /// Soft-wrap into rows of at most `width` columns; returns each row's first
+    /// char index. Char-wrapped (not word-wrapped) so the cursor maps exactly.
+    fn row_starts(&self, width: usize) -> Vec<usize> {
+        let mut starts = vec![0];
+        let mut used = 0;
+        for (i, c) in self.text.chars().enumerate() {
+            let w = char_width(c);
+            if used + w > width && used > 0 {
+                starts.push(i);
+                used = 0;
+            }
+            used += w;
+        }
+        starts
+    }
+
+    /// The cursor's `(row, column)` in the wrapped layout. A cursor after a full
+    /// last row sits at the start of the row below it.
+    fn cursor_pos(&self, width: usize) -> (usize, usize) {
+        let starts = self.row_starts(width);
+        let row = starts.iter().rposition(|&s| s <= self.cursor).unwrap_or(0);
+        let col = self
+            .text
+            .chars()
+            .skip(starts[row])
+            .take(self.cursor - starts[row])
+            .map(char_width)
+            .sum();
+        if col >= width {
+            (row + 1, 0)
+        } else {
+            (row, col)
+        }
+    }
+
+    /// `↑`/`↓`: move to the same column on the wrapped row above/below.
+    fn move_vertical(&mut self, width: usize, delta: isize) {
+        let starts = self.row_starts(width);
+        let (row, col) = self.cursor_pos(width);
+        let Some(target) = row.checked_add_signed(delta).filter(|&r| r < starts.len()) else {
+            return;
+        };
+        let end = starts.get(target + 1).map_or(self.len(), |&e| e - 1);
+        let (mut i, mut used) = (starts[target], 0);
+        for c in self.text.chars().skip(i) {
+            if i >= end || used + char_width(c) > col {
+                break;
+            }
+            used += char_width(c);
+            i += 1;
+        }
+        self.cursor = i;
+    }
+}
+
+/// Readline-style editing in an entry dialog. `Enter`/`Esc` are the caller's;
+/// `width` is the dialog's text width (for `↑`/`↓`).
+fn edit_input(input: &mut TextInput, key: KeyEvent, width: usize) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let (cur, len) = (input.cursor, input.len());
+    match key.code {
+        KeyCode::Char('a') if ctrl => input.cursor = 0,
+        KeyCode::Char('e') if ctrl => input.cursor = len,
+        KeyCode::Char('u') if ctrl => input.delete(0, cur),
+        KeyCode::Char('k') if ctrl => input.delete(cur, len),
+        KeyCode::Char('w') if ctrl => {
+            let chars: Vec<char> = input.text.chars().collect();
+            let mut i = cur;
+            while i > 0 && chars[i - 1] == ' ' {
+                i -= 1;
+            }
+            while i > 0 && chars[i - 1] != ' ' {
+                i -= 1;
+            }
+            input.delete(i, cur);
+        }
+        KeyCode::Char(_) if ctrl => {}
+        KeyCode::Char(c) => input.insert(c),
+        KeyCode::Backspace if cur > 0 => input.delete(cur - 1, cur),
+        KeyCode::Delete if cur < len => input.delete(cur, cur + 1),
+        KeyCode::Left => input.cursor = cur.saturating_sub(1),
+        KeyCode::Right => input.cursor = (cur + 1).min(len),
+        KeyCode::Home => input.cursor = 0,
+        KeyCode::End => input.cursor = len,
+        KeyCode::Up => input.move_vertical(width, -1),
+        KeyCode::Down => input.move_vertical(width, 1),
+        _ => {}
+    }
+}
+
+/// Draw a centred entry dialog showing `input` soft-wrapped, with the terminal
+/// cursor placed at its cursor. Grows with the text (3 rows minimum) and scrolls
+/// to keep the cursor visible. Returns the text width.
+fn draw_input_dialog(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    input: &TextInput,
+    theme: &theme::Theme,
+) -> usize {
+    let w = (area.width * 7 / 10).max(30).min(area.width);
+    let width = w.saturating_sub(2).max(1) as usize;
+    let starts = input.row_starts(width);
+    let (row, col) = input.cursor_pos(width);
+    let max_rows = area.height.saturating_sub(4).max(1) as usize;
+    let rows = starts
+        .len()
+        .max(row + 1)
+        .clamp(3, max_rows.max(3))
+        .min(max_rows);
+    let top = (row + 1).saturating_sub(rows);
+    let h = rows as u16 + 2;
+    let popup = Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 3,
+        width: w,
+        height: h.min(area.height),
+    };
+    let chars: Vec<char> = input.text.chars().collect();
+    let lines: Vec<Line> = starts
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| {
+            let e = starts.get(i + 1).copied().unwrap_or(chars.len());
+            Line::from(chars[s..e].iter().collect::<String>())
+        })
+        .collect();
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            title.to_string(),
+            Style::default().fg(theme.accent),
+        ))
+        .style(Style::default().bg(theme.background));
+    let inner = block.inner(popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().fg(theme.success))
+            .scroll((top as u16, 0))
+            .block(block),
+        popup,
+    );
+    frame.set_cursor_position(Position {
+        x: inner.x + col as u16,
+        y: inner.y + (row - top) as u16,
+    });
+    width
+}
+
 fn popup_area(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
     let vertical = Layout::vertical([
         Constraint::Percentage((100 - percent_y) / 2),
@@ -4019,7 +4179,7 @@ mod tests {
         let conn = db::open(":memory:").unwrap();
         let mut app = App::new();
         app.inbox_path = "task-inbox.md".to_string();
-        app.quick_add_query = "my new task".to_string();
+        app.quick_add_query.text = "my new task".to_string();
         app.quick_adding = true;
 
         app.submit_quick_add(&conn);
@@ -4044,7 +4204,7 @@ mod tests {
         // Modal exited + query cleared.
         assert!(!app.quick_adding, "modal must exit after submit");
         assert!(
-            app.quick_add_query.is_empty(),
+            app.quick_add_query.text.is_empty(),
             "query must be cleared after submit"
         );
     }
@@ -4055,7 +4215,7 @@ mod tests {
     fn quick_add_empty_text_is_noop() {
         let conn = db::open(":memory:").unwrap();
         let mut app = App::new();
-        app.quick_add_query = "   ".to_string();
+        app.quick_add_query.text = "   ".to_string();
         app.quick_adding = true;
 
         app.submit_quick_add(&conn);
@@ -4101,7 +4261,7 @@ mod tests {
         let conn = db::open(":memory:").unwrap();
         let mut app = App::new();
         app.inbox_path = "task-inbox.md".to_string();
-        app.quick_add_query = "my task".to_string();
+        app.quick_add_query.text = "my task".to_string();
         app.quick_adding = true;
         app.submit_quick_add(&conn);
         let id = db::pending_actions(&conn).unwrap()[0].id;
@@ -7265,5 +7425,68 @@ mod tests {
         assert_eq!(text, ["    [ ] alpha", "        beta", "        gamma"]);
         assert!(lines.iter().all(|l| l.width() <= 16));
         assert_eq!(links, [(2, 8, 5, "u".to_string())]);
+    }
+
+    fn typed(keys: &[KeyEvent]) -> TextInput {
+        let mut input = TextInput::default();
+        for &k in keys {
+            edit_input(&mut input, k, 4);
+        }
+        input
+    }
+
+    #[test]
+    fn edit_input_readline_keys() {
+        let k = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let chars = |s: &str| s.chars().map(|c| k(KeyCode::Char(c))).collect::<Vec<_>>();
+
+        // Insert mid-text after Ctrl-A / arrows; Ctrl-E back to the end.
+        let mut keys = chars("bd");
+        keys.extend([ctrl('a'), k(KeyCode::Char('a')), k(KeyCode::Right)]);
+        keys.push(k(KeyCode::Char('c')));
+        keys.extend([ctrl('e'), k(KeyCode::Char('e'))]);
+        let input = typed(&keys);
+        assert_eq!((input.text.as_str(), input.cursor), ("abcde", 5));
+
+        // Ctrl-W deletes the word before the cursor; Ctrl-U/K split around it.
+        let mut keys = chars("one two");
+        keys.push(ctrl('w'));
+        assert_eq!(typed(&keys).text, "one ");
+        let mut keys = chars("abcd");
+        keys.extend([k(KeyCode::Left), k(KeyCode::Left), ctrl('k')]);
+        assert_eq!(typed(&keys).text, "ab");
+        keys.push(ctrl('u'));
+        assert_eq!(typed(&keys).text, "");
+
+        // Width 4: "abcdefghij" wraps to rows at 0, 4, 8; ↑ keeps the column.
+        let mut keys = chars("abcdefghij");
+        let input = typed(&keys);
+        assert_eq!(input.row_starts(4), [0, 4, 8]);
+        assert_eq!(input.cursor_pos(4), (2, 2));
+        keys.push(k(KeyCode::Up));
+        assert_eq!(typed(&keys).cursor, 6);
+        keys.extend([k(KeyCode::Up), k(KeyCode::Up), k(KeyCode::Down)]);
+        assert_eq!(typed(&keys).cursor, 6);
+    }
+
+    #[test]
+    fn draw_quick_add_dialog_wraps_long_text() {
+        use ratatui::backend::TestBackend;
+
+        for (w, h) in [(80, 24), (30, 6)] {
+            let mut app = App::new();
+            app.start_quick_add();
+            app.quick_add_query.text = "word ".repeat(60);
+            app.quick_add_query.cursor = 300;
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            let buf = terminal.backend().buffer();
+            let rows_with_text = (0..h)
+                .filter(|&y| (0..w).any(|x| buf[(x, y)].symbol() == "w"))
+                .count();
+            assert!(rows_with_text >= 2, "{w}x{h}: long text should span rows");
+            assert!(app.input_width < w as usize);
+        }
     }
 }

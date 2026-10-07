@@ -285,6 +285,13 @@ filter predicates within each bucket and emits `Header` + `Task` rows.
 While a search prompt is active: `Esc` cancels (clears filter), `Enter` dismisses (keeps
 filter), `Backspace` edits query, characters build query.
 
+The `a` quick-add and `n` add-note text is typed in a centred dialog that soft-wraps
+(char-wrap, grows with the text, scrolls past the screen height) and shows the real
+terminal cursor. Editing (`TextInput` + `edit_input`): `←`/`→`, `↑`/`↓` (same column on
+the wrapped row), `Home`/`End`, `Ctrl-A`/`Ctrl-E`, `Backspace`/`Delete`, `Ctrl-W` (word
+back), `Ctrl-U`/`Ctrl-K` (to start / to end). `Enter` saves, `Esc`/`Ctrl-C` cancel. The
+text stays one line — a task line can't hold a newline.
+
 The footer cheat-sheet is trimmed to the most-used gestures (`j/k move · Space toggle ·
 Enter fold · f filter · / search · ? help · q quit`); the full keybinding list lives in the
 floating help overlay opened by `?`. The overlay is modal — it intercepts keys before
