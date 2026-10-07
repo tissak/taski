@@ -5,6 +5,10 @@
 //! either component alone. Combined mode is **in-process** (ADR-0007) and protected by a
 //! **single-writer file lock** (ADR-0008); on TUI quit the daemon drains pending actions
 //! and exits. The TUI still never touches vault files; the daemon stays the sole writer.
+//! The remaining subcommands (`list`, `show`, `done`, …) are the scriptable CLI for AI
+//! agents and shell use — see [`cli`] and ADR-0027.
+
+mod cli;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -23,7 +27,7 @@ use taski_daemon::{
 #[command(
     name = "taski",
     version,
-    about = "Run the Taski daemon and TUI together, or either alone"
+    about = "Run the Taski daemon and TUI together, or either alone; script tasks via the CLI subcommands"
 )]
 struct Cli {
     /// Run only the daemon, or only the TUI. With no subcommand, run both (the default).
@@ -46,14 +50,59 @@ enum Mode {
     Daemon,
     /// Run only the TUI. A reader — safe to run alongside any running daemon.
     Tui,
+    /// List tasks (default: open, in-progress and blocked). Prints `id  [c] text  path:line`.
+    List(cli::ListArgs),
+    /// Show one task plus the surrounding lines of its note.
+    Show {
+        id: i64,
+        /// Lines of note context on each side of the task.
+        #[arg(long, default_value_t = 5)]
+        context: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mark a task done `[x]` (stamps ✅ today).
+    Done { id: i64 },
+    /// Re-open a task `[ ]` (clears ✅/❌).
+    Open { id: i64 },
+    /// Mark a task in progress `[/]`.
+    Start { id: i64 },
+    /// Mark a task blocked `[!]`.
+    Block { id: i64 },
+    /// Cancel a task `[-]` (stamps ❌ today).
+    Cancel { id: i64 },
+    /// Set or clear a task's ⏳ scheduled date: YYYY-MM-DD, `today`, or `none`.
+    Schedule { id: i64, date: String },
+    /// Append a new task to the inbox note (stamps ➕ today).
+    Add {
+        #[arg(required = true, num_args = 1..)]
+        text: Vec<String>,
+    },
+    /// Append a note under a task (its `## task-notes` section, ADR-0019).
+    Note {
+        id: i64,
+        #[arg(required = true, num_args = 1..)]
+        text: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-    match cli.mode {
+    let mut cli = Cli::parse();
+    let ctx = || cli::Ctx::load(cli.vault.as_deref(), cli.db.as_deref());
+    match cli.mode.take() {
         Some(Mode::Daemon) => run_daemon_only(cli),
         Some(Mode::Tui) => taski_tui::run_with_db(cli.db),
         None => run_combined(cli),
+        Some(Mode::List(a)) => cli::list(&ctx()?, &a),
+        Some(Mode::Show { id, context, json }) => cli::show(&ctx()?, id, context, json),
+        Some(Mode::Done { id }) => cli::set_status(&ctx()?, id, cli::Target::Done),
+        Some(Mode::Open { id }) => cli::set_status(&ctx()?, id, cli::Target::Open),
+        Some(Mode::Start { id }) => cli::set_status(&ctx()?, id, cli::Target::Start),
+        Some(Mode::Block { id }) => cli::set_status(&ctx()?, id, cli::Target::Block),
+        Some(Mode::Cancel { id }) => cli::set_status(&ctx()?, id, cli::Target::Cancel),
+        Some(Mode::Schedule { id, date }) => cli::schedule(&ctx()?, id, &date),
+        Some(Mode::Add { text }) => cli::add(&ctx()?, &text.join(" ")),
+        Some(Mode::Note { id, text }) => cli::note(&ctx()?, id, &text.join(" ")),
     }
 }
 

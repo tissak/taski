@@ -70,6 +70,22 @@ TUI only (a reader; safe alongside any running daemon):
 taski tui
 ```
 
+## 5. Let AI agents use Taski
+
+The `taski` binary doubles as a scriptable CLI (ADR-0027):
+
+```sh
+taski list --today            # what's on today (add --json for machine output)
+taski show 42                 # a task plus its note context
+taski done 42                 # mark done (also: open, start, block, cancel)
+taski schedule 42 today       # set ⏳ (YYYY-MM-DD, today, none)
+taski add "Call the plumber"  # new inbox task
+```
+
+Give agents the skill in [`skills/taski/SKILL.md`](../skills/taski/SKILL.md). For Claude
+Code, link it in: `ln -s "$PWD/skills/taski" ~/.claude/skills/taski`. Make sure
+`taski` is on the agent's `PATH` (e.g. `cargo install --path crates/taski`).
+
 ## Uninstall
 
 ```sh
