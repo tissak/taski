@@ -47,8 +47,40 @@ Filters combine (AND). Plain-text output is one task per line:
 ```
 
 That's id, checkbox and task text (including its metadata emojis), then
-`note_path:line`. Checkbox chars: `[ ]` open, `[/]` in progress, `[!]` blocked,
-`[x]` done, `[-]` cancelled.
+`note_path:line`.
+
+## Statuses
+
+A task's status is its checkbox character. Map the user's words to this table. The
+Taski board (TUI) uses the lane names Doing, Blocked, Todo and Done.
+
+| User says | Checkbox | JSON `status` | Find them | Set it |
+|---|---|---|---|---|
+| todo, open, not started | `[ ]` | `open` | `taski list \| grep -F '[ ]'` | `taski open <id>` |
+| doing, in progress, started, working on | `[/]` | `in_progress` | `taski list \| grep -F '[/]'` | `taski start <id>` |
+| blocked, waiting, stuck | `[!]` | `blocked` | `taski list \| grep -F '[!]'` | `taski block <id>` |
+| done, finished, complete | `[x]` | `done` | `taski list --status done` | `taski done <id>` |
+| cancelled, dropped, won't do | `[-]` | `cancelled` | `taski list --status cancelled` | `taski cancel <id>` |
+
+`--status` only accepts `open`, `done`, `cancelled` and `all`. There is **no**
+`--status in_progress`, `--status blocked` or `--status doing`. `--status open` (the
+default) means all active work: todo, doing and blocked together. To get just one of
+those three, grep the plain-text output for its checkbox as shown above. Any other
+checkbox character shows up as JSON `status` `other`.
+
+## Keep output small
+
+Large output can be cut off by your tool's output limit, and a cut-off JSON array won't
+parse.
+
+- Narrow first: `--today`, `--overdue`, `--tag`, `--file`, `--search`, or a
+  `grep -F` on the checkbox. Don't run a bare `taski list --json` just to filter it
+  yourself.
+- Prefer plain text. Use `--json` only when you need fields the text line doesn't show
+  (dates as separate fields, absolute `path`, tags list).
+- When you do use JSON, pipe it straight into the parser so the full output never
+  passes through your tool's output:
+  `taski list --tag home --json | python3 -c 'import json,sys; ...'`
 
 `--json` gives one object per task:
 
@@ -59,7 +91,7 @@ That's id, checkbox and task text (including its metadata emojis), then
  "cancelled":null,"priority":null,"tags":["home"]}
 ```
 
-`status` is one of `open`, `in_progress`, `blocked`, `done`, `cancelled`, `other`.
+`status` values are in the Statuses table above.
 `priority` is the emoji: 🔺 highest, ⏫ high, 🔼 medium, 🔽 low, ⏬ lowest. `line` is
 where the task was at the last scan; treat it as a hint for reading the file, not as
 identity.
