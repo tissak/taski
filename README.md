@@ -18,11 +18,11 @@ A few things I cared about enough to build around:
 - **Getting back to the note fast.** When a task does need its full context — or editing — I want to be one keypress from the source note in Obsidian. So `o` opens it via a deep link.
 - **Not reinventing standards.** Completion, scheduling, and cancellation are written back using the [Obsidian Tasks](https://publish.obsidian.md/tasks/) plugin's date-emoji syntax (`✅ ⏳ ❌ ➕`). What Taski writes, Obsidian and its plugins already understand — and vice versa.
 
-It's a personal tool, narrow on purpose: no mobile, no kanban, no sync. It fits *one* workflow — mine — well, rather than many adequately.
+It's a personal tool, narrow on purpose: no mobile, no sync. It fits *one* workflow — mine — well, rather than many adequately.
 
 ## How it works (in one breath)
 
-Obsidian stays the source of truth. A background daemon watches one vault, parses every checkbox task into a local SQLite index, and is the **sole writer** back to your notes. The TUI only reads the index and submits intents; the daemon performs every write atomically, re-checking the file bytes immediately before it writes and **refusing rather than clobbering** if the note changed underneath it. The only things ever written into a note are the change you asked for — a checkbox flip or a standard date stamp — under a strict, property-tested grammar. Your prose is never touched.
+Obsidian stays the source of truth. A background daemon watches one vault, parses every checkbox task into a local SQLite index, and is the **sole writer** back to your notes. The TUI (and the scriptable `taski` CLI) only reads the index and submits intents; the daemon performs every write atomically, re-checking the file bytes immediately before it writes and **refusing rather than clobbering** if the note changed underneath it. The only things ever written into a note are the change you asked for — a checkbox flip, a standard date stamp, an appended task or note, a reorder or archive of task lines — each under a strict, property-tested contract. Your prose is never rewritten.
 
 
 ## Features
@@ -32,16 +32,36 @@ A keyboard-driven TUI. Press `?` in the app for the full keybinding overlay.
 - **Browse** every task across the vault, grouped by folder+note / note / tag / priority / folder (cycle with `G`).
 - **Filter** by status (`f`), today (`T`), overdue (`O`), text search (`/`), and file search (`F`) — all compose.
 - **See context** — `p` toggles the in-note context pane; `J`/`K` scroll it. This is the whole point.
+- **Board view** — `B` swaps the list for a kanban board with Doing `[/]` → Blocked `[!]` → Todo `[ ]` → Done `[x]` lanes; `<`/`>` move a task between lanes.
+- **Readable links** — `[label](url)` and `[[note|alias]]` in task text show as just the label, clickable in terminals that support OSC 8 hyperlinks.
 - **Act** without leaving the keyboard:
   - `Space` — toggle open ↔ done (stamps `✅`)
   - `t` — mark / unmark for today (`⏳`)
+  - `i` — toggle in progress (`[/]`)
   - `d` — cancel (`❌`)
   - `b` — toggle checkbox ↔ bullet
   - `a` — quick-add to an inbox note (`➕`)
   - `n` — add a closing note to the task (grouped under a `## task-notes` section, with a clickable in-page link)
   - `m` — move mode: reorder a task within its note (`j`/`k` to bubble, `Enter` to place, `Esc` to cancel)
+  - `A` — archive the note's done and cancelled tasks into an archive note
   - `u` — undo
   - `o` — open the task's note in Obsidian (native deep link, or exact-line jump with the [Advanced URI](https://github.com/Vinzent03/obsidian-advanced-uri) plugin)
+
+## Scripting and AI agents
+
+The `taski` binary doubles as a CLI, so AI agents (or shell scripts) can work with your tasks through bash — with the same conflict-checked write path as the TUI:
+
+```sh
+taski list --today              # what's on today (filters: --overdue --tag --file --search --status)
+taski list --tag home --json    # machine-readable, with each task's note path and line
+taski show 42                   # a task plus the lines around it in its note
+taski done 42                   # also: open, start, block, cancel
+taski schedule 42 today         # set ⏳ (YYYY-MM-DD, today, none)
+taski add "Call the plumber"    # new task in the inbox note
+taski note 42 "Quoted 350"      # attach a note to a task
+```
+
+Writes work whether or not the daemon is running, and print the updated task. Give your agent the skill in [`skills/taski/SKILL.md`](./skills/taski/SKILL.md) — for Claude Code: `ln -s "$PWD/skills/taski" ~/.claude/skills/taski`.
 
 ## Quick start
 
@@ -74,7 +94,8 @@ Then `taski` will *attach* to the running daemon (TUI only) instead of spawning 
 ```toml
 vault = "/path/to/your/vault"                       # required by the daemon; no default
 db    = "/Users/you/.local/share/taski/taski.db"    # defaults to ./taski.db
-inbox_path = "task-inbox.md"                        # quick-add (`a`) target note
+inbox_path = "task-inbox.md"                        # quick-add (`a`, `taski add`) target note
+archive_path = "task-archive.md"                    # archive (`A`) target note
 
 # Directories to skip when scanning (relative to vault root):
 exclude_dirs = ["_System/Templates"]
@@ -84,20 +105,22 @@ obsidian_vault    = "My Vault"   # optional override; defaults to the vault fold
 use_advanced_uri  = false         # true → jump to the task's exact line (needs the plugin)
 ```
 
+Colours (`[theme]`, including a ready-made Nord palette) and pane layout (`[ui]`) are configurable too — see [`docs/config.md`](./docs/config.md).
+
 ## What Taski is *not*
 
 These are deliberate, not gaps:
 
 - **No mobile, web, or GUI app.** Terminal only.
 - **No sync, collaboration, or multi-vault.** A personal, single-user, single-vault tool.
-- **No free-text editing of tasks from the TUI.** Writes are bounded to checkbox flips and Obsidian-standard date stamps, by design — safety over flexibility. When I need to edit the words, I'm one `o` keypress from the note in Obsidian.
+- **No free-text editing of tasks.** Writes are bounded to a fixed set of operations — checkbox flips, Obsidian-standard date stamps, appending new tasks and notes, reordering and archiving — by design: safety over flexibility. When I need to edit the words, I'm one `o` keypress from the note in Obsidian.
 - **No packaging / one-click install.** You build it from source.
 
 ## Under the hood
 
 If you want the full architecture — the SQLite decoupling boundary, the conflict-checked write-back contract, the data model, and the reasoning behind each load-bearing decision — it all lives in [`docs/context.md`](./docs/context.md), with the *why* behind each choice recorded in [`docs/adr/`](./docs/adr/).
 
-The short version: a small Rust workspace (`ratatui` · `rusqlite`/WAL · `notify` · `tracing`), edition 2024, stable toolchain. The daemon is the sole writer; the TUI only reads the index and enqueues intents. The write-back "never corrupts a note" contract is guarded by 256-case property tests.
+The short version: a small Rust workspace (`ratatui` · `rusqlite`/WAL · `notify` · `tracing`), edition 2024, stable toolchain. The daemon is the sole writer; the TUI and CLI only read the index and enqueue intents. The write-back "never corrupts a note" contract is guarded by 256-case property tests.
 
 ```sh
 cargo fmt --all --check && cargo clippy --all-targets -- -D warnings && cargo test --all

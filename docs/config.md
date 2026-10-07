@@ -61,6 +61,10 @@ db = "./taski.db"
 # appended here as `- [ ] <text> ➕ <today>`.
 inbox_path = "task-inbox.md"
 
+# Archive (`A` key) note, relative to the vault root. Completed tasks are moved
+# here; created on first use.
+archive_path = "task-archive.md"
+
 # Vault name used for `obsidian://` deep links (the `o` key). Defaults to the
 # basename of `vault`; set only if your Obsidian vault name differs from the
 # folder name. (Shown commented because the default is derived, not literal.)
@@ -112,6 +116,7 @@ context_wrap      = false        # wrap context-pane lines instead of truncating
 | `vault` | string | — (required) | Obsidian vault root. No default; set here or pass `--vault`. |
 | `db` | string | `./taski.db` | SQLite index path. Override per-run with `--db`. |
 | `inbox_path` | string | `task-inbox.md` | Quick-add target note, relative to vault root. |
+| `archive_path` | string | `task-archive.md` | Archive (`A`) target note, relative to vault root. Created on first use. |
 | `obsidian_vault` | string | basename of `vault` | Only set if the Obsidian vault name ≠ folder name. |
 | `use_advanced_uri` | bool | `false` | `true` uses the Advanced URI plugin so `o` targets the exact line. |
 | `exclude_dirs` | array&lt;string&gt; | `[]` | Vault-relative dirs to skip. Hidden dirs always excluded. |
