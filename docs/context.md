@@ -1,6 +1,6 @@
 # Taski — Engineering Context & Onboarding
 
-*Onboarding guide for new engineers. Last updated: 2026-09-07 (post-v0.4 — adds Tier 1 metadata parsing [tags, priority, start/created/done/cancelled dates], Tier 2 views [overdue `O`, group-by cycling `G`], the `✅` done-date stamp on toggle [ADR-0012], the `❌` cancelled-date stamp on cancel [ADR-0013], the `➕` quick-add inbox creation [ADR-0014], the `o` open-in-Obsidian deep-link gesture [ADR-0015], the `i` in-progress toggle gesture [ADR-0016], and the `taski-skip` frontmatter opt-out [ADR-0017]; user-configurable TUI theming + per-panel density knobs [ADR-0018], followed by a global `bold` style toggle [off by default — color contrast carries emphasis] and a finer note-grouping split [`folder+note` / `note` / `folder`], and the `n` add-note task-annotation gesture [grouped `## task-notes` section + aliased in-page link, ADR-0019], and the `m` move-mode task-reordering gesture [TUI-local reorder committed as one in-note line-content permutation, ADR-0020], and the `A` archive-completed gesture [copy-then-delete move of a note's done/cancelled tasks into a designated archive note, ADR-0021], and the `T` Today view widened to also surface due-today tasks [scheduled OR due == today, ADR-0022], and the `O` Overdue view widened to also surface past-scheduled tasks [due OR scheduled < today, ADR-0023], and "today" redefined as the user's local calendar date everywhere — views and stamps — instead of UTC [ADR-0024], and the `B` kanban board — status lanes as full-width rows [Doing `[/]` / Blocked `[!]` / Todo `[ ]` / Done `[x]`], `<`/`>` lane moves as plain checkbox flips, `[!]` counted as open [ADR-0025]; 453 tests across 6 crates).*
+*Onboarding guide for new engineers. Last updated: 2026-09-07 (post-v0.4 — adds Tier 1 metadata parsing [tags, priority, start/created/done/cancelled dates], Tier 2 views [overdue `O`, group-by cycling `G`], the `✅` done-date stamp on toggle [ADR-0012], the `❌` cancelled-date stamp on cancel [ADR-0013], the `➕` quick-add inbox creation [ADR-0014], the `o` open-in-Obsidian deep-link gesture [ADR-0015], the `i` in-progress toggle gesture [ADR-0016], and the `taski-skip` frontmatter opt-out [ADR-0017]; user-configurable TUI theming + per-panel density knobs [ADR-0018], followed by a global `bold` style toggle [off by default — color contrast carries emphasis] and a finer note-grouping split [`folder+note` / `note` / `folder`], and the `n` add-note task-annotation gesture [grouped `## task-notes` section + aliased in-page link, ADR-0019], and the `m` move-mode task-reordering gesture [TUI-local reorder committed as one in-note line-content permutation, ADR-0020], and the `A` archive-completed gesture [copy-then-delete move of a note's done/cancelled tasks into a designated archive note, ADR-0021], and the `T` Today view widened to also surface due-today tasks [scheduled OR due == today, ADR-0022], and the `O` Overdue view widened to also surface past-scheduled tasks [due OR scheduled < today, ADR-0023], and "today" redefined as the user's local calendar date everywhere — views and stamps — instead of UTC [ADR-0024], and the `B` kanban board — status lanes as full-width rows [Doing `[/]` / Blocked `[!]` / Todo `[ ]` / Done `[x]`], `<`/`>` lane moves as plain checkbox flips, `[!]` counted as open [ADR-0025], and compact clickable links — `[label](url)` / `[[note|alias]]` render as just the label, hyperlinked via OSC 8 [ADR-0026]; 456 tests across 6 crates).*
 
 This document is the "operating manual" for working on Taski: what it is, how it's
 built, the decisions that are load-bearing (and must not be casually undone), and the
@@ -617,6 +617,15 @@ the frontmatter grammar is a load-bearing contract future parsing must respect.
     lane-scopes header keys with `\u{1f}` so fold state is per lane; whole lanes fold via `App::folded_lanes` (Done folded by default). `[!]` blocked now counts
     as open (`is_open_like`). TUI-only.
 
+26. **Compact, clickable links** ([ADR-0026](./adr/0026-compact-clickable-links.md)) —
+    task-row links render as just their label (`split_links`: `[label](url)`,
+    `[[target|label]]`, `[[target]]`; embeds stay raw), underlined in the accent colour.
+    After the list renders, `apply_hyperlinks` wraps each label cell in an **OSC 8**
+    hyperlink with `CellDiffOption::ForcedWidth(1)` so the terminal opens it on click — no
+    mouse capture. `link_url` resolves web URLs (scheme or `www.`) and wiki links
+    (`obsidian://open`, needs the vault name) and **refuses any target containing a control
+    char** (untrusted note text must not escape the OSC sequence). Display-only, TUI-local.
+
 ---
 
 ## Gotchas & Landmines (read this before you change anything)
@@ -729,6 +738,11 @@ These are the things that aren't obvious from reading the code and will cost you
 - **Tags are local-only.** `v0.1` and all commits exist only in the local repo until
   pushed. There is currently no remote set up in this working tree — confirm before
   assuming `git push` will work.
+
+- **Never put escape sequences inside a ratatui `Span`.** ratatui counts the bytes as visible
+  width and shifts the row. Terminal hyperlinks go through `apply_hyperlinks`, which edits
+  rendered buffer cells and pins them with `CellDiffOption::ForcedWidth(1)` (ADR-0026). Any
+  URL written into an escape must be control-char-free — `link_url` enforces this.
 
 - **The `run_loop` branches on search state before normal key dispatch.** When
   `app.searching` or `app.file_searching` is true, most keystrokes build the search query

@@ -11,6 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,6 +22,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::{execute, terminal::EnterAlternateScreen, terminal::LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
+use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -213,6 +215,126 @@ fn percent_encode_query(s: &str) -> String {
         }
     }
     out
+}
+
+/// ADR-0026: a run of task text — plain, or a link shown compacted to its label.
+#[derive(Debug, PartialEq)]
+enum TextSeg<'a> {
+    Plain(&'a str),
+    /// `[label](url)`
+    Md {
+        label: &'a str,
+        url: &'a str,
+    },
+    /// `[[target]]` / `[[target|label]]`
+    Wiki {
+        target: &'a str,
+        label: &'a str,
+    },
+}
+
+/// Split task text into plain runs and Markdown / wiki links. Embeds (`![…](…)`,
+/// `![[…]]`) and malformed brackets stay plain.
+fn split_links(text: &str) -> Vec<TextSeg<'_>> {
+    let mut segs = Vec::new();
+    let mut plain = 0; // start of the pending plain run
+    let mut i = 0;
+    while let Some(off) = text[i..].find('[') {
+        let at = i + off;
+        match parse_link(&text[at..]) {
+            Some((len, seg)) if !text[..at].ends_with('!') => {
+                if plain < at {
+                    segs.push(TextSeg::Plain(&text[plain..at]));
+                }
+                segs.push(seg);
+                i = at + len;
+                plain = i;
+            }
+            _ => i = at + 1,
+        }
+    }
+    if plain < text.len() {
+        segs.push(TextSeg::Plain(&text[plain..]));
+    }
+    segs
+}
+
+/// Parse one link at the start of `s` (which begins with `[`), returning its byte
+/// length and segment.
+fn parse_link(s: &str) -> Option<(usize, TextSeg<'_>)> {
+    if let Some(rest) = s.strip_prefix("[[") {
+        let end = rest.find("]]")?;
+        let inner = &rest[..end];
+        if inner.is_empty() || inner.contains('[') {
+            return None;
+        }
+        let (target, label) = inner.split_once('|').unwrap_or((inner, inner));
+        return Some((end + 4, TextSeg::Wiki { target, label }));
+    }
+    let close = s.find(']')?;
+    let label = &s[1..close];
+    let rest = s[close + 1..].strip_prefix('(')?;
+    let end = rest.find(')')?;
+    let url = &rest[..end];
+    if label.is_empty()
+        || label.contains('[')
+        || url.is_empty()
+        || url.contains(char::is_whitespace)
+    {
+        return None;
+    }
+    Some((close + 2 + end + 1, TextSeg::Md { label, url }))
+}
+
+/// The URL a link opens, or `None` to show the label without a hyperlink. Web
+/// links need a scheme or a `www.` prefix (`https://` is added); relative paths
+/// aren't resolved. Wiki links open in Obsidian when the vault name is known; an
+/// in-page link (`[[#notes-…|Notes]]`, ADR-0019) opens the task's own note.
+fn link_url(seg: &TextSeg, note_path: &str, vault: Option<&str>) -> Option<String> {
+    let url = match seg {
+        TextSeg::Plain(_) => return None,
+        TextSeg::Md { url, .. } if url.contains("://") || url.starts_with("mailto:") => {
+            url.to_string()
+        }
+        TextSeg::Md { url, .. } if url.starts_with("www.") => format!("https://{url}"),
+        TextSeg::Md { .. } => return None,
+        TextSeg::Wiki { target, .. } => {
+            let file = target.split('#').next().unwrap_or_default();
+            let file = if file.is_empty() { note_path } else { file };
+            obsidian_url(vault?, file, 0, false)
+        }
+    };
+    // Note text is untrusted: a control char could break out of the OSC 8
+    // escape sequence and drive the terminal.
+    (!url.chars().any(char::is_control)).then_some(url)
+}
+
+/// A hyperlink on a rendered list row: `(column, width, url)`.
+type RowLink = (usize, usize, String);
+
+/// ADR-0026: wrap each link-label cell of the visible list rows in an OSC 8
+/// hyperlink so the terminal makes it clickable. `ForcedWidth(1)` keeps ratatui's
+/// diff from counting the escape bytes as visible columns. `area` is the list's
+/// inner area and `offset` its first visible item.
+fn apply_hyperlinks(buf: &mut Buffer, area: Rect, offset: usize, item_links: &[Vec<RowLink>]) {
+    let rows = item_links.iter().skip(offset).take(area.height as usize);
+    for (dy, links) in rows.enumerate() {
+        let y = area.y + dy as u16;
+        for (col, width, url) in links {
+            for x in (area.x as usize + col..area.x as usize + col + width)
+                .take_while(|&x| x < area.right() as usize)
+            {
+                let cell = &mut buf[(x as u16, y)];
+                // Leave wide glyphs alone; forcing them to width 1 would shift the row.
+                if Span::raw(cell.symbol()).width() != 1 {
+                    continue;
+                }
+                let symbol = format!("\x1b]8;;{url}\x1b\\{}\x1b]8;;\x1b\\", cell.symbol());
+                cell.set_symbol(&symbol)
+                    .set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::MIN));
+            }
+        }
+    }
 }
 
 /// Build an `obsidian://` deep-link URL for a task's location.
@@ -2503,12 +2625,19 @@ fn draw(frame: &mut Frame, app: &mut App) {
         frame.render_widget(Paragraph::new(msg).block(block), list_col);
     } else {
         // ADR-0018 S3: insert density blank-line separators between groups.
-        let items: Vec<ListItem> = app
+        // ADR-0026: each item carries its link hits (gaps carry none).
+        let (items, item_links): (Vec<ListItem>, Vec<Vec<RowLink>>) = app
             .rows
             .iter()
             .enumerate()
             .flat_map(|(i, r)| {
-                let item = row_to_item(r, &app.today, &app.theme, app.group_by);
+                let item = row_to_item(
+                    r,
+                    &app.today,
+                    &app.theme,
+                    app.group_by,
+                    app.vault_name.as_deref(),
+                );
                 // A Lane starts a section; a Header starts one unless it sits
                 // directly under its Lane divider.
                 let starts_section = match r {
@@ -2520,8 +2649,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
                     DisplayRow::Task { .. } => false,
                 };
                 if starts_section && i > 0 {
-                    let mut gap: Vec<ListItem> = (0..app.layout.list_density)
-                        .map(|_| ListItem::new(""))
+                    let mut gap: Vec<(ListItem, Vec<RowLink>)> = (0..app.layout.list_density)
+                        .map(|_| (ListItem::new(""), Vec::new()))
                         .collect();
                     gap.push(item);
                     gap
@@ -2529,11 +2658,13 @@ fn draw(frame: &mut Frame, app: &mut App) {
                     vec![item]
                 }
             })
-            .collect();
+            .unzip();
+        let inner = block.inner(list_col);
         let list = List::new(items)
             .block(block)
             .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
         frame.render_stateful_widget(list, list_col, &mut app.state);
+        apply_hyperlinks(frame.buffer_mut(), inner, app.state.offset(), &item_links);
     }
 
     // Write-back failure notice: red, between the list and the footer, only when set.
@@ -2729,8 +2860,10 @@ fn row_to_item(
     today: &str,
     theme: &theme::Theme,
     group_by: GroupBy,
-) -> ListItem<'static> {
-    match row {
+    vault: Option<&str>,
+) -> (ListItem<'static>, Vec<RowLink>) {
+    let mut links = Vec::new();
+    let item = match row {
         DisplayRow::Header {
             group_key,
             open_count,
@@ -2781,7 +2914,28 @@ fn row_to_item(
             // source-line indentation, so subtasks render at proportional depth.
             spans.push(Span::raw(" ".repeat(4 + task.indent)));
             spans.push(Span::styled(checkbox, checkbox_style(&task.status, theme)));
-            spans.push(Span::raw(format!(" {}", task.text)));
+            // ADR-0026: links show as just their label; hyperlinked when they resolve.
+            spans.push(Span::raw(" "));
+            for seg in split_links(&task.text) {
+                let label = match seg {
+                    TextSeg::Plain(s) => {
+                        spans.push(Span::raw(s.to_string()));
+                        continue;
+                    }
+                    TextSeg::Md { label, .. } | TextSeg::Wiki { label, .. } => label,
+                };
+                let link = Span::styled(
+                    label.to_string(),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::UNDERLINED | theme.bold_modifier()),
+                );
+                if let Some(url) = link_url(&seg, &task.note_path, vault) {
+                    let col = spans.iter().map(Span::width).sum();
+                    links.push((col, link.width(), url));
+                }
+                spans.push(link);
+            }
             if let Some(due) = &task.due_date {
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(
@@ -2827,7 +2981,8 @@ fn row_to_item(
                 .fg(theme.group_accent)
                 .add_modifier(theme.bold_modifier()),
         ))),
-    }
+    };
+    (item, links)
 }
 
 /// Colour for the `[x]` checkbox, by status: open=amber (attention), done=green,
@@ -6899,5 +7054,102 @@ mod tests {
         ));
         app.toggle_at_cursor(ToggleMode::Toggle);
         assert!(app.folded_lanes.contains("x"));
+    }
+
+    // ── ADR-0026 compact links ──────────────────────────────────────────
+
+    #[test]
+    fn split_links_compacts_markdown_and_wiki_links() {
+        use TextSeg::*;
+        assert_eq!(
+            split_links("see [docs](https://x.io) and [[Note|alias]] or [[Plain]]"),
+            vec![
+                Plain("see "),
+                Md {
+                    label: "docs",
+                    url: "https://x.io"
+                },
+                Plain(" and "),
+                Wiki {
+                    target: "Note",
+                    label: "alias"
+                },
+                Plain(" or "),
+                Wiki {
+                    target: "Plain",
+                    label: "Plain"
+                },
+            ]
+        );
+        // Embeds, bare brackets, spaces in URLs, and unclosed links stay plain.
+        for s in [
+            "![img](a.png)",
+            "![[pic.png]]",
+            "[x] y",
+            "[a](b c)",
+            "[a](b",
+            "[[open",
+        ] {
+            assert_eq!(split_links(s), vec![Plain(s)], "{s}");
+        }
+    }
+
+    #[test]
+    fn link_url_resolves_and_rejects_unsafe_targets() {
+        let md = |url| TextSeg::Md { label: "l", url };
+        assert_eq!(
+            link_url(&md("https://a.b"), "n.md", None).as_deref(),
+            Some("https://a.b")
+        );
+        assert_eq!(
+            link_url(&md("www.google.com"), "n.md", None).as_deref(),
+            Some("https://www.google.com")
+        );
+        assert_eq!(link_url(&md("other.md"), "n.md", Some("V")), None);
+        assert_eq!(link_url(&md("https://a\u{1b}]b"), "n.md", None), None);
+        let wiki = |target| TextSeg::Wiki { target, label: "l" };
+        assert_eq!(
+            link_url(&wiki("Note"), "n.md", None),
+            None,
+            "no vault, no link"
+        );
+        assert_eq!(
+            link_url(&wiki("Note#Head"), "n.md", Some("V")).as_deref(),
+            Some("obsidian://open?vault=V&file=Note")
+        );
+        assert_eq!(
+            link_url(&wiki("#notes-1"), "dir/n.md", Some("V")).as_deref(),
+            Some("obsidian://open?vault=V&file=dir%2Fn.md")
+        );
+    }
+
+    /// End to end: the row shows only the label, and exactly the label's cells
+    /// carry the OSC 8 hyperlink.
+    #[test]
+    fn draw_renders_links_compact_and_hyperlinked() {
+        use ratatui::backend::TestBackend;
+        let mut app = App::new();
+        app.pane_visible = false;
+        let mut t = task(1, " ", 1, "a.md");
+        t.text = "read [it](https://x.io) now".to_string();
+        app.tasks = vec![t];
+        app.expanded.insert("a.md".to_string());
+        app.rebuild();
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let row: Vec<&str> = (0..60).map(|x| buf[(x, 2)].symbol()).collect();
+        let linked: Vec<usize> = (0..60)
+            .filter(|&x| row[x].contains("]8;;https://x.io"))
+            .collect();
+        assert_eq!(linked.len(), 2, "one hyperlinked cell per label char");
+        let plain: String = row
+            .iter()
+            .map(|s| {
+                s.replace("\x1b]8;;https://x.io\x1b\\", "")
+                    .replace("\x1b]8;;\x1b\\", "")
+            })
+            .collect();
+        assert!(plain.contains("[ ] read it now"), "{plain}");
     }
 }
