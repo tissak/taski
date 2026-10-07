@@ -321,10 +321,12 @@ fn lane_target_char(raw: &str, step: isize) -> Option<&'static str> {
 /// ADR-0025: the kanban board. For each lane, `view` (the normal [`build_view`]
 /// with the active filters) groups that lane's tasks; a `Lane` row heads each
 /// non-empty lane. Header keys are lane-scoped with [`LANE_SEP`] so `expanded`
-/// tracks each lane's groups separately.
+/// tracks each lane's groups separately. A lane whose char is in `folded_lanes`
+/// shows only its `Lane` row.
 fn build_kanban_view(
     tasks: &[Task],
     expanded: &HashSet<String>,
+    folded_lanes: &HashSet<&str>,
     view: impl Fn(&[Task], &HashSet<String>) -> Vec<DisplayRow>,
 ) -> Vec<DisplayRow> {
     let mut rows = Vec::new();
@@ -344,15 +346,21 @@ fn build_kanban_view(
         if lane_rows.is_empty() {
             continue;
         }
+        let collapsed = folded_lanes.contains(ch);
+        rows.push(DisplayRow::Lane {
+            ch,
+            label,
+            count: lane.len(),
+            collapsed,
+        });
+        if collapsed {
+            continue;
+        }
         for row in &mut lane_rows {
             if let DisplayRow::Header { group_key, .. } = row {
                 *group_key = format!("{prefix}{group_key}");
             }
         }
-        rows.push(DisplayRow::Lane {
-            label,
-            count: lane.len(),
-        });
         rows.extend(lane_rows);
     }
     rows
@@ -499,10 +507,12 @@ enum DisplayRow {
     Task {
         task: Box<Task>,
     },
-    /// ADR-0025: a kanban lane divider (`━━ Doing (3) ━━…`). Not foldable.
+    /// ADR-0025: a kanban lane divider (`━━ Doing (3) ━━…`). Folds the whole lane.
     Lane {
+        ch: &'static str,
         label: &'static str,
         count: usize,
+        collapsed: bool,
     },
 }
 
@@ -831,6 +841,8 @@ struct App {
     group_by: GroupBy,
     /// ADR-0025: kanban board mode (`B`) — tasks sectioned into status lanes.
     kanban: bool,
+    /// ADR-0025: chars of the folded kanban lanes. Done starts folded.
+    folded_lanes: HashSet<&'static str>,
     /// Whether the floating "Keybindings" help overlay (`?`) is open. Modal:
     /// while true, [`run_loop`] intercepts keys before normal-mode dispatch —
     /// `?`/`Esc`/`q` dismiss it (notably `q` does NOT quit while help is open),
@@ -904,6 +916,7 @@ impl App {
             last_action: None,
             group_by: GroupBy::FolderNote,
             kanban: false,
+            folded_lanes: HashSet::from(["x"]),
             show_help: false,
             theme: theme::Theme::default(),
             layout: theme::LayoutPrefs::default(),
@@ -940,7 +953,7 @@ impl App {
         };
         self.rows = if self.kanban {
             // The lanes ARE the status axis, so the `f` filter is ignored here.
-            build_kanban_view(&self.tasks, &self.expanded, |t, e| {
+            build_kanban_view(&self.tasks, &self.expanded, &self.folded_lanes, |t, e| {
                 view(t, e, StatusFilter::All)
             })
         } else {
@@ -1477,7 +1490,21 @@ impl App {
                         None
                     }
                 }
-                DisplayRow::Lane { .. } => None,
+                DisplayRow::Lane { ch, collapsed, .. } => {
+                    let want_collapsed = match mode {
+                        ToggleMode::Toggle => !collapsed,
+                        ToggleMode::Expand => false,
+                        ToggleMode::Collapse => true,
+                    };
+                    if want_collapsed {
+                        self.folded_lanes.insert(ch);
+                    } else {
+                        self.folded_lanes.remove(ch);
+                    }
+                    self.rebuild();
+                    self.ctx_scroll = 0;
+                    return;
+                }
             }
         };
         let Some((key, want_expanded)) = action else {
@@ -1496,10 +1523,6 @@ impl App {
     fn expand_all(&mut self) {
         for row in &self.rows {
             if let DisplayRow::Header { group_key, .. } = row {
-                // ADR-0025: Done stays folded on the board — it fades out at the bottom.
-                if group_key.starts_with(&format!("x{LANE_SEP}")) {
-                    continue;
-                }
                 self.expanded.insert(group_key.clone());
             }
         }
@@ -2788,9 +2811,18 @@ fn row_to_item(
             };
             ListItem::new(Line::from(spans)).style(item_style)
         }
-        DisplayRow::Lane { label, count } => ListItem::new(Line::from(Span::styled(
+        DisplayRow::Lane {
+            label,
+            count,
+            collapsed,
+            ..
+        } => ListItem::new(Line::from(Span::styled(
             // Over-long rule; the List clips it at the pane edge.
-            format!("━━ {label} ({count}) {}", "━".repeat(240)),
+            format!(
+                "{} {label} ({count}) {}",
+                if *collapsed { "▸" } else { "▾" },
+                "━".repeat(240)
+            ),
             Style::default()
                 .fg(theme.group_accent)
                 .add_modifier(theme.bold_modifier()),
@@ -6761,7 +6793,7 @@ mod tests {
             task(5, "X", 5, "b.md"),
         ];
         let expanded = HashSet::from([format!("/{LANE_SEP}a.md")]);
-        let rows = build_kanban_view(&tasks, &expanded, |t, e| {
+        let rows = build_kanban_view(&tasks, &expanded, &HashSet::new(), |t, e| {
             build_view(
                 t,
                 StatusFilter::All,
@@ -6777,7 +6809,7 @@ mod tests {
         let shape: Vec<String> = rows
             .iter()
             .map(|r| match r {
-                DisplayRow::Lane { label, count } => format!("lane {label} {count}"),
+                DisplayRow::Lane { label, count, .. } => format!("lane {label} {count}"),
                 DisplayRow::Header { group_key, .. } => format!("hdr {group_key}"),
                 DisplayRow::Task { task } => format!("task {}", task.id),
             })
@@ -6832,24 +6864,40 @@ mod tests {
         ));
     }
 
-    /// `B` turns the board on; `Tab` there leaves the Done lane folded.
+    /// Done starts folded to just its lane row; `Enter` on a lane row unfolds and
+    /// refolds it, and `Tab` can't reach a folded lane's groups.
     #[test]
-    fn kanban_expand_all_keeps_done_folded() {
+    fn kanban_done_lane_starts_folded_and_toggles() {
         let mut app = App::new();
         app.tasks = vec![task(1, " ", 1, "a.md"), task(2, "x", 2, "a.md")];
         app.toggle_kanban();
         app.expand_all();
-        assert!(app.expanded.contains(&format!(" {LANE_SEP}a.md")));
-        assert!(!app.expanded.contains(&format!("x{LANE_SEP}a.md")));
-        assert!(
+        let shown = |app: &App, id| {
             app.rows
                 .iter()
-                .any(|r| matches!(r, DisplayRow::Task { task } if task.id == 1))
-        );
-        assert!(
-            !app.rows
-                .iter()
-                .any(|r| matches!(r, DisplayRow::Task { task } if task.id == 2))
-        );
+                .any(|r| matches!(r, DisplayRow::Task { task } if task.id == id))
+        };
+        assert!(shown(&app, 1));
+        assert!(!shown(&app, 2));
+        assert!(matches!(
+            app.rows.last(),
+            Some(DisplayRow::Lane {
+                label: "Done",
+                count: 1,
+                collapsed: true,
+                ..
+            })
+        ));
+
+        let done = app.rows.len() - 1;
+        app.state.select(Some(done));
+        app.toggle_at_cursor(ToggleMode::Toggle);
+        assert!(!app.folded_lanes.contains("x"));
+        assert!(matches!(
+            app.state.selected().map(|i| &app.rows[i]),
+            Some(DisplayRow::Lane { label: "Done", .. })
+        ));
+        app.toggle_at_cursor(ToggleMode::Toggle);
+        assert!(app.folded_lanes.contains("x"));
     }
 }

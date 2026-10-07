@@ -35,8 +35,10 @@ arbitrary `new_char` (covered by `writeback_proptest`, ADR-0016).
   lane the tasks are grouped by the active `G` axis (default folder+note — the "swimlanes").
   Tasks in no lane (cancelled `-`, other custom chars) don't appear on the board.
 - **Lane-scoped fold state.** Kanban header keys are `"<lane char>\u{1f}<group key>"`, so a
-  note folds independently in each lane. `Tab` (expand all) skips the Done lane — Done
-  stays folded so it fades out at the bottom.
+  note folds independently in each lane.
+- **Lanes fold too.** `Enter` / `←` / `→` on a lane divider folds or unfolds the whole lane
+  (session-only state). **Done starts folded** — just its `▸ Done (n)` divider shows, so
+  finished work fades out at the bottom without clutter. `Tab` doesn't open a folded lane.
 - **Filters:** `T`, `O`, `/`, `F` compose as usual. The `f` status filter is ignored on the
   board — the lanes *are* the status axis.
 - **`<` / `>`** move the selected task one lane up / down: a `checkbox` action to the
