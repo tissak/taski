@@ -281,6 +281,81 @@ impl StatusFilter {
 /// title count in agreement (ADR-0016 follow-on).
 fn is_open_like(status: &Status) -> bool {
     matches!(status, Status::Open | Status::InProgress)
+        || matches!(status, Status::Other(c) if c == BLOCKED_CHAR)
+}
+
+/// ADR-0025: the blocked checkbox char (`- [!]`). Blocked is still active work,
+/// so [`is_open_like`] counts it as open.
+const BLOCKED_CHAR: &str = "!";
+
+/// ADR-0025: kanban lanes, top to bottom — active work first, done fades out last.
+/// Each lane is one checkbox char; moving a task between lanes is a plain
+/// `checkbox` flip. Tasks whose char is in no lane (cancelled `-`, …) don't show
+/// on the board.
+// ponytail: hardcoded starter lanes; move to a `[kanban]` config table when a lane
+// needs adding or renaming.
+const LANES: [(&str, &str); 4] = [
+    ("/", "Doing"),
+    (BLOCKED_CHAR, "Blocked"),
+    (" ", "Todo"),
+    ("x", "Done"),
+];
+
+/// Separates the lane char from the inner group key in kanban header keys, so
+/// each lane's groups fold independently (`"x\u{1f}inbox.md"` ≠ `" \u{1f}inbox.md"`).
+const LANE_SEP: char = '\u{1f}';
+
+/// The [`LANES`] index for a raw checkbox char (`X` is Done, like `x`).
+fn lane_of(raw: &str) -> Option<usize> {
+    let raw = if raw == "X" { "x" } else { raw };
+    LANES.iter().position(|(c, _)| *c == raw)
+}
+
+/// The checkbox char one lane up (`step = -1`) or down (`step = 1`) from `raw`,
+/// or `None` at the board's edge or for a char in no lane.
+fn lane_target_char(raw: &str, step: isize) -> Option<&'static str> {
+    let i = lane_of(raw)?.checked_add_signed(step)?;
+    LANES.get(i).map(|(c, _)| *c)
+}
+
+/// ADR-0025: the kanban board. For each lane, `view` (the normal [`build_view`]
+/// with the active filters) groups that lane's tasks; a `Lane` row heads each
+/// non-empty lane. Header keys are lane-scoped with [`LANE_SEP`] so `expanded`
+/// tracks each lane's groups separately.
+fn build_kanban_view(
+    tasks: &[Task],
+    expanded: &HashSet<String>,
+    view: impl Fn(&[Task], &HashSet<String>) -> Vec<DisplayRow>,
+) -> Vec<DisplayRow> {
+    let mut rows = Vec::new();
+    for (i, (ch, label)) in LANES.iter().enumerate() {
+        let lane: Vec<Task> = tasks
+            .iter()
+            .filter(|t| lane_of(&t.raw_checkbox_char) == Some(i))
+            .cloned()
+            .collect();
+        let prefix = format!("{ch}{LANE_SEP}");
+        let lane_expanded: HashSet<String> = expanded
+            .iter()
+            .filter_map(|k| k.strip_prefix(&prefix))
+            .map(str::to_string)
+            .collect();
+        let mut lane_rows = view(&lane, &lane_expanded);
+        if lane_rows.is_empty() {
+            continue;
+        }
+        for row in &mut lane_rows {
+            if let DisplayRow::Header { group_key, .. } = row {
+                *group_key = format!("{prefix}{group_key}");
+            }
+        }
+        rows.push(DisplayRow::Lane {
+            label,
+            count: lane.len(),
+        });
+        rows.extend(lane_rows);
+    }
+    rows
 }
 
 /// ADR-0021: whether a task is **closed** (done or cancelled) and thus archivable by
@@ -424,6 +499,11 @@ enum DisplayRow {
     Task {
         task: Box<Task>,
     },
+    /// ADR-0025: a kanban lane divider (`━━ Doing (3) ━━…`). Not foldable.
+    Lane {
+        label: &'static str,
+        count: usize,
+    },
 }
 
 impl DisplayRow {
@@ -434,6 +514,7 @@ impl DisplayRow {
         match self {
             DisplayRow::Header { group_key, .. } => group_key,
             DisplayRow::Task { task } => &task.note_path,
+            DisplayRow::Lane { label, .. } => label,
         }
     }
 }
@@ -748,6 +829,8 @@ struct App {
     /// switching axes naturally starts every group collapsed (old keys won't
     /// match the new axis's labels) without needing to clear the set.
     group_by: GroupBy,
+    /// ADR-0025: kanban board mode (`B`) — tasks sectioned into status lanes.
+    kanban: bool,
     /// Whether the floating "Keybindings" help overlay (`?`) is open. Modal:
     /// while true, [`run_loop`] intercepts keys before normal-mode dispatch —
     /// `?`/`Esc`/`q` dismiss it (notably `q` does NOT quit while help is open),
@@ -820,6 +903,7 @@ impl App {
             use_advanced_uri: false,
             last_action: None,
             group_by: GroupBy::FolderNote,
+            kanban: false,
             show_help: false,
             theme: theme::Theme::default(),
             layout: theme::LayoutPrefs::default(),
@@ -841,17 +925,27 @@ impl App {
     /// Rebuild rows from the current tasks/filter/expanded/search and preserve selection.
     fn rebuild(&mut self) {
         let (note, task_id, idx) = self.snapshot();
-        self.rows = build_view(
-            &self.tasks,
-            self.filter,
-            &self.expanded,
-            self.today_only,
-            &self.today,
-            &self.search_query,
-            &self.file_query,
-            self.overdue_only,
-            self.group_by,
-        );
+        let view = |tasks: &[Task], expanded: &HashSet<String>, filter| {
+            build_view(
+                tasks,
+                filter,
+                expanded,
+                self.today_only,
+                &self.today,
+                &self.search_query,
+                &self.file_query,
+                self.overdue_only,
+                self.group_by,
+            )
+        };
+        self.rows = if self.kanban {
+            // The lanes ARE the status axis, so the `f` filter is ignored here.
+            build_kanban_view(&self.tasks, &self.expanded, |t, e| {
+                view(t, e, StatusFilter::All)
+            })
+        } else {
+            view(&self.tasks, &self.expanded, self.filter)
+        };
         reconcile_view_selection(&self.rows, note.as_deref(), task_id, idx, &mut self.state);
     }
 
@@ -1063,6 +1157,12 @@ impl App {
         let Some((start, end)) = self.group_task_row_range() else {
             return;
         };
+        // ADR-0025: a kanban group holds only one lane's slice of the note, so a
+        // permutation of it can't be expressed safely. Reorder from the list view.
+        if self.kanban {
+            self.notice = Some("Move mode isn't available on the board — press B".to_string());
+            return;
+        }
         // Owned snapshot of the run so the borrow of `self.rows` ends before the
         // eligibility checks (which set `self.notice`).
         let run: Vec<(i64, String)> = self.rows[start..end]
@@ -1329,6 +1429,13 @@ impl App {
         self.ctx_scroll = 0;
     }
 
+    /// `B` (ADR-0025): toggle the kanban board.
+    fn toggle_kanban(&mut self) {
+        self.kanban = !self.kanban;
+        self.rebuild();
+        self.ctx_scroll = 0;
+    }
+
     /// Toggle / expand / collapse the group under the cursor. `Enter` toggles a
     /// header; `→` forces expand; `←` forces collapse and, when pressed on a task row,
     /// collapses that task's parent group (fold from inside). All other key/row
@@ -1370,6 +1477,7 @@ impl App {
                         None
                     }
                 }
+                DisplayRow::Lane { .. } => None,
             }
         };
         let Some((key, want_expanded)) = action else {
@@ -1388,6 +1496,10 @@ impl App {
     fn expand_all(&mut self) {
         for row in &self.rows {
             if let DisplayRow::Header { group_key, .. } = row {
+                // ADR-0025: Done stays folded on the board — it fades out at the bottom.
+                if group_key.starts_with(&format!("x{LANE_SEP}")) {
+                    continue;
+                }
                 self.expanded.insert(group_key.clone());
             }
         }
@@ -1567,6 +1679,42 @@ impl App {
             (enqueue_in_progress(conn, task), Some(action))
         };
         // S4: only record an undoable action if the enqueue actually succeeded.
+        if result.is_ok() {
+            self.last_action = last_action;
+        }
+        self.track_enqueued(result);
+    }
+
+    /// `<` / `>` (ADR-0025): move the selected task one kanban lane up (`step = -1`)
+    /// or down (`step = 1`). A lane move is a plain checkbox flip, so the daemon's
+    /// `✅` stamping and `u` undo apply unchanged. No-op at the board's edge or on a
+    /// task in no lane.
+    fn submit_lane_move(&mut self, conn: &Connection, step: isize) {
+        let (result, last_action) = {
+            let Some(task) = self.selected_task() else {
+                return;
+            };
+            let Some(new_char) = lane_target_char(&task.raw_checkbox_char, step) else {
+                return;
+            };
+            let action = LastAction::CheckboxToggle {
+                task_id: task.id,
+                note_path: task.note_path.clone(),
+                line_number: task.line_number,
+                expected_char: task.raw_checkbox_char.clone(),
+                new_char: new_char.to_string(),
+            };
+            let result = db::enqueue_action(
+                conn,
+                task.id,
+                &task.note_path,
+                task.line_number,
+                &task.raw_checkbox_char,
+                new_char,
+            )
+            .context("enqueuing lane move");
+            (result, Some(action))
+        };
         if result.is_ok() {
             self.last_action = last_action;
         }
@@ -1881,6 +2029,11 @@ fn run_loop(
                 // during a search prompt — `i` falls through to `push_search_char`
                 // in the search arms above, exactly like `b`/`d`/`a`/`t`.
                 KeyCode::Char('i') => app.submit_in_progress(conn),
+                // ADR-0025: `B` toggles the kanban board; `<`/`>` move the selected
+                // task one lane up/down (a checkbox flip through the daemon).
+                KeyCode::Char('B') => app.toggle_kanban(),
+                KeyCode::Char('<') => app.submit_lane_move(conn, -1),
+                KeyCode::Char('>') => app.submit_lane_move(conn, 1),
                 // ADR-0010 text search: `/` opens the search prompt.
                 KeyCode::Char('/') => app.start_search(),
                 // ADR-0010 file search: `F` opens the file/path search prompt.
@@ -2162,6 +2315,8 @@ fn render_failure_notice(action: &PendingAction) -> String {
         // distinguished by `new_char == "/"`. A failed in-progress flip's retry
         // key is `i`.
         _ if action.new_char == "/" => ("Mark in-progress", "i"),
+        // ADR-0025: only a lane move (`<`/`>`) writes the blocked char.
+        _ if action.new_char == BLOCKED_CHAR => ("Mark blocked", "< / >"),
         // ADR-0014: quick-add (a key) and its undo (u key). These carry their
         // own action_types, so they're matched here — not in the checkbox
         // wildcard. A refused quick-add surfaces "Quick add not applied — …
@@ -2242,7 +2397,11 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let mut title_spans: Vec<Span> = vec![
         Span::raw(" Taski — "),
         Span::styled(
-            format!("filter: {}", app.filter.label()),
+            if app.kanban {
+                "kanban".to_string()
+            } else {
+                format!("filter: {}", app.filter.label())
+            },
             Style::default()
                 .fg(app.theme.accent)
                 .add_modifier(app.theme.bold_modifier()),
@@ -2327,7 +2486,17 @@ fn draw(frame: &mut Frame, app: &mut App) {
             .enumerate()
             .flat_map(|(i, r)| {
                 let item = row_to_item(r, &app.today, &app.theme, app.group_by);
-                if matches!(r, DisplayRow::Header { .. }) && i > 0 {
+                // A Lane starts a section; a Header starts one unless it sits
+                // directly under its Lane divider.
+                let starts_section = match r {
+                    DisplayRow::Lane { .. } => true,
+                    DisplayRow::Header { .. } => !matches!(
+                        app.rows.get(i.wrapping_sub(1)),
+                        Some(DisplayRow::Lane { .. })
+                    ),
+                    DisplayRow::Task { .. } => false,
+                };
+                if starts_section && i > 0 {
                     let mut gap: Vec<ListItem> = (0..app.layout.list_density)
                         .map(|_| ListItem::new(""))
                         .collect();
@@ -2555,6 +2724,10 @@ fn row_to_item(
             // ADR-0018: under Note grouping the key is a note path; dim the
             // directory prefix so the filename (bold/default) pops at a glance.
             // Other axes (Tag/Priority/Folder) render the key whole.
+            // ADR-0025: drop the kanban lane scope from the shown key.
+            let group_key = group_key
+                .split_once(LANE_SEP)
+                .map_or(group_key.as_str(), |(_, k)| k);
             match (group_by, split_note_header(group_key)) {
                 (GroupBy::FolderNote, (Some(prefix), filename)) => {
                     spans.push(Span::styled(
@@ -2567,7 +2740,7 @@ fn row_to_item(
                     ));
                 }
                 _ => spans.push(Span::styled(
-                    group_key.clone(),
+                    group_key.to_string(),
                     Style::default().add_modifier(theme.bold_modifier()),
                 )),
             }
@@ -2615,6 +2788,13 @@ fn row_to_item(
             };
             ListItem::new(Line::from(spans)).style(item_style)
         }
+        DisplayRow::Lane { label, count } => ListItem::new(Line::from(Span::styled(
+            // Over-long rule; the List clips it at the pane edge.
+            format!("━━ {label} ({count}) {}", "━".repeat(240)),
+            Style::default()
+                .fg(theme.group_accent)
+                .add_modifier(theme.bold_modifier()),
+        ))),
     }
 }
 
@@ -2855,8 +3035,7 @@ fn help_popup(theme: &theme::Theme) -> Paragraph<'static> {
     let lines = vec![
         head("Navigation"),
         row("j/k ↑/↓", "Move selection up/down"),
-        row("Enter", "Fold group"),
-        row("←/→", "Collapse / expand group"),
+        row("Enter / ←/→", "Fold group / collapse / expand"),
         row("Tab / ⇧Tab", "Expand all / collapse all groups"),
         row("J / K", "Scroll context pane"),
         Line::raw(""),
@@ -2868,6 +3047,7 @@ fn help_popup(theme: &theme::Theme) -> Paragraph<'static> {
             "G",
             "Cycle group-by (folder+note / note / tag / priority / folder)",
         ),
+        row("B · < / >", "Kanban board · move task up / down a lane"),
         row("p", "Toggle context pane"),
         Line::raw(""),
         head("Task actions"),
@@ -6564,6 +6744,112 @@ mod tests {
         assert!(
             rendered.contains("to close"),
             "the dim dismissal hint should render"
+        );
+    }
+
+    // ── ADR-0025 kanban board ───────────────────────────────────────────
+
+    /// Lanes come out Doing → Blocked → Todo → Done; tasks in no lane (cancelled)
+    /// are dropped; empty lanes are hidden; header keys are lane-scoped.
+    #[test]
+    fn kanban_orders_lanes_and_scopes_keys() {
+        let tasks = vec![
+            task(1, "x", 1, "a.md"),
+            task(2, " ", 2, "a.md"),
+            task(3, "/", 3, "a.md"),
+            task(4, "-", 4, "a.md"),
+            task(5, "X", 5, "b.md"),
+        ];
+        let expanded = HashSet::from([format!("/{LANE_SEP}a.md")]);
+        let rows = build_kanban_view(&tasks, &expanded, |t, e| {
+            build_view(
+                t,
+                StatusFilter::All,
+                e,
+                false,
+                "",
+                "",
+                "",
+                false,
+                GroupBy::FolderNote,
+            )
+        });
+        let shape: Vec<String> = rows
+            .iter()
+            .map(|r| match r {
+                DisplayRow::Lane { label, count } => format!("lane {label} {count}"),
+                DisplayRow::Header { group_key, .. } => format!("hdr {group_key}"),
+                DisplayRow::Task { task } => format!("task {}", task.id),
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                "lane Doing 1".to_string(),
+                format!("hdr /{LANE_SEP}a.md"),
+                "task 3".to_string(), // only Doing's a.md group is expanded
+                "lane Todo 1".to_string(),
+                format!("hdr  {LANE_SEP}a.md"),
+                "lane Done 2".to_string(),
+                format!("hdr x{LANE_SEP}a.md"),
+                format!("hdr x{LANE_SEP}b.md"),
+            ]
+        );
+    }
+
+    /// `<`/`>` step one lane; the board's edges and lane-less chars are no-ops.
+    #[test]
+    fn lane_target_char_steps_and_stops_at_edges() {
+        assert_eq!(lane_target_char(" ", -1), Some("!"));
+        assert_eq!(lane_target_char("!", -1), Some("/"));
+        assert_eq!(lane_target_char("/", -1), None);
+        assert_eq!(lane_target_char(" ", 1), Some("x"));
+        assert_eq!(lane_target_char("X", -1), Some(" "));
+        assert_eq!(lane_target_char("x", 1), None);
+        assert_eq!(lane_target_char("-", 1), None);
+    }
+
+    /// Blocked is active work: it shows under the `Open` filter.
+    #[test]
+    fn blocked_counts_as_open() {
+        assert!(is_open_like(&Status::from_checkbox_char("!")));
+        assert!(!is_open_like(&Status::from_checkbox_char("-")));
+    }
+
+    /// `>` enqueues a checkbox flip to the next lane's char and is undoable.
+    #[test]
+    fn lane_move_enqueues_flip_to_next_lane() {
+        let conn = db::open(":memory:").unwrap();
+        let mut app = app_with_expanded_note("inbox.md", 1, 1);
+        app.submit_lane_move(&conn, -1); // Todo → Blocked
+        let actions = db::pending_actions(&conn).unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].expected_char, " ");
+        assert_eq!(actions[0].new_char, "!");
+        assert!(matches!(
+            app.last_action,
+            Some(LastAction::CheckboxToggle { ref new_char, .. }) if new_char == "!"
+        ));
+    }
+
+    /// `B` turns the board on; `Tab` there leaves the Done lane folded.
+    #[test]
+    fn kanban_expand_all_keeps_done_folded() {
+        let mut app = App::new();
+        app.tasks = vec![task(1, " ", 1, "a.md"), task(2, "x", 2, "a.md")];
+        app.toggle_kanban();
+        app.expand_all();
+        assert!(app.expanded.contains(&format!(" {LANE_SEP}a.md")));
+        assert!(!app.expanded.contains(&format!("x{LANE_SEP}a.md")));
+        assert!(
+            app.rows
+                .iter()
+                .any(|r| matches!(r, DisplayRow::Task { task } if task.id == 1))
+        );
+        assert!(
+            !app.rows
+                .iter()
+                .any(|r| matches!(r, DisplayRow::Task { task } if task.id == 2))
         );
     }
 }
