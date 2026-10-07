@@ -1,6 +1,6 @@
 # Taski — Engineering Context & Onboarding
 
-*Onboarding guide for new engineers. Last updated: 2026-09-07 (post-v0.4 — adds Tier 1 metadata parsing [tags, priority, start/created/done/cancelled dates], Tier 2 views [overdue `O`, group-by cycling `G`], the `✅` done-date stamp on toggle [ADR-0012], the `❌` cancelled-date stamp on cancel [ADR-0013], the `➕` quick-add inbox creation [ADR-0014], the `o` open-in-Obsidian deep-link gesture [ADR-0015], the `i` in-progress toggle gesture [ADR-0016], and the `taski-skip` frontmatter opt-out [ADR-0017]; user-configurable TUI theming + per-panel density knobs [ADR-0018], followed by a global `bold` style toggle [off by default — color contrast carries emphasis] and a finer note-grouping split [`folder+note` / `note` / `folder`], and the `n` add-note task-annotation gesture [grouped `## task-notes` section + aliased in-page link, ADR-0019], and the `m` move-mode task-reordering gesture [TUI-local reorder committed as one in-note line-content permutation, ADR-0020], and the `A` archive-completed gesture [copy-then-delete move of a note's done/cancelled tasks into a designated archive note, ADR-0021], and the `T` Today view widened to also surface due-today tasks [scheduled OR due == today, ADR-0022], and the `O` Overdue view widened to also surface past-scheduled tasks [due OR scheduled < today, ADR-0023], and "today" redefined as the user's local calendar date everywhere — views and stamps — instead of UTC [ADR-0024]; 448 tests across 6 crates).*
+*Onboarding guide for new engineers. Last updated: 2026-09-07 (post-v0.4 — adds Tier 1 metadata parsing [tags, priority, start/created/done/cancelled dates], Tier 2 views [overdue `O`, group-by cycling `G`], the `✅` done-date stamp on toggle [ADR-0012], the `❌` cancelled-date stamp on cancel [ADR-0013], the `➕` quick-add inbox creation [ADR-0014], the `o` open-in-Obsidian deep-link gesture [ADR-0015], the `i` in-progress toggle gesture [ADR-0016], and the `taski-skip` frontmatter opt-out [ADR-0017]; user-configurable TUI theming + per-panel density knobs [ADR-0018], followed by a global `bold` style toggle [off by default — color contrast carries emphasis] and a finer note-grouping split [`folder+note` / `note` / `folder`], and the `n` add-note task-annotation gesture [grouped `## task-notes` section + aliased in-page link, ADR-0019], and the `m` move-mode task-reordering gesture [TUI-local reorder committed as one in-note line-content permutation, ADR-0020], and the `A` archive-completed gesture [copy-then-delete move of a note's done/cancelled tasks into a designated archive note, ADR-0021], and the `T` Today view widened to also surface due-today tasks [scheduled OR due == today, ADR-0022], and the `O` Overdue view widened to also surface past-scheduled tasks [due OR scheduled < today, ADR-0023], and "today" redefined as the user's local calendar date everywhere — views and stamps — instead of UTC [ADR-0024], and the `B` kanban board — status lanes as full-width rows [Doing `[/]` / Blocked `[!]` / Todo `[ ]` / Done `[x]`], `<`/`>` lane moves as plain checkbox flips, `[!]` counted as open [ADR-0025]; 453 tests across 6 crates).*
 
 This document is the "operating manual" for working on Taski: what it is, how it's
 built, the decisions that are load-bearing (and must not be casually undone), and the
@@ -274,6 +274,8 @@ filter predicates within each bucket and emits `Header` + `Task` rows.
 | `/` | Open text search prompt (matches `task.text`, case-insensitive) |
 | `F` | Open file/path search prompt (matches `task.note_path`) |
 | `o` | Open the selected task's note in Obsidian via an `obsidian://` deep link (native: opens the file; with `use_advanced_uri = true`: jumps to the task's line — requires the Advanced URI plugin). Read-only, TUI-local; macOS only [ADR-0015] |
+| `B` | Toggle the kanban board: lanes Doing `[/]` → Blocked `[!]` → Todo `[ ]` → Done `[x]` as full-width rows, grouped by `G` inside each lane; `f` ignored; `Tab` leaves Done folded; `m` refused [ADR-0025] |
+| `<` / `>` | Move the selected task one kanban lane up / down (a checkbox flip; undoable with `u`) [ADR-0025] |
 | `p` | Toggle the context pane (right-half note preview) |
 | `J` / `K` | Scroll context pane up/down |
 | `?` | Toggle the floating keybindings help overlay (modal: `?`/`Esc`/`q` close it without quitting; `Ctrl-C` still quits from any state). The footer cheat-sheet is trimmed to essentials; the full list lives here |
@@ -605,6 +607,15 @@ the frontmatter grammar is a load-bearing contract future parsing must respect.
     `taski_db::local_utc_offset_secs()` (`libc` `localtime_r`+`tzset`; non-unix → 0).
     No schema bump; previously-written stamps are not migrated. New explicit `libc` dep
     in `taski-db` (recorded in `tech.md`).
+
+25. **Kanban board — status lanes as rows** ([ADR-0025](./adr/0025-kanban-board-view.md)) —
+    `B` swaps the list for a board: lanes Doing `[/]` → Blocked `[!]` → Todo `[ ]` → Done
+    `[x]`, stacked as full-width rows (columns wrap and run off a terminal). Status is the
+    checkbox char — the Obsidian/Tasks convention — so `<`/`>` lane moves are plain `checkbox`
+    flips: no action_type, schema, or daemon change; undo and `✅` stamping are free. Lanes are
+    hardcoded (`LANES` in `taski-tui`); `build_kanban_view` wraps `build_view` per lane and
+    lane-scopes header keys with `\u{1f}` so fold state is per lane. `[!]` blocked now counts
+    as open (`is_open_like`). TUI-only.
 
 ---
 
