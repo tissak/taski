@@ -9,6 +9,8 @@ license.workspace = true
 taski-daemon = { path = "../taski-daemon" }
 taski-tui = { path = "../taski-tui" }
 taski-config.workspace = true
+taski-db.workspace = true
+rusqlite.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 ctrlc.workspace = true

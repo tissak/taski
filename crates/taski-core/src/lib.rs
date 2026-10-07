@@ -43,6 +43,13 @@ impl Status {
             Status::Other(ch) => ch.as_str(),
         }
     }
+
+    /// Still active work: open, in-progress, or blocked (`[!]`, ADR-0025). The TUI's
+    /// Open filter and the CLI's default `list` share this definition.
+    pub fn is_open_like(&self) -> bool {
+        matches!(self, Status::Open | Status::InProgress)
+            || matches!(self, Status::Other(c) if c == "!")
+    }
 }
 
 /// Obsidian Tasks-plugin priority (Tier 1 read path). The five variants map 1:1
@@ -178,6 +185,21 @@ pub struct Task {
     pub cancelled_date: Option<String>,
     /// Last-seen timestamp, unix seconds.
     pub updated_at: i64,
+}
+
+impl Task {
+    /// Today view predicate (ADR-0022): scheduled OR due == `today` (`YYYY-MM-DD`).
+    pub fn is_today(&self, today: &str) -> bool {
+        self.scheduled_date.as_deref() == Some(today) || self.due_date.as_deref() == Some(today)
+    }
+
+    /// Overdue view predicate (ADR-0023): due OR scheduled strictly before `today`.
+    /// Purely date-based — status filtering is the caller's job. Lexicographic
+    /// comparison is chronological for zero-padded ISO dates.
+    pub fn is_overdue(&self, today: &str) -> bool {
+        self.due_date.as_deref().is_some_and(|d| d < today)
+            || self.scheduled_date.as_deref().is_some_and(|d| d < today)
+    }
 }
 
 /// Parse Markdown into [`Task`]s for the given note path.

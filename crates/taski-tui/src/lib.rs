@@ -361,7 +361,7 @@ fn obsidian_url(vault: &str, note_path: &str, line: usize, advanced: bool) -> St
 /// in-progress task shows alongside unstarted ones under the default Open filter.
 /// Done and other states appear only under `All`. This keeps the three-state
 /// mapping (all / open / done) and the open/total counts consistent: an in-progress
-/// task is treated as open for both visibility and counting (see [`is_open_like`]).
+/// task is treated as open for both visibility and counting (see [`Status::is_open_like`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum StatusFilter {
     All,
@@ -373,7 +373,7 @@ impl StatusFilter {
     fn matches(self, status: &Status) -> bool {
         match self {
             StatusFilter::All => true,
-            StatusFilter::Open => is_open_like(status),
+            StatusFilter::Open => status.is_open_like(),
             StatusFilter::Done => matches!(status, Status::Done),
         }
     }
@@ -401,13 +401,8 @@ impl StatusFilter {
 /// under the default Open filter instead of being hidden. `Done` and other states
 /// are excluded. The single predicate keeps the filter, the header counts and the
 /// title count in agreement (ADR-0016 follow-on).
-fn is_open_like(status: &Status) -> bool {
-    matches!(status, Status::Open | Status::InProgress)
-        || matches!(status, Status::Other(c) if c == BLOCKED_CHAR)
-}
-
 /// ADR-0025: the blocked checkbox char (`- [!]`). Blocked is still active work,
-/// so [`is_open_like`] counts it as open.
+/// so [`Status::is_open_like`] counts it as open.
 const BLOCKED_CHAR: &str = "!";
 
 /// ADR-0025: kanban lanes, top to bottom — active work first, done fades out last.
@@ -708,11 +703,7 @@ fn build_view(
     overdue_only: bool,
     group_by: GroupBy,
 ) -> Vec<DisplayRow> {
-    let matches_today = |t: &Task| -> bool {
-        !today_only
-            || t.scheduled_date.as_deref() == Some(today)
-            || t.due_date.as_deref() == Some(today)
-    };
+    let matches_today = |t: &Task| -> bool { !today_only || t.is_today(today) };
     let matches_search = |t: &Task| -> bool {
         search_query.is_empty() || t.text.to_lowercase().contains(&search_query.to_lowercase())
     };
@@ -722,11 +713,7 @@ fn build_view(
                 .to_lowercase()
                 .contains(&file_query.to_lowercase())
     };
-    let not_overdue = |t: &Task| -> bool {
-        !overdue_only
-            || t.due_date.as_deref().is_some_and(|d| d < today)
-            || t.scheduled_date.as_deref().is_some_and(|d| d < today)
-    };
+    let not_overdue = |t: &Task| -> bool { !overdue_only || t.is_overdue(today) };
     let passes_filters = |t: &Task| -> bool {
         filter.matches(&t.status)
             && matches_today(t)
@@ -766,7 +753,7 @@ fn build_view(
     for key in &order {
         let bucket = &buckets[index[key]];
         let total_count = bucket.len();
-        let open_count = bucket.iter().filter(|t| is_open_like(&t.status)).count();
+        let open_count = bucket.iter().filter(|t| t.status.is_open_like()).count();
         let visible: Vec<&Task> = bucket
             .iter()
             .copied()
@@ -2531,7 +2518,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         (list_area, None)
     };
 
-    let open_total = app.tasks.iter().filter(|t| is_open_like(&t.status)).count();
+    let open_total = app.tasks.iter().filter(|t| t.status.is_open_like()).count();
     let total = app.tasks.len();
     let notes = app
         .rows
@@ -6999,8 +6986,8 @@ mod tests {
     /// Blocked is active work: it shows under the `Open` filter.
     #[test]
     fn blocked_counts_as_open() {
-        assert!(is_open_like(&Status::from_checkbox_char("!")));
-        assert!(!is_open_like(&Status::from_checkbox_char("-")));
+        assert!(Status::from_checkbox_char("!").is_open_like());
+        assert!(!Status::from_checkbox_char("-").is_open_like());
     }
 
     /// `>` enqueues a checkbox flip to the next lane's char and is undoable.

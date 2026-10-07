@@ -755,22 +755,7 @@ pub fn pending_actions(conn: &Connection) -> rusqlite::Result<Vec<PendingAction>
          WHERE state = 'pending'
          ORDER BY id ASC",
     )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(PendingAction {
-            id: row.get(0)?,
-            task_id: row.get::<_, i64>(1)?,
-            note_path: row.get(2)?,
-            line_number: row.get::<_, i64>(3)? as usize,
-            expected_char: row.get(4)?,
-            new_char: row.get(5)?,
-            state: row.get(6)?,
-            created_at: row.get(7)?,
-            resolved_at: row.get(8)?,
-            error: row.get(9)?,
-            action_type: row.get(10)?,
-            payload: row.get(11)?,
-        })
-    })?;
+    let rows = stmt.query_map([], row_to_action)?;
     rows.collect()
 }
 
@@ -788,23 +773,40 @@ pub fn recent_actions(conn: &Connection, limit: i64) -> rusqlite::Result<Vec<Pen
          ORDER BY resolved_at DESC NULLS LAST, id DESC
          LIMIT ?1",
     )?;
-    let rows = stmt.query_map(rusqlite::params![limit], |row| {
-        Ok(PendingAction {
-            id: row.get(0)?,
-            task_id: row.get::<_, i64>(1)?,
-            note_path: row.get(2)?,
-            line_number: row.get::<_, i64>(3)? as usize,
-            expected_char: row.get(4)?,
-            new_char: row.get(5)?,
-            state: row.get(6)?,
-            created_at: row.get(7)?,
-            resolved_at: row.get(8)?,
-            error: row.get(9)?,
-            action_type: row.get(10)?,
-            payload: row.get(11)?,
-        })
-    })?;
+    let rows = stmt.query_map(rusqlite::params![limit], row_to_action)?;
     rows.collect()
+}
+
+/// One action by id, in any state — the CLI polls this to learn how the action it
+/// enqueued was resolved. `None` if the id doesn't exist (e.g. pruned).
+pub fn action(conn: &Connection, id: i64) -> rusqlite::Result<Option<PendingAction>> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT id, task_id, note_path, line_number, expected_char, new_char,
+                state, created_at, resolved_at, error, action_type, payload
+         FROM pending_actions WHERE id = ?1",
+        rusqlite::params![id],
+        row_to_action,
+    )
+    .optional()
+}
+
+/// Column order shared by every `pending_actions` SELECT above.
+fn row_to_action(row: &rusqlite::Row) -> rusqlite::Result<PendingAction> {
+    Ok(PendingAction {
+        id: row.get(0)?,
+        task_id: row.get::<_, i64>(1)?,
+        note_path: row.get(2)?,
+        line_number: row.get::<_, i64>(3)? as usize,
+        expected_char: row.get(4)?,
+        new_char: row.get(5)?,
+        state: row.get(6)?,
+        created_at: row.get(7)?,
+        resolved_at: row.get(8)?,
+        error: row.get(9)?,
+        action_type: row.get(10)?,
+        payload: row.get(11)?,
+    })
 }
 
 /// Mark an action resolved: `state` becomes `done` or `failed`, `resolved_at` is

@@ -51,6 +51,7 @@ Authoritative record of technology choices for Taski. Each entry has a one-line 
 | **`taski-config` crate** + `serde` + `toml` | TOML config (`~/.config/taski/config.toml`, XDG-style; overridable via `TASKI_CONFIG`). Lives in its own crate so `taski-core` stays pure (no FS/TOML I/O). Precedence: CLI flag → config file → compiled default. | 2026-06-20 |
 | **`tracing` + `tracing-subscriber`** | Structured logs to stderr; essential for post-incident write-back diagnosis. | 2026-06-20 |
 | **`libc`** (in `taski-db`) | `localtime_r` + `tzset` probe for the system-local UTC offset backing "today" everywhere (views + stamps). Pure date math stays in `taski-core` (`ymd_from_unix_local` takes the offset as an argument — no date crate); the one impure probe lives in `taski-db`, which both consumers already depend on. Already in the tree transitively. Non-unix falls back to UTC. See ADR-0024. | 2026-09-07 |
+| **Scriptable CLI on the `taski` binary** | `taski list/show/done/…` for AI agents and scripts — a third index client like the TUI: reads `all_tasks`, writes only via `pending_actions`; synchronous (waits on the daemon, or takes the single-writer lock and drains itself). JSON is hand-encoded — **no `serde_json`**. Agent skill at `skills/taski/SKILL.md`. See ADR-0027. | 2026-10-07 |
 
 ## Testing
 | Choice | Rationale | Decided |
