@@ -309,18 +309,30 @@ fn link_url(seg: &TextSeg, note_path: &str, vault: Option<&str>) -> Option<Strin
     (!url.chars().any(char::is_control)).then_some(url)
 }
 
-/// A hyperlink on a rendered list row: `(column, width, url)`.
-type RowLink = (usize, usize, String);
+/// A hyperlink on a rendered list item: `(line, column, width, url)` — `line` is
+/// the item's wrapped line (always 0 unless `w` wrap is on).
+type RowLink = (usize, usize, usize, String);
 
 /// ADR-0026: wrap each link-label cell of the visible list rows in an OSC 8
 /// hyperlink so the terminal makes it clickable. `ForcedWidth(1)` keeps ratatui's
 /// diff from counting the escape bytes as visible columns. `area` is the list's
-/// inner area and `offset` its first visible item.
-fn apply_hyperlinks(buf: &mut Buffer, area: Rect, offset: usize, item_links: &[Vec<RowLink>]) {
-    let rows = item_links.iter().skip(offset).take(area.height as usize);
-    for (dy, links) in rows.enumerate() {
-        let y = area.y + dy as u16;
-        for (col, width, url) in links {
+/// inner area, `offset` its first visible item, and each item carries its height.
+fn apply_hyperlinks(
+    buf: &mut Buffer,
+    area: Rect,
+    offset: usize,
+    item_links: &[(usize, Vec<RowLink>)],
+) {
+    let mut top = 0;
+    for (height, links) in item_links.iter().skip(offset) {
+        if top >= area.height as usize {
+            break;
+        }
+        for (line, col, width, url) in links {
+            let Some(y) = (top + line < area.height as usize).then(|| area.y + (top + line) as u16)
+            else {
+                continue;
+            };
             for x in (area.x as usize + col..area.x as usize + col + width)
                 .take_while(|&x| x < area.right() as usize)
             {
@@ -334,7 +346,87 @@ fn apply_hyperlinks(buf: &mut Buffer, area: Rect, offset: usize, item_links: &[V
                     .set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::MIN));
             }
         }
+        top += height;
     }
+}
+
+/// `w` wrap: word-wrap a task row's spans to `width` columns, indenting
+/// continuation lines by `hang` (the text column, under the checkbox). Link hits
+/// (all on line 0 going in) are re-mapped onto the wrapped lines, split if a
+/// label straddles a break.
+fn wrap_spans(
+    spans: &[Span<'static>],
+    links: Vec<RowLink>,
+    width: usize,
+    hang: usize,
+) -> (Vec<Line<'static>>, Vec<RowLink>) {
+    let hang = hang.min(width / 2);
+    // Per char: (char, style, flat column on the unwrapped row, display width).
+    type Cell = (char, Style, usize, usize);
+    let indent = || -> Vec<Cell> { vec![(' ', Style::default(), usize::MAX, 1); hang] };
+    let mut rows: Vec<Vec<Cell>> = vec![Vec::new()];
+    let (mut used, mut flat) = (0, 0);
+    for span in spans {
+        for ch in span.content.chars() {
+            let w = Span::raw(ch.to_string()).width();
+            if used + w > width && used > hang {
+                let cur = rows.last_mut().expect("rows is never empty");
+                let mut next = indent();
+                if ch == ' ' {
+                    // Break on the space itself; drop it.
+                    used = hang;
+                    flat += w;
+                    rows.push(next);
+                    continue;
+                }
+                // Carry the partial word over when there's a space to break at.
+                if let Some(i) = cur.iter().rposition(|c| c.0 == ' ').filter(|&i| i > hang) {
+                    let tail = cur.split_off(i + 1);
+                    cur.pop();
+                    next.extend(tail);
+                }
+                used = next.iter().map(|c| c.3).sum();
+                rows.push(next);
+            }
+            rows.last_mut()
+                .expect("rows is never empty")
+                .push((ch, span.style, flat, w));
+            used += w;
+            flat += w;
+        }
+    }
+    let mut out_links = Vec::new();
+    for (_, col, lw, url) in links {
+        for (r, row) in rows.iter().enumerate() {
+            let start: usize = row
+                .iter()
+                .take_while(|c| c.2 < col || c.2 == usize::MAX)
+                .map(|c| c.3)
+                .sum();
+            let w: usize = row
+                .iter()
+                .filter(|c| c.2 >= col && c.2 < col + lw)
+                .map(|c| c.3)
+                .sum();
+            if w > 0 {
+                out_links.push((r, start, w, url.clone()));
+            }
+        }
+    }
+    let lines = rows
+        .into_iter()
+        .map(|row| {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            for (ch, style, ..) in row {
+                match spans.last_mut() {
+                    Some(s) if s.style == style => s.content.to_mut().push(ch),
+                    _ => spans.push(Span::styled(ch.to_string(), style)),
+                }
+            }
+            Line::from(spans)
+        })
+        .collect();
+    (lines, out_links)
 }
 
 /// Build an `obsidian://` deep-link URL for a task's location.
@@ -865,6 +957,8 @@ struct App {
     /// Whether the context pane is shown. Toggled with `p`; also hidden automatically
     /// below [`MIN_SPLIT_WIDTH`] columns so neither pane is unreadably narrow.
     pane_visible: bool,
+    /// `w`: word-wrap long task rows to the list width instead of clipping them.
+    wrap_list: bool,
     /// Manual scroll offset (in lines) applied on top of the auto-centered context
     /// window. `J`/`K` adjust it; any task navigation resets it to 0 (recenter on the
     /// new task). It survives index refreshes so a scroll isn't undone ~750ms later.
@@ -1003,6 +1097,7 @@ impl App {
             ctx_note_path: None,
             ctx_content: None,
             pane_visible: true,
+            wrap_list: true,
             ctx_scroll: 0,
             today_only: false,
             today: today_string(),
@@ -1995,6 +2090,7 @@ fn run_loop(
     // `App::new()` uses `Theme::default()` / `LayoutPrefs::default()` for standalone
     // test construction.
     app.theme = theme;
+    app.wrap_list = layout.list_wrap;
     app.layout = layout;
     // `None` => never refreshed yet, so the first iteration reads immediately.
     let mut last_refresh: Option<Instant> = None;
@@ -2201,6 +2297,7 @@ fn run_loop(
                 KeyCode::Char('J') => app.scroll_context(1),
                 KeyCode::Char('K') => app.scroll_context(-1),
                 KeyCode::Char('p') => app.toggle_pane(),
+                KeyCode::Char('w') => app.wrap_list = !app.wrap_list,
                 // Open the selected task in Obsidian via an `obsidian://` deep link
                 // (read-only and TUI-local — no vault mutation, no daemon involvement).
                 // Suppressed during any search/quick-add prompt: `o` there builds the
@@ -2613,6 +2710,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         // ADR-0018 S3: insert density blank-line separators between groups.
         // ADR-0026: each item carries its link hits (gaps carry none).
+        let inner = block.inner(list_col);
+        let wrap_width = app.wrap_list.then_some(inner.width as usize);
         let (items, item_links): (Vec<ListItem>, Vec<Vec<RowLink>>) = app
             .rows
             .iter()
@@ -2624,6 +2723,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
                     &app.theme,
                     app.group_by,
                     app.vault_name.as_deref(),
+                    wrap_width,
                 );
                 // A Lane starts a section; a Header starts one unless it sits
                 // directly under its Lane divider.
@@ -2646,7 +2746,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
                 }
             })
             .unzip();
-        let inner = block.inner(list_col);
+        let item_links: Vec<(usize, Vec<RowLink>)> =
+            items.iter().map(ListItem::height).zip(item_links).collect();
         let list = List::new(items)
             .block(block)
             .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
@@ -2848,6 +2949,7 @@ fn row_to_item(
     theme: &theme::Theme,
     group_by: GroupBy,
     vault: Option<&str>,
+    wrap_width: Option<usize>,
 ) -> (ListItem<'static>, Vec<RowLink>) {
     let mut links = Vec::new();
     let item = match row {
@@ -2919,7 +3021,7 @@ fn row_to_item(
                 );
                 if let Some(url) = link_url(&seg, &task.note_path, vault) {
                     let col = spans.iter().map(Span::width).sum();
-                    links.push((col, link.width(), url));
+                    links.push((0, col, link.width(), url));
                 }
                 spans.push(link);
             }
@@ -2950,7 +3052,16 @@ fn row_to_item(
                     .add_modifier(Modifier::DIM),
                 _ => Style::new(),
             };
-            ListItem::new(Line::from(spans)).style(item_style)
+            // `w` wrap: hang continuation lines under the text, past the checkbox.
+            let lines = match wrap_width {
+                Some(w) if spans.iter().map(Span::width).sum::<usize>() > w => {
+                    let (lines, wrapped) = wrap_spans(&spans, links, w, 8 + task.indent);
+                    links = wrapped;
+                    lines
+                }
+                _ => vec![Line::from(spans)],
+            };
+            ListItem::new(lines).style(item_style)
         }
         DisplayRow::Lane {
             label,
@@ -3222,7 +3333,7 @@ fn help_popup(theme: &theme::Theme) -> Paragraph<'static> {
             "Cycle group-by (folder+note / note / tag / priority / folder)",
         ),
         row("B · < / >", "Kanban board · move task up / down a lane"),
-        row("p", "Toggle context pane"),
+        row("p · w", "Toggle context pane · wrap long tasks"),
         Line::raw(""),
         head("Task actions"),
         row("Space", "Toggle open ↔ done (stamps ✅)"),
@@ -7138,5 +7249,21 @@ mod tests {
             })
             .collect();
         assert!(plain.contains("[ ] read it now"), "{plain}");
+    }
+
+    #[test]
+    fn wrap_spans_hangs_continuations_and_remaps_links() {
+        let spans = vec![
+            Span::raw("    [ ] "),
+            Span::raw("alpha beta "),
+            Span::styled("gamma", Style::default().fg(Color::Cyan)),
+        ];
+        // "gamma" sits at flat column 19.
+        let links = vec![(0, 19, 5, "u".to_string())];
+        let (lines, links) = wrap_spans(&spans, links, 16, 8);
+        let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        assert_eq!(text, ["    [ ] alpha", "        beta", "        gamma"]);
+        assert!(lines.iter().all(|l| l.width() <= 16));
+        assert_eq!(links, [(2, 8, 5, "u".to_string())]);
     }
 }

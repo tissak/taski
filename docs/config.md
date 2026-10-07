@@ -100,6 +100,7 @@ bold           = false          # global bold emphasis (off = crisper text)
 list_pane_percent = 50          # 20–80; list width when the context pane is open
 list_density      = "compact"   # compact | comfortable | spacious
 context_wrap      = false        # wrap context-pane lines instead of truncating
+list_wrap         = true         # word-wrap long task rows (`w` toggles at runtime)
 ```
 
 > Note: `[theme]` and `[ui]` are themselves optional. Omitting a whole section
@@ -128,6 +129,7 @@ context_wrap      = false        # wrap context-pane lines instead of truncating
 | `list_pane_percent` | `50` | `20`–`80` (clamped, warns if outside) | Task-list width when the context pane is visible. Below the 60-col split floor the pane auto-hides and this is moot. |
 | `list_density` | `"compact"` | `compact` / `comfortable` / `spacious` | Blank-line separators between groups: 0 / 1 / 2 lines. A bad value is a **hard error** at load. |
 | `context_wrap` | `false` | bool | Wrap long context-pane lines instead of truncating. |
+| `list_wrap` | `true` | bool | Word-wrap long task rows in the list; `false` clips them at the pane edge. `w` toggles it for the session. |
 
 `[theme]` is covered in its own section below.
 
