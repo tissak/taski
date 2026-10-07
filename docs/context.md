@@ -277,6 +277,7 @@ filter predicates within each bucket and emits `Header` + `Task` rows.
 | `B` | Toggle the kanban board: lanes Doing `[/]` → Blocked `[!]` → Todo `[ ]` → Done `[x]` as full-width rows, grouped by `G` inside each lane; `Enter`/`←`/`→` on a lane divider folds the whole lane, Done starts folded; `f` ignored; `m` refused [ADR-0025] |
 | `<` / `>` | Move the selected task one kanban lane up / down (a checkbox flip; undoable with `u`) [ADR-0025] |
 | `p` | Toggle the context pane (right-half note preview) |
+| `w` | Toggle word wrap for long task rows (continuation lines hang under the text; on by default, `list_wrap = false` in `[ui]` turns it off) |
 | `J` / `K` | Scroll context pane up/down |
 | `?` | Toggle the floating keybindings help overlay (modal: `?`/`Esc`/`q` close it without quitting; `Ctrl-C` still quits from any state). The footer cheat-sheet is trimmed to essentials; the full list lives here |
 | `q` / `Esc` / `Ctrl-C` | Quit |
@@ -516,7 +517,7 @@ the frontmatter grammar is a load-bearing contract future parsing must respect.
 
 18. **Color theming and per-panel density knobs** ([ADR-0018](./adr/0018-theming-and-per-panel-density.md)) —
     `[theme]` (12 semantic color roles — 11 fg + a `background` — plus a global `bold` toggle) and
-    `[ui]` (list_pane_percent, list_density, context_wrap) sections
+    `[ui]` (list_pane_percent, list_density, context_wrap, list_wrap) sections
     in `config.toml` drive user-configurable colors and per-panel space allocation. Resolved from
     `ThemeConfig`/`UiConfig` in `taski-config` (no ratatui dep) to `Theme`/`LayoutPrefs` in `taski-tui`
     once at startup in `run_inner`. Defaults reproduce today's hardcoded palette, with **two deliberate

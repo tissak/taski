@@ -105,6 +105,7 @@ pub struct UiConfig {
     #[serde(default)]
     pub list_density: Option<DensityPreset>,
     pub context_wrap: Option<bool>,
+    pub list_wrap: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -315,7 +316,8 @@ pub fn template(vault: Option<&str>, db: &str) -> String {
          # [ui]\n\
          # list_pane_percent = 50      # 20–80; list width when context pane is visible\n\
          # list_density     = \"compact\"  # compact | comfortable | spacious\n\
-         # context_wrap     = false\n",
+         # context_wrap     = false\n\
+         # list_wrap        = true       # word-wrap long task rows (`w` toggles)\n",
     )
 }
 

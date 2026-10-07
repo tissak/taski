@@ -171,6 +171,9 @@ pub struct LayoutPrefs {
     /// Whether text in the context pane wraps at the pane boundary.
     /// `false` = current behaviour (no wrap).
     pub context_wrap: bool,
+    /// Whether long task rows word-wrap in the list (`w` toggles at runtime).
+    /// `true` by default; `list_wrap = false` restores clipping.
+    pub list_wrap: bool,
 }
 
 impl Default for LayoutPrefs {
@@ -179,6 +182,7 @@ impl Default for LayoutPrefs {
             list_pane_percent: 50,
             list_density: 0, // compact = no separators (matches pre-S3 behaviour)
             context_wrap: false,
+            list_wrap: true,
         }
     }
 }
@@ -213,6 +217,7 @@ impl LayoutPrefs {
                 .map(|d| d.blank_lines())
                 .unwrap_or(defaults.list_density),
             context_wrap: cfg.context_wrap.unwrap_or(defaults.context_wrap),
+            list_wrap: cfg.list_wrap.unwrap_or(defaults.list_wrap),
         }
     }
 }
@@ -540,6 +545,7 @@ mod tests {
             list_pane_percent: None,
             list_density: Some(DensityPreset::Compact),
             context_wrap: None,
+            list_wrap: None,
         };
         let lp = LayoutPrefs::resolve_from(Some(&cfg));
         assert_eq!(lp.list_density, 0);
@@ -554,6 +560,7 @@ mod tests {
             list_pane_percent: None,
             list_density: Some(DensityPreset::Comfortable),
             context_wrap: None,
+            list_wrap: None,
         };
         let lp = LayoutPrefs::resolve_from(Some(&cfg));
         assert_eq!(lp.list_density, 1);
@@ -565,6 +572,7 @@ mod tests {
             list_pane_percent: None,
             list_density: Some(DensityPreset::Spacious),
             context_wrap: None,
+            list_wrap: None,
         };
         let lp = LayoutPrefs::resolve_from(Some(&cfg));
         assert_eq!(lp.list_density, 2);
@@ -580,6 +588,7 @@ mod tests {
             list_pane_percent: Some(65),
             list_density: None,
             context_wrap: None,
+            list_wrap: None,
         };
         let lp = LayoutPrefs::resolve_from(Some(&cfg));
         assert_eq!(lp.list_pane_percent, 65);
@@ -591,6 +600,7 @@ mod tests {
             list_pane_percent: Some(5),
             list_density: None,
             context_wrap: None,
+            list_wrap: None,
         };
         let lp = LayoutPrefs::resolve_from(Some(&cfg));
         assert_eq!(lp.list_pane_percent, 20);
@@ -602,6 +612,7 @@ mod tests {
             list_pane_percent: Some(95),
             list_density: None,
             context_wrap: None,
+            list_wrap: None,
         };
         let lp = LayoutPrefs::resolve_from(Some(&cfg));
         assert_eq!(lp.list_pane_percent, 80);
@@ -617,6 +628,7 @@ mod tests {
             list_pane_percent: None,
             list_density: None,
             context_wrap: Some(false),
+            list_wrap: None,
         };
         let lp = LayoutPrefs::resolve_from(Some(&cfg));
         assert!(!lp.context_wrap);
@@ -628,8 +640,19 @@ mod tests {
             list_pane_percent: None,
             list_density: None,
             context_wrap: Some(true),
+            list_wrap: None,
         };
         let lp = LayoutPrefs::resolve_from(Some(&cfg));
         assert!(lp.context_wrap);
+    }
+
+    #[test]
+    fn resolve_from_list_wrap_defaults_on_and_config_turns_off() {
+        assert!(LayoutPrefs::resolve_from(None).list_wrap);
+        let cfg = UiConfig {
+            list_wrap: Some(false),
+            ..Default::default()
+        };
+        assert!(!LayoutPrefs::resolve_from(Some(&cfg)).list_wrap);
     }
 }
