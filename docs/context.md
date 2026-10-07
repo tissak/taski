@@ -274,7 +274,7 @@ filter predicates within each bucket and emits `Header` + `Task` rows.
 | `/` | Open text search prompt (matches `task.text`, case-insensitive) |
 | `F` | Open file/path search prompt (matches `task.note_path`) |
 | `o` | Open the selected task's note in Obsidian via an `obsidian://` deep link (native: opens the file; with `use_advanced_uri = true`: jumps to the task's line — requires the Advanced URI plugin). Read-only, TUI-local; macOS only [ADR-0015] |
-| `B` | Toggle the kanban board: lanes Doing `[/]` → Blocked `[!]` → Todo `[ ]` → Done `[x]` as full-width rows, grouped by `G` inside each lane; `f` ignored; `Tab` leaves Done folded; `m` refused [ADR-0025] |
+| `B` | Toggle the kanban board: lanes Doing `[/]` → Blocked `[!]` → Todo `[ ]` → Done `[x]` as full-width rows, grouped by `G` inside each lane; `Enter`/`←`/`→` on a lane divider folds the whole lane, Done starts folded; `f` ignored; `m` refused [ADR-0025] |
 | `<` / `>` | Move the selected task one kanban lane up / down (a checkbox flip; undoable with `u`) [ADR-0025] |
 | `p` | Toggle the context pane (right-half note preview) |
 | `J` / `K` | Scroll context pane up/down |
@@ -614,7 +614,7 @@ the frontmatter grammar is a load-bearing contract future parsing must respect.
     checkbox char — the Obsidian/Tasks convention — so `<`/`>` lane moves are plain `checkbox`
     flips: no action_type, schema, or daemon change; undo and `✅` stamping are free. Lanes are
     hardcoded (`LANES` in `taski-tui`); `build_kanban_view` wraps `build_view` per lane and
-    lane-scopes header keys with `\u{1f}` so fold state is per lane. `[!]` blocked now counts
+    lane-scopes header keys with `\u{1f}` so fold state is per lane; whole lanes fold via `App::folded_lanes` (Done folded by default). `[!]` blocked now counts
     as open (`is_open_like`). TUI-only.
 
 ---
